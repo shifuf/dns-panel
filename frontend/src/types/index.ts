@@ -223,6 +223,13 @@ export interface SystemSettings {
   registrationOpen?: boolean;
   setupComplete?: boolean;
   logRetentionDays?: number;
+  retryMaxAttempts?: number;
+  retryIntervalSeconds?: number;
+  retryTimeoutSeconds?: number;
+  backupSnapshotDir?: string;
+  backupFilePrefix?: string;
+  backupWriteServerCopy?: boolean;
+  databasePath?: string;
 }
 
 export interface BackupPayload {

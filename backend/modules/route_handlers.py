@@ -282,13 +282,7 @@ def _auth_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         if not is_admin_user_id(uid):
             self._err("需要管理员权限", 403)
             return
-        self._ok(
-            {
-                "registrationOpen": False,
-                "setupComplete": setup_status_dict()["setupComplete"],
-                "logRetentionDays": get_log_retention_days(),
-            }
-        )
+        self._ok(system_settings_payload())
         return
 
     # PUT /api/auth/system-settings — update global settings (authed)
@@ -300,6 +294,18 @@ def _auth_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             retention = p_int(body.get("logRetentionDays"), get_log_retention_days(), 36500)
             set_system_setting("log_retention_days", str(retention))
             cleanup_logs_older_than(retention)
+        if "retryMaxAttempts" in body:
+            set_system_setting("retry_max_attempts", str(p_int(body.get("retryMaxAttempts"), get_retry_max_attempts(), 10)))
+        if "retryIntervalSeconds" in body:
+            set_system_setting("retry_interval_seconds", str(p_int(body.get("retryIntervalSeconds"), get_retry_interval_seconds(), 300)))
+        if "retryTimeoutSeconds" in body:
+            set_system_setting("retry_timeout_seconds", str(p_int(body.get("retryTimeoutSeconds"), get_retry_timeout_seconds(), 300)))
+        if "backupSnapshotDir" in body:
+            set_system_setting("backup_snapshot_dir", str(body.get("backupSnapshotDir") or "").strip() or "backups")
+        if "backupFilePrefix" in body:
+            set_system_setting("backup_file_prefix", sanitize_backup_file_prefix(str(body.get("backupFilePrefix") or "")))
+        if "backupWriteServerCopy" in body:
+            set_system_setting("backup_write_server_copy", "1" if bool(body.get("backupWriteServerCopy")) else "0")
         set_system_setting("registration_open", "0")
         self._ok(None, "系统设置已更新")
         return
@@ -327,8 +333,20 @@ def _auth_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             )
         except Exception:
             pass
-        filename = f"dns-panel-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-        self._ok({"backup": backup, "filename": filename}, "备份已生成")
+        filename = build_backup_filename()
+        snapshot_path = None
+        snapshot_error = None
+        if should_write_backup_server_copy():
+            try:
+                snapshot_path = write_backup_snapshot_file(backup, filename)
+            except Exception as exc:
+                snapshot_error = str(exc)
+        payload = {"backup": backup, "filename": filename}
+        if snapshot_path:
+            payload["snapshotPath"] = snapshot_path
+        if snapshot_error:
+            payload["snapshotError"] = snapshot_error
+        self._ok(payload, "备份已生成")
         return
 
     if self.command == "POST" and sub == "/backup/restore":

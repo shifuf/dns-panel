@@ -160,6 +160,12 @@ MIGRATIONS: list[str] = [
     "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('registration_open', '0')",
     "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('setup_complete', '0')",
     "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('log_retention_days', '90')",
+    "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('retry_max_attempts', '3')",
+    "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('retry_interval_seconds', '2')",
+    "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('retry_timeout_seconds', '15')",
+    "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('backup_snapshot_dir', 'backups')",
+    "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('backup_file_prefix', 'dns-panel-backup')",
+    "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('backup_write_server_copy', '1')",
 ]
 
 

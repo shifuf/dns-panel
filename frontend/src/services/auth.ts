@@ -169,13 +169,19 @@ export const getSystemSettings = async (): Promise<ApiResponse<SystemSettings>> 
  */
 export const updateSystemSettings = async (params: {
   logRetentionDays?: number;
+  retryMaxAttempts?: number;
+  retryIntervalSeconds?: number;
+  retryTimeoutSeconds?: number;
+  backupSnapshotDir?: string;
+  backupFilePrefix?: string;
+  backupWriteServerCopy?: boolean;
 }): Promise<ApiResponse> => {
   return api.put('/auth/system-settings', params);
 };
 
 export const exportBackup = async (params: {
   scopes: string[];
-}): Promise<ApiResponse<{ backup: BackupPayload; filename: string }>> => {
+}): Promise<ApiResponse<{ backup: BackupPayload; filename: string; snapshotPath?: string; snapshotError?: string }>> => {
   return api.post('/auth/backup/export', params);
 };
 

@@ -46,8 +46,16 @@ const versionCheckedAtLabel = computed(() => {
 });
 
 // System settings
-const systemSettingsLoading = ref(false);
+const retrySettingsLoading = ref(false);
+const storageSettingsLoading = ref(false);
 const logRetentionDays = ref('90');
+const retryMaxAttempts = ref('3');
+const retryIntervalSeconds = ref('2');
+const retryTimeoutSeconds = ref('15');
+const backupSnapshotDir = ref('');
+const backupFilePrefix = ref('dns-panel-backup');
+const backupWriteServerCopy = ref(true);
+const databasePath = ref('');
 const backupDns = ref(true);
 const backupSsl = ref(true);
 const restoreDns = ref(true);
@@ -58,6 +66,19 @@ const exportLoading = ref(false);
 const selectedBackupFile = ref<File | null>(null);
 const restoreFileInput = ref<HTMLInputElement | null>(null);
 const dnsCredentialPanelKey = ref(0);
+const retrySummary = computed(() => `最多 ${retryMaxAttempts.value || '3'} 次，间隔 ${retryIntervalSeconds.value || '2'} 秒，单次超时 ${retryTimeoutSeconds.value || '15'} 秒`);
+const backupFilenamePreview = computed(() => `${(backupFilePrefix.value.trim() || 'dns-panel-backup')}-YYYYMMDD-HHMMSS.json`);
+
+function applySystemSettings(settings: any) {
+  logRetentionDays.value = String(settings?.logRetentionDays || 90);
+  retryMaxAttempts.value = String(settings?.retryMaxAttempts || 3);
+  retryIntervalSeconds.value = String(settings?.retryIntervalSeconds || 2);
+  retryTimeoutSeconds.value = String(settings?.retryTimeoutSeconds || 15);
+  backupSnapshotDir.value = String(settings?.backupSnapshotDir || '');
+  backupFilePrefix.value = String(settings?.backupFilePrefix || 'dns-panel-backup');
+  backupWriteServerCopy.value = settings?.backupWriteServerCopy !== false;
+  databasePath.value = String(settings?.databasePath || '');
+}
 
 async function fetchVersionInfo(forceRefresh = false, silent = false) {
   updateChecking.value = true;
@@ -101,24 +122,72 @@ onMounted(async () => {
   try {
     const sysRes = await getSystemSettings();
     const sd = (sysRes as any)?.data || sysRes;
-    logRetentionDays.value = String(sd?.logRetentionDays || 90);
+    applySystemSettings(sd);
   } catch { /* ignore */ }
 });
 
-async function saveSystemSettings() {
-  systemSettingsLoading.value = true;
+async function saveRetrySettings() {
+  retrySettingsLoading.value = true;
+  try {
+    const maxAttempts = parseInt(retryMaxAttempts.value, 10);
+    const intervalSeconds = parseInt(retryIntervalSeconds.value, 10);
+    const timeoutSeconds = parseInt(retryTimeoutSeconds.value, 10);
+    if (Number.isNaN(maxAttempts) || maxAttempts < 1) {
+      message.error('最大重试次数至少为 1');
+      return;
+    }
+    if (Number.isNaN(intervalSeconds) || intervalSeconds < 1) {
+      message.error('重试间隔至少为 1 秒');
+      return;
+    }
+    if (Number.isNaN(timeoutSeconds) || timeoutSeconds < 1) {
+      message.error('单次请求超时至少为 1 秒');
+      return;
+    }
+    await updateSystemSettings({
+      retryMaxAttempts: maxAttempts,
+      retryIntervalSeconds: intervalSeconds,
+      retryTimeoutSeconds: timeoutSeconds,
+    });
+    const sysRes = await getSystemSettings();
+    applySystemSettings((sysRes as any)?.data || sysRes);
+    message.success('重试设置已保存');
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    retrySettingsLoading.value = false;
+  }
+}
+
+async function saveStorageSettings() {
+  storageSettingsLoading.value = true;
   try {
     const retention = parseInt(logRetentionDays.value, 10);
     if (Number.isNaN(retention) || retention < 1) {
       message.error('日志保留时长至少为 1 天');
       return;
     }
-    await updateSystemSettings({ logRetentionDays: retention });
-    message.success('系统设置已保存');
+    if (!backupSnapshotDir.value.trim()) {
+      message.error('备份快照目录不能为空');
+      return;
+    }
+    if (!backupFilePrefix.value.trim()) {
+      message.error('备份文件名前缀不能为空');
+      return;
+    }
+    await updateSystemSettings({
+      logRetentionDays: retention,
+      backupSnapshotDir: backupSnapshotDir.value.trim(),
+      backupFilePrefix: backupFilePrefix.value.trim(),
+      backupWriteServerCopy: backupWriteServerCopy.value,
+    });
+    const sysRes = await getSystemSettings();
+    applySystemSettings((sysRes as any)?.data || sysRes);
+    message.success('存储设置已保存');
   } catch (err: any) {
     message.error(String(err));
   } finally {
-    systemSettingsLoading.value = false;
+    storageSettingsLoading.value = false;
   }
 }
 
@@ -269,7 +338,15 @@ async function handleExportBackup() {
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
-    message.success('备份文件已导出');
+    const snapshotPath = res.data?.snapshotPath;
+    const snapshotError = res.data?.snapshotError;
+    if (snapshotPath) {
+      message.success(`备份文件已导出，并已写入服务器快照：${snapshotPath}`);
+    } else if (snapshotError) {
+      message.warning(`备份文件已导出，但服务器快照写入失败：${snapshotError}`);
+    } else {
+      message.success('备份文件已导出');
+    }
   } catch (err: any) {
     message.error(String(err));
   } finally {
@@ -541,17 +618,24 @@ async function handleRestoreBackup() {
       <div v-if="activeTab === 'retry'" class="settings-tab-content">
         <div class="bento-card">
           <p class="bento-section-title">重试策略</p>
-          <p class="bento-section-meta">配置 DNS 操作的重试机制</p>
+          <p class="bento-section-meta">配置外部请求与版本检查的自动重试机制</p>
+          <div class="mb-4 rounded-2xl border border-blue-100 bg-blue-50/70 px-4 py-3 text-sm text-blue-900">
+            当前策略：{{ retrySummary }}
+          </div>
           <div class="space-y-4">
             <div class="settings-subpanel">
               <p class="settings-subpanel-label">最大重试次数</p>
-              <NInput type="number" placeholder="输入最大重试次数" size="small" />
+              <NInput v-model:value="retryMaxAttempts" type="number" placeholder="输入最大重试次数" size="small" />
             </div>
             <div class="settings-subpanel">
               <p class="settings-subpanel-label">重试间隔（秒）</p>
-              <NInput type="number" placeholder="输入重试间隔" size="small" />
+              <NInput v-model:value="retryIntervalSeconds" type="number" placeholder="输入重试间隔" size="small" />
             </div>
-            <NButton type="primary" size="small">
+            <div class="settings-subpanel">
+              <p class="settings-subpanel-label">单次请求超时（秒）</p>
+              <NInput v-model:value="retryTimeoutSeconds" type="number" placeholder="输入单次超时秒数" size="small" />
+            </div>
+            <NButton type="primary" size="small" :loading="retrySettingsLoading" @click="saveRetrySettings">
               <template #icon><Save :size="14" /></template>
               保存重试设置
             </NButton>
@@ -563,7 +647,7 @@ async function handleRestoreBackup() {
       <div v-if="activeTab === 'storage'" class="settings-tab-content">
         <div class="bento-card">
           <p class="bento-section-title">存储设置</p>
-          <p class="bento-section-meta">配置数据存储和日志保留策略</p>
+          <p class="bento-section-meta">配置日志清理与备份快照的服务器端存储行为</p>
           <div class="space-y-4">
             <div v-if="isAdmin" class="settings-subpanel">
               <p class="settings-subpanel-label">日志保留时长（天）</p>
@@ -571,11 +655,33 @@ async function handleRestoreBackup() {
                 <NInput v-model:value="logRetentionDays" type="number" size="small" class="!w-20" />
                 <span class="text-xs text-slate-400">天</span>
               </div>
-              <NButton class="mt-3 w-full" size="small" :loading="systemSettingsLoading" @click="saveSystemSettings">保存日志策略</NButton>
             </div>
             <div class="settings-subpanel">
-              <p class="settings-subpanel-label">存储路径</p>
-              <NInput placeholder="输入存储路径" size="small" />
+              <p class="settings-subpanel-label">数据库路径</p>
+              <NInput :value="databasePath" readonly size="small" />
+            </div>
+            <div class="settings-subpanel">
+              <p class="settings-subpanel-label">备份快照目录</p>
+              <NInput v-model:value="backupSnapshotDir" placeholder="例如 /app/backups 或 backups" size="small" />
+              <p class="mt-2 text-xs text-slate-500">导出备份时，服务器会将同一份 JSON 快照落到该目录。</p>
+            </div>
+            <div class="settings-subpanel">
+              <p class="settings-subpanel-label">备份文件名前缀</p>
+              <NInput v-model:value="backupFilePrefix" placeholder="例如 dns-panel-backup" size="small" />
+              <p class="mt-2 text-xs text-slate-500">文件名预览：{{ backupFilenamePreview }}</p>
+            </div>
+            <div class="settings-subpanel">
+              <div class="flex items-center gap-4">
+                <NSwitch v-model:value="backupWriteServerCopy" size="small" />
+                <span class="text-sm text-slate-600">导出备份时同步写入服务器快照</span>
+              </div>
+            </div>
+            <NButton class="w-full" type="primary" size="small" :loading="storageSettingsLoading" @click="saveStorageSettings">
+              <template #icon><Save :size="14" /></template>
+              保存存储设置
+            </NButton>
+            <div class="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3 text-xs leading-6 text-slate-600">
+              建议在 Docker 部署中把备份目录映射到宿主机卷，否则容器重建后服务器快照不会保留。
             </div>
           </div>
         </div>

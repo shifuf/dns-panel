@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,6 +59,7 @@ from modules.route_handlers import attach_route_methods
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = (BASE_DIR / "db" / "database.db").resolve()
+DEFAULT_BACKUP_SNAPSHOT_DIR = (BASE_DIR / "backups").resolve()
 PORT = int(os.getenv("PORT", "4001"))
 LEGACY = os.getenv("LEGACY_NODE_BASE_URL", "http://127.0.0.1:4101").rstrip("/")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-jwt-secret-key-min-32-char-123456")
@@ -97,6 +99,10 @@ PROVIDER_NAMES = {
     "tencent_ssl": "腾讯云 SSL",
 }
 DEFAULT_LOG_RETENTION_DAYS = 90
+DEFAULT_RETRY_MAX_ATTEMPTS = 3
+DEFAULT_RETRY_INTERVAL_SECONDS = 2
+DEFAULT_RETRY_TIMEOUT_SECONDS = 15
+DEFAULT_BACKUP_FILE_PREFIX = "dns-panel-backup"
 VALID_BACKUP_SCOPES = {"dns", "ssl"}
 
 
@@ -213,6 +219,71 @@ def set_system_setting(key: str, value: str) -> None:
 
 def get_log_retention_days() -> int:
     return p_int(get_system_setting("log_retention_days", str(DEFAULT_LOG_RETENTION_DAYS)), DEFAULT_LOG_RETENTION_DAYS, 36500)
+
+
+def get_retry_max_attempts() -> int:
+    return p_int(get_system_setting("retry_max_attempts", str(DEFAULT_RETRY_MAX_ATTEMPTS)), DEFAULT_RETRY_MAX_ATTEMPTS, 10)
+
+
+def get_retry_interval_seconds() -> int:
+    return p_int(get_system_setting("retry_interval_seconds", str(DEFAULT_RETRY_INTERVAL_SECONDS)), DEFAULT_RETRY_INTERVAL_SECONDS, 300)
+
+
+def get_retry_timeout_seconds() -> int:
+    return p_int(get_system_setting("retry_timeout_seconds", str(DEFAULT_RETRY_TIMEOUT_SECONDS)), DEFAULT_RETRY_TIMEOUT_SECONDS, 300)
+
+
+def sanitize_backup_file_prefix(raw_value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", str(raw_value or "").strip()).strip("._-")
+    return text or DEFAULT_BACKUP_FILE_PREFIX
+
+
+def normalize_storage_path(raw_path: str, fallback: Path) -> Path:
+    text = str(raw_path or "").strip()
+    if not text:
+        return fallback
+    p = Path(text)
+    return p if p.is_absolute() else (BASE_DIR / p).resolve()
+
+
+def get_backup_snapshot_dir() -> Path:
+    return normalize_storage_path(get_system_setting("backup_snapshot_dir", "backups"), DEFAULT_BACKUP_SNAPSHOT_DIR)
+
+
+def get_backup_file_prefix() -> str:
+    return sanitize_backup_file_prefix(get_system_setting("backup_file_prefix", DEFAULT_BACKUP_FILE_PREFIX))
+
+
+def should_write_backup_server_copy() -> bool:
+    return get_system_setting("backup_write_server_copy", "1") != "0"
+
+
+def system_settings_payload() -> Dict[str, Any]:
+    return {
+        "registrationOpen": False,
+        "setupComplete": setup_status_dict()["setupComplete"],
+        "logRetentionDays": get_log_retention_days(),
+        "retryMaxAttempts": get_retry_max_attempts(),
+        "retryIntervalSeconds": get_retry_interval_seconds(),
+        "retryTimeoutSeconds": get_retry_timeout_seconds(),
+        "backupSnapshotDir": str(get_backup_snapshot_dir()),
+        "backupFilePrefix": get_backup_file_prefix(),
+        "backupWriteServerCopy": should_write_backup_server_copy(),
+        "databasePath": str(DB),
+    }
+
+
+def build_backup_filename(ts: datetime | None = None) -> str:
+    stamp = (ts or datetime.now()).strftime("%Y%m%d-%H%M%S")
+    return f"{get_backup_file_prefix()}-{stamp}.json"
+
+
+def write_backup_snapshot_file(backup: Dict[str, Any], filename: str) -> str:
+    target_dir = get_backup_snapshot_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / filename
+    target_path.write_text(json.dumps(backup, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(target_path)
 
 
 def cleanup_logs_older_than(retention_days: int | None = None) -> int:
@@ -545,6 +616,12 @@ def init_db() -> None:
         defaults = {
             "registration_open": "0",
             "log_retention_days": str(DEFAULT_LOG_RETENTION_DAYS),
+            "retry_max_attempts": str(DEFAULT_RETRY_MAX_ATTEMPTS),
+            "retry_interval_seconds": str(DEFAULT_RETRY_INTERVAL_SECONDS),
+            "retry_timeout_seconds": str(DEFAULT_RETRY_TIMEOUT_SECONDS),
+            "backup_snapshot_dir": "backups",
+            "backup_file_prefix": DEFAULT_BACKUP_FILE_PREFIX,
+            "backup_write_server_copy": "1",
             "setup_complete": "1" if has_any_users() else "0",
         }
         for key, value in defaults.items():
@@ -837,31 +914,39 @@ def _fetch_github_version_payload(repo: str) -> Dict[str, Any]:
         ),
     ]
     last_error = ""
+    retry_attempts = get_retry_max_attempts()
+    retry_interval = get_retry_interval_seconds()
+    timeout_seconds = get_retry_timeout_seconds()
     for source, url, reader in sources:
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            version = reader(payload)
-            if version:
-                release_url = ""
-                if isinstance(payload, dict):
-                    release_url = str(payload.get("html_url") or "").strip()
-                if not release_url:
-                    release_url = f"{UPSTREAM_GITHUB_REPO_URL}/releases/tag/{version}"
-                return {
-                    "latestVersion": version,
-                    "source": source,
-                    "repo": UPSTREAM_GITHUB_REPO_URL,
-                    "releaseUrl": release_url,
-                    "checkedAt": now_iso(),
-                }
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                continue
-            last_error = f"http {exc.code}"
-        except Exception as exc:
-            last_error = str(exc)
+        for attempt in range(retry_attempts):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                version = reader(payload)
+                if version:
+                    release_url = ""
+                    if isinstance(payload, dict):
+                        release_url = str(payload.get("html_url") or "").strip()
+                    if not release_url:
+                        release_url = f"{UPSTREAM_GITHUB_REPO_URL}/releases/tag/{version}"
+                    return {
+                        "latestVersion": version,
+                        "source": source,
+                        "repo": UPSTREAM_GITHUB_REPO_URL,
+                        "releaseUrl": release_url,
+                        "checkedAt": now_iso(),
+                    }
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    last_error = "http 404"
+                    break
+                last_error = f"http {exc.code}"
+            except Exception as exc:
+                last_error = str(exc)
+            if attempt < retry_attempts - 1:
+                time.sleep(retry_interval)
     fallback_payload: Dict[str, Any] = {
         "latestVersion": APP_VERSION,
         "source": "local-fallback",
