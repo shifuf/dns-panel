@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -110,7 +111,35 @@ jobs:
             echo
             echo "- frontend-build.zip"
             echo "- backend-build.zip"
+            echo
+            echo "## Docker 镜像"
+            echo
+            echo "- ghcr.io/shifuf/dns-panel-backend:${current_tag}"
+            echo "- ghcr.io/shifuf/dns-panel-frontend:${current_tag}"
+            echo
+            echo "## Docker 更新命令"
+            echo
+            echo '```bash'
+            echo "DNS_PANEL_VERSION=${current_tag} docker compose up -d --pull always"
+            echo '```'
           } > "$notes_file"
+
+      - name: Set image names
+        id: images
+        shell: bash
+        run: |
+          echo "backend=ghcr.io/shifuf/dns-panel-backend" >> "$GITHUB_OUTPUT"
+          echo "frontend=ghcr.io/shifuf/dns-panel-frontend" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -141,6 +170,26 @@ jobs:
           pip install -r requirements.txt
           mkdir -p ../release-assets
           zip -r ../release-assets/backend-build.zip . -x "db/*" "__pycache__/*" "*.pyc"
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          push: true
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.tag }}
+          tags: |
+            ${{ steps.images.outputs.backend }}:${{ steps.version.outputs.tag }}
+            ${{ steps.images.outputs.backend }}:latest
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          push: true
+          tags: |
+            ${{ steps.images.outputs.frontend }}:${{ steps.version.outputs.tag }}
+            ${{ steps.images.outputs.frontend }}:latest
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -15,7 +15,9 @@ services:
       retries: 3
 
   backend:
+    image: ghcr.io/shifuf/dns-panel-backend:${DNS_PANEL_VERSION:-latest}
     build: ./backend
+    pull_policy: always
     restart: unless-stopped
     ports:
       - "4001:4001"
@@ -42,7 +44,9 @@ services:
       start_period: 30s
 
   frontend:
+    image: ghcr.io/shifuf/dns-panel-frontend:${DNS_PANEL_VERSION:-latest}
     build: ./frontend
+    pull_policy: always
     restart: unless-stopped
     ports:
       - "8080:80"

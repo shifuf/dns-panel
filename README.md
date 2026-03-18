@@ -50,7 +50,7 @@ DATABASE_URL=file:./database.db
 3. **启动服务**
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 4. **访问面板**
@@ -155,6 +155,23 @@ services:
 - 推送到 `main` 后会自动触发 GitHub Actions 发布
 - 工作流会基于最新的 `v*` 标签自动计算下一个版本号，起始版本为 `v0.02`
 - Release 会自动附带 `frontend-build.zip` 和 `backend-build.zip`
+- 同时会自动发布 Docker 镜像到 `ghcr.io/shifuf/dns-panel-backend` 和 `ghcr.io/shifuf/dns-panel-frontend`
+
+### Docker 一键更新
+
+```bash
+# 更新到 GitHub 最新发布版本
+docker compose up -d --pull always
+
+# 更新到指定 GitHub 版本号
+DNS_PANEL_VERSION=v0.02 docker compose up -d --pull always
+```
+
+说明：
+
+- `DNS_PANEL_VERSION=latest` 时会跟随最新发布
+- 指定 `DNS_PANEL_VERSION=v0.xx` 时会固定到对应 GitHub Release 版本
+- 首次从 `ghcr.io` 拉取私有镜像时，需要先执行 `docker login ghcr.io`
 
 ### 自动更新
 
