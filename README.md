@@ -162,8 +162,12 @@ services:
 # 赋予脚本执行权限
 chmod +x update.sh
 
-# 运行更新脚本
+# 从 GitHub 拉取最新代码并无停机更新前后端
 ./update.sh
+
+# 仅更新后端或前端
+./update.sh backend
+./update.sh frontend
 ```
 
 ### 手动更新
