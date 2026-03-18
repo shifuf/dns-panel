@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: dns-panel-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    ports:
+      - "4001:4001"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=4001
+      - DATABASE_URL=file:/app/db/database.db
+      - JWT_SECRET=${JWT_SECRET:-please-change-this-to-a-random-secret-min-32-chars}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-please-change-to-32-char-key!!}
+      - CORS_ORIGIN=${CORS_ORIGIN:-http://localhost:80}
+      - JWT_EXPIRES_IN=7d
+      - LOG_RETENTION_DAYS=90
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./backend/db:/app/db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  redis_data:

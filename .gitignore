@@ -1,0 +1,33 @@
+.ace-tool/
+.env
+
+# Runtime database files
+backend/db/*.db
+backend/db/*.db-*
+backend/db/*.sqlite
+backend/db/*.sqlite-*
+backend/db/*.backup
+backend/db/*.bak
+
+# Python artifacts
+backend/__pycache__/
+backend/**/*.pyc
+backend/**/*.pyo
+backend/**/*.pyd
+
+# Frontend dependencies and build outputs
+frontend/node_modules/
+frontend/dist/
+
+# Logs
+*.log
+backend/*.log
+frontend/*.log
+
+# Backup and temp files
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*.backup
