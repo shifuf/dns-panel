@@ -25,7 +25,10 @@ from modules.cloudflare_api import CloudflareApi, CloudflareApiError
 from modules.dnspod_api import DnspodApi, DnspodApiError
 
 # ── Application version ─────────────────────────────────────────
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
+UPSTREAM_GITHUB_REPO = os.getenv("UPSTREAM_GITHUB_REPO", "shifuf/dns-panel").strip() or "shifuf/dns-panel"
+UPSTREAM_GITHUB_REPO_URL = f"https://github.com/{UPSTREAM_GITHUB_REPO}"
+VERSION_CACHE_TTL_SECONDS = 1800
 from modules.aliyun_esa_api import (
     AliyunEsaError,
     apply_certificate as esa_apply_certificate,
@@ -709,6 +712,101 @@ def safe_json_loads(text: Any) -> Any:
         return None
 
 
+def read_cache_json(key: str) -> Any:
+    if not table_exists("cache"):
+        return None
+    try:
+        with conn() as c:
+            row = c.execute("SELECT value, expiresAt FROM cache WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return None
+        exp = parse_dt(row["expiresAt"])
+        if not exp or exp <= now():
+            return None
+        return safe_json_loads(row["value"])
+    except Exception:
+        return None
+
+
+def write_cache_json(key: str, value: Any, ttl_seconds: int) -> None:
+    if not table_exists("cache"):
+        return
+    with conn() as c:
+        c.execute(
+            """
+            INSERT INTO cache (key, value, expiresAt, createdAt)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, expiresAt = excluded.expiresAt
+            """,
+            (
+                key,
+                json.dumps(value, ensure_ascii=False),
+                (now() + timedelta(seconds=ttl_seconds)).isoformat().replace("+00:00", "Z"),
+                now_iso(),
+            ),
+        )
+        c.commit()
+
+
+def _fetch_github_version_payload(repo: str) -> Dict[str, Any]:
+    encoded_repo = urllib.parse.quote(repo, safe="/")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "dns-panel-python/1.0",
+    }
+    sources = [
+        (
+            "github-release",
+            f"https://api.github.com/repos/{encoded_repo}/releases/latest",
+            lambda payload: str(payload.get("tag_name") or payload.get("name") or "").strip() if isinstance(payload, dict) else "",
+        ),
+        (
+            "github-tag",
+            f"https://api.github.com/repos/{encoded_repo}/tags?per_page=1",
+            lambda payload: str(payload[0].get("name") or "").strip() if isinstance(payload, list) and payload else "",
+        ),
+    ]
+    last_error = ""
+    for source, url, reader in sources:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            version = reader(payload)
+            if version:
+                return {
+                    "version": version,
+                    "source": source,
+                    "repo": UPSTREAM_GITHUB_REPO_URL,
+                    "checkedAt": now_iso(),
+                }
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                continue
+            last_error = f"http {exc.code}"
+        except Exception as exc:
+            last_error = str(exc)
+    fallback_payload: Dict[str, Any] = {
+        "version": APP_VERSION,
+        "source": "local-fallback",
+        "repo": UPSTREAM_GITHUB_REPO_URL,
+        "checkedAt": now_iso(),
+    }
+    if last_error:
+        fallback_payload["error"] = last_error
+    return fallback_payload
+
+
+def get_public_version_payload() -> Dict[str, Any]:
+    cache_key = f"publicVersion:{UPSTREAM_GITHUB_REPO}"
+    cached = read_cache_json(cache_key)
+    if isinstance(cached, dict) and str(cached.get("version") or "").strip():
+        return cached
+    payload = _fetch_github_version_payload(UPSTREAM_GITHUB_REPO)
+    write_cache_json(cache_key, payload, VERSION_CACHE_TTL_SECONDS if payload.get("source") != "local-fallback" else 300)
+    return payload
+
+
 def user_public_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return {
         "id": row["id"],
@@ -930,7 +1028,7 @@ class H(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok", "backend": "python-v2", "legacyProxy": LEGACY, "timestamp": now_iso()})
             return
         if path == "/api/version":
-            self._json(200, {"version": APP_VERSION})
+            self._json(200, get_public_version_payload())
             return
         if path == "/api/_python/migration-status":
             self._ok(

@@ -7,6 +7,7 @@ import { Plus, Settings, Search, Trash2, ArrowLeft } from 'lucide-vue-next';
 import { getCustomHostnames, createCustomHostname, deleteCustomHostname, getFallbackOrigin, updateFallbackOrigin } from '@/services/hostnames';
 import { useCredentialResolver } from '@/composables/useCredentialResolver';
 import { useResponsive } from '@/composables/useResponsive';
+import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import type { CustomHostname } from '@/types';
 import { h } from 'vue';
 
@@ -24,7 +25,7 @@ const newHostname = ref('');
 const newOriginServer = ref('');
 const fallbackOrigin = ref('');
 const page = ref(1);
-const pageSize = ref(parseInt(localStorage.getItem('dns_hostnames_page_size') || '20'));
+const pageSize = TABLE_PAGE_SIZE;
 
 // Hostnames query
 const { data: hostnamesData, isLoading, refetch } = useQuery({
@@ -44,14 +45,11 @@ const hostnames = computed(() => {
 });
 
 const paginatedHostnames = computed(() => {
-  const start = (page.value - 1) * pageSize.value;
-  return hostnames.value.slice(start, start + pageSize.value);
+  const start = (page.value - 1) * pageSize;
+  return hostnames.value.slice(start, start + pageSize);
 });
 
-watch([searchKeyword, pageSize], () => { page.value = 1; });
-watch(pageSize, (size) => {
-  localStorage.setItem('dns_hostnames_page_size', String(size));
-});
+watch(searchKeyword, () => { page.value = 1; });
 
 // Fallback origin query
 const { data: fallbackData, refetch: refetchFallback } = useQuery({
@@ -179,10 +177,8 @@ const columns = computed(() => [
       <div v-if="hostnames.length > pageSize" class="mt-4 flex justify-end">
         <NPagination
           v-model:page="page"
-          v-model:page-size="pageSize"
+          :page-size="pageSize"
           :item-count="hostnames.length"
-          :page-sizes="[20, 50, 100]"
-          show-size-picker
           show-quick-jumper
           size="small"
         />

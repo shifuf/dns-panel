@@ -5,14 +5,13 @@ import { NSelect, NDataTable, NTag, NSpin, NEmpty, NPagination, NButton, NDrawer
 import { cleanupLogs, clearLogs, getLogs } from '@/services/logs';
 import { getSystemSettings } from '@/services/auth';
 import { formatDateTime } from '@/utils/formatters';
-import { ACTION_TYPES, RESOURCE_TYPES, OPERATION_STATUS } from '@/utils/constants';
+import { ACTION_TYPES, RESOURCE_TYPES, OPERATION_STATUS, TABLE_PAGE_SIZE } from '@/utils/constants';
 import type { Log } from '@/types';
 import { h } from 'vue';
 
 const message = useMessage();
-const LOGS_PAGE_SIZE_KEY = 'dns_logs_page_size';
 const page = ref(1);
-const pageSize = ref(parseInt(localStorage.getItem(LOGS_PAGE_SIZE_KEY) || '50'));
+const pageSize = TABLE_PAGE_SIZE;
 const cleanupLoading = ref(false);
 const clearLoading = ref(false);
 const logRetentionDays = ref(90);
@@ -25,10 +24,10 @@ const selectedLog = ref<Log | null>(null);
 const showDetail = ref(false);
 
 const { data, isLoading, refetch } = useQuery({
-  queryKey: computed(() => ['logs', page.value, pageSize.value, filters.value]),
+  queryKey: computed(() => ['logs', page.value, pageSize, filters.value]),
   queryFn: () => getLogs({
     page: page.value,
-    limit: pageSize.value,
+    limit: pageSize,
     action: filters.value.action || undefined,
     resourceType: filters.value.resourceType || undefined,
     status: filters.value.status || undefined,
@@ -58,8 +57,8 @@ const tableData = computed(() => {
   if (data.value?.pagination?.total || (data.value?.data as any)?.pagination?.total) {
     return logs.value;
   }
-  const start = (page.value - 1) * pageSize.value;
-  return logs.value.slice(start, start + pageSize.value);
+  const start = (page.value - 1) * pageSize;
+  return logs.value.slice(start, start + pageSize);
 });
 
 const successCount = computed(() => logs.value.filter((log) => log.status === 'SUCCESS').length);
@@ -79,10 +78,6 @@ onMounted(async () => {
 });
 
 watch(filters, () => { page.value = 1; }, { deep: true });
-watch(pageSize, (size) => {
-  localStorage.setItem(LOGS_PAGE_SIZE_KEY, String(size));
-  page.value = 1;
-});
 
 const actionOptions = [
   { label: '全部', value: null },
@@ -372,10 +367,8 @@ const columns = computed(() => [
       <div v-if="total > pageSize" class="mt-4 flex justify-end">
         <NPagination
           v-model:page="page"
-          v-model:page-size="pageSize"
+          :page-size="pageSize"
           :item-count="total"
-          :page-sizes="[20, 50, 100, 200]"
-          show-size-picker
           show-quick-jumper
           size="small"
         />

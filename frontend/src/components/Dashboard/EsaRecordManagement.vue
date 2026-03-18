@@ -9,6 +9,7 @@ import {
   type EsaDnsRecord,
 } from '@/services/aliyunEsa';
 import { useResponsive } from '@/composables/useResponsive';
+import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import { h } from 'vue';
 
 const props = defineProps<{
@@ -31,7 +32,7 @@ const editingRecord = ref<EsaDnsRecord | null>(null);
 const showHttps = ref(false);
 const selectedRecordForCert = ref<string | null>(null);
 const page = ref(1);
-const pageSize = ref(parseInt(localStorage.getItem('dns_esa_records_page_size') || '20'));
+const pageSize = TABLE_PAGE_SIZE;
 
 // Form state
 const formType = ref('A');
@@ -57,12 +58,8 @@ const { data: recordsData, isLoading, refetch } = useQuery({
 
 const records = computed(() => recordsData.value || []);
 const paginatedRecords = computed(() => {
-  const start = (page.value - 1) * pageSize.value;
-  return records.value.slice(start, start + pageSize.value);
-});
-watch(pageSize, (size) => {
-  page.value = 1;
-  localStorage.setItem('dns_esa_records_page_size', String(size));
+  const start = (page.value - 1) * pageSize;
+  return records.value.slice(start, start + pageSize);
 });
 
 // CNAME status check
@@ -244,10 +241,8 @@ const columns = computed(() => [
     <div v-if="records.length > pageSize" class="mt-3 flex justify-end">
       <NPagination
         v-model:page="page"
-        v-model:page-size="pageSize"
+        :page-size="pageSize"
         :item-count="records.length"
-        :page-sizes="[20, 50, 100]"
-        show-size-picker
         show-quick-jumper
         size="small"
       />

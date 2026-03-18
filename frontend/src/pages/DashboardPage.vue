@@ -33,6 +33,7 @@ import {
 } from '@/services/dashboard';
 import { getStoredUser } from '@/services/auth';
 import { formatRelativeTime } from '@/utils/formatters';
+import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import type { Domain, Log } from '@/types';
 import type { ProviderType } from '@/types/dns';
 import { getProviderDisplayName } from '@/utils/provider';
@@ -49,7 +50,6 @@ const message = useMessage();
 const dialog = useDialog();
 const { isMobile } = useResponsive();
 
-const DOMAINS_PER_PAGE_KEY = 'dns_domains_per_page';
 const DASHBOARD_SYNC_TASKS_KEY = 'dns_dashboard_sync_tasks';
 const DASHBOARD_ALERT_RULES_KEY = 'dns_dashboard_alert_rules';
 const DASHBOARD_ALERT_EVENTS_KEY = 'dns_dashboard_alert_events';
@@ -59,7 +59,7 @@ const DASHBOARD_TAGS_KEY = 'dns_dashboard_domain_tags';
 const search = ref('');
 const expandedId = ref<string | null>(null);
 const currentPage = ref(1);
-const pageSize = ref(parseInt(localStorage.getItem(DOMAINS_PER_PAGE_KEY) || '20'));
+const pageSize = TABLE_PAGE_SIZE;
 const showAddEsa = ref(false);
 const showAddCredential = ref(false);
 const panelMode = ref<'dns' | 'esa'>('dns');
@@ -545,8 +545,8 @@ const sortedDomains = computed(() => {
 
 // Pagination
 const paginatedDomains = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value;
-  return sortedDomains.value.slice(start, start + pageSize.value);
+  const start = (currentPage.value - 1) * pageSize;
+  return sortedDomains.value.slice(start, start + pageSize);
 });
 
 const activeDomainCount = computed(() =>
@@ -1007,7 +1007,6 @@ async function saveCurrentView() {
     sortBy: sortBy.value,
     sortOrder: sortOrder.value,
     selectedTagFilter: selectedTagFilter.value,
-    pageSize: pageSize.value,
     panelMode: panelMode.value,
   };
   const localView: DashboardViewPreset = {
@@ -1276,10 +1275,6 @@ const columns = computed<DataTableColumns<Domain>>(() => {
 
 // Reset page on filter change
 watch([search, effectiveCredentialId, quickFilter, sortBy, sortOrder, panelMode, selectedTagFilter], () => { currentPage.value = 1; });
-watch(pageSize, (size) => {
-  localStorage.setItem(DOMAINS_PER_PAGE_KEY, String(size));
-  currentPage.value = 1;
-});
 
 watch(sortedDomains, (list) => {
   const valid = new Set(list.map(getDomainRowKey));
@@ -1296,7 +1291,6 @@ watch(selectedViewId, (id) => {
   sortBy.value = (payload.sortBy || 'updatedAt') as typeof sortBy.value;
   sortOrder.value = (payload.sortOrder || 'desc') as typeof sortOrder.value;
   selectedTagFilter.value = payload.selectedTagFilter || null;
-  pageSize.value = Number(payload.pageSize || 20);
   panelMode.value = (payload.panelMode || 'dns') as typeof panelMode.value;
   message.success(`已应用视图：${view.name}`);
 });
@@ -1696,10 +1690,8 @@ watch(domains, (list) => {
       <div v-if="filteredDomains.length > pageSize" class="mt-4 flex justify-end">
         <NPagination
           v-model:page="currentPage"
-          v-model:page-size="pageSize"
+          :page-size="pageSize"
           :item-count="filteredDomains.length"
-          :page-sizes="[20, 50, 100, 200]"
-          show-size-picker
           show-quick-jumper
           size="small"
         />

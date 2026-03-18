@@ -64,3 +64,8 @@ export const OPERATION_STATUS = {
   SUCCESS: '成功',
   FAILED: '失败',
 };
+
+/**
+ * 表格分页默认每页条数
+ */
+export const TABLE_PAGE_SIZE = 10;
