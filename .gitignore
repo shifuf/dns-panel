@@ -11,11 +11,10 @@ backend/db/*.backup
 backend/db/*.bak
 
 # Python artifacts
-backend/__pycache__/
-backend/modules/__pycache__/
-backend/**/*.pyc
-backend/**/*.pyo
-backend/**/*.pyd
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
 # Frontend dependencies and build outputs
 frontend/node_modules/

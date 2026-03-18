@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,7 +28,7 @@ from modules.dnspod_api import DnspodApi, DnspodApiError
 # ── Application version ─────────────────────────────────────────
 # Fallback version for local/offline environments. GitHub Releases are the
 # primary public version source and are created automatically by Actions.
-APP_VERSION = "0.02"
+APP_VERSION = os.getenv("APP_VERSION", "0.02").strip() or "0.02"
 UPSTREAM_GITHUB_REPO = os.getenv("UPSTREAM_GITHUB_REPO", "shifuf/dns-panel").strip() or "shifuf/dns-panel"
 UPSTREAM_GITHUB_REPO_URL = f"https://github.com/{UPSTREAM_GITHUB_REPO}"
 VERSION_CACHE_TTL_SECONDS = 1800
@@ -750,6 +751,73 @@ def write_cache_json(key: str, value: Any, ttl_seconds: int) -> None:
         c.commit()
 
 
+def normalize_version_tag(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text[1:] if text.lower().startswith("v") else text
+
+
+def parse_version_parts(value: str) -> List[int]:
+    normalized = normalize_version_tag(value)
+    match = re.match(r"^(\d+(?:\.\d+)*)", normalized)
+    if not match:
+        return []
+    return [int(part) for part in match.group(1).split(".")]
+
+
+def compare_versions(left: str, right: str) -> int:
+    left_parts = parse_version_parts(left)
+    right_parts = parse_version_parts(right)
+    if not left_parts and not right_parts:
+        return 0
+    max_length = max(len(left_parts), len(right_parts))
+    for idx in range(max_length):
+        left_value = left_parts[idx] if idx < len(left_parts) else 0
+        right_value = right_parts[idx] if idx < len(right_parts) else 0
+        if left_value != right_value:
+            return 1 if left_value > right_value else -1
+    return 0
+
+
+def format_version_label(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return f"v{APP_VERSION}"
+    return text if text.lower().startswith("v") else f"v{text}"
+
+
+def _resolve_git_version() -> str:
+    git_dir = BASE_DIR.parent / ".git"
+    if not git_dir.exists():
+        return ""
+    commands = [
+        ["git", "-C", str(BASE_DIR.parent), "describe", "--tags", "--always", "--dirty"],
+        ["git", "-C", str(BASE_DIR.parent), "tag", "--points-at", "HEAD"],
+    ]
+    for command in commands:
+        try:
+            output = subprocess.check_output(command, stderr=subprocess.DEVNULL, text=True, timeout=5).strip()
+            if not output:
+                continue
+            first_line = output.splitlines()[0].strip()
+            if first_line:
+                return first_line
+        except Exception:
+            continue
+    return ""
+
+
+def get_current_app_version() -> Dict[str, str]:
+    git_version = _resolve_git_version()
+    if git_version:
+        return {"version": git_version, "source": "git"}
+    env_version = os.getenv("APP_VERSION", "").strip()
+    if env_version:
+        return {"version": env_version, "source": "env"}
+    return {"version": APP_VERSION, "source": "fallback"}
+
+
 def _fetch_github_version_payload(repo: str) -> Dict[str, Any]:
     encoded_repo = urllib.parse.quote(repo, safe="/")
     headers = {
@@ -776,10 +844,16 @@ def _fetch_github_version_payload(repo: str) -> Dict[str, Any]:
                 payload = json.loads(resp.read().decode("utf-8"))
             version = reader(payload)
             if version:
+                release_url = ""
+                if isinstance(payload, dict):
+                    release_url = str(payload.get("html_url") or "").strip()
+                if not release_url:
+                    release_url = f"{UPSTREAM_GITHUB_REPO_URL}/releases/tag/{version}"
                 return {
-                    "version": version,
+                    "latestVersion": version,
                     "source": source,
                     "repo": UPSTREAM_GITHUB_REPO_URL,
+                    "releaseUrl": release_url,
                     "checkedAt": now_iso(),
                 }
         except urllib.error.HTTPError as exc:
@@ -789,9 +863,10 @@ def _fetch_github_version_payload(repo: str) -> Dict[str, Any]:
         except Exception as exc:
             last_error = str(exc)
     fallback_payload: Dict[str, Any] = {
-        "version": APP_VERSION,
+        "latestVersion": APP_VERSION,
         "source": "local-fallback",
         "repo": UPSTREAM_GITHUB_REPO_URL,
+        "releaseUrl": f"{UPSTREAM_GITHUB_REPO_URL}/releases/latest",
         "checkedAt": now_iso(),
     }
     if last_error:
@@ -799,13 +874,36 @@ def _fetch_github_version_payload(repo: str) -> Dict[str, Any]:
     return fallback_payload
 
 
-def get_public_version_payload() -> Dict[str, Any]:
+def get_public_version_payload(force_refresh: bool = False) -> Dict[str, Any]:
     cache_key = f"publicVersion:{UPSTREAM_GITHUB_REPO}"
-    cached = read_cache_json(cache_key)
-    if isinstance(cached, dict) and str(cached.get("version") or "").strip():
-        return cached
-    payload = _fetch_github_version_payload(UPSTREAM_GITHUB_REPO)
-    write_cache_json(cache_key, payload, VERSION_CACHE_TTL_SECONDS if payload.get("source") != "local-fallback" else 300)
+    current_info = get_current_app_version()
+    current_version = str(current_info.get("version") or APP_VERSION).strip() or APP_VERSION
+    cached = None if force_refresh else read_cache_json(cache_key)
+    release_payload = cached if isinstance(cached, dict) and str(cached.get("latestVersion") or "").strip() else None
+    if release_payload is None:
+        release_payload = _fetch_github_version_payload(UPSTREAM_GITHUB_REPO)
+        write_cache_json(
+            cache_key,
+            release_payload,
+            VERSION_CACHE_TTL_SECONDS if release_payload.get("source") != "local-fallback" else 300,
+        )
+    latest_version = str(release_payload.get("latestVersion") or current_version).strip() or current_version
+    update_available = compare_versions(latest_version, current_version) > 0
+    payload: Dict[str, Any] = {
+        "version": current_version,
+        "currentVersion": current_version,
+        "currentVersionLabel": format_version_label(current_version),
+        "currentVersionSource": current_info.get("source") or "fallback",
+        "latestVersion": latest_version,
+        "latestVersionLabel": format_version_label(latest_version),
+        "updateAvailable": update_available,
+        "source": release_payload.get("source") or "local-fallback",
+        "repo": release_payload.get("repo") or UPSTREAM_GITHUB_REPO_URL,
+        "releaseUrl": release_payload.get("releaseUrl") or f"{UPSTREAM_GITHUB_REPO_URL}/releases/latest",
+        "checkedAt": release_payload.get("checkedAt") or now_iso(),
+    }
+    if release_payload.get("error"):
+        payload["error"] = release_payload["error"]
     return payload
 
 
@@ -1030,7 +1128,8 @@ class H(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok", "backend": "python-v2", "legacyProxy": LEGACY, "timestamp": now_iso()})
             return
         if path == "/api/version":
-            self._json(200, get_public_version_payload())
+            force_refresh = str(q.get("refresh", ["0"])[0]).strip().lower() in {"1", "true", "yes"}
+            self._json(200, get_public_version_payload(force_refresh))
             return
         if path == "/api/_python/migration-status":
             self._ok(

@@ -20,10 +20,29 @@ const queryClient = useQueryClient();
 const providerStore = useProviderStore();
 const user = getStoredUser();
 const isAdmin = computed(() => !user?.role || user.role === 'admin');
+const fallbackVersion = '0.02';
 const APP_VERSION = ref('...');
+const latestVersion = ref('');
+const versionCheckedAt = ref('');
+const releaseUrl = ref('');
+const versionError = ref('');
+const updateChecking = ref(false);
+const updateAvailable = ref(false);
 const appVersionLabel = computed(() => {
-  const version = APP_VERSION.value.trim() || '0.02';
+  const version = APP_VERSION.value.trim() || fallbackVersion;
   return version.startsWith('v') ? version : `v${version}`;
+});
+const latestVersionLabel = computed(() => {
+  const version = latestVersion.value.trim() || APP_VERSION.value.trim() || fallbackVersion;
+  return version.startsWith('v') ? version : `v${version}`;
+});
+const versionStatusText = computed(() => updateAvailable.value ? '发现新版本' : '已是最新版本');
+const versionStatusTone = computed(() => updateAvailable.value ? 'text-amber-600' : 'text-emerald-600');
+const versionCheckedAtLabel = computed(() => {
+  if (!versionCheckedAt.value) return '未检查';
+  const date = new Date(versionCheckedAt.value);
+  if (Number.isNaN(date.getTime())) return versionCheckedAt.value;
+  return date.toLocaleString('zh-CN', { hour12: false });
 });
 
 // System settings
@@ -40,14 +59,45 @@ const selectedBackupFile = ref<File | null>(null);
 const restoreFileInput = ref<HTMLInputElement | null>(null);
 const dnsCredentialPanelKey = ref(0);
 
-onMounted(async () => {
+async function fetchVersionInfo(forceRefresh = false, silent = false) {
+  updateChecking.value = true;
+  versionError.value = '';
   try {
-    const res = await api.get('/version');
+    const suffix = forceRefresh ? '?refresh=1' : '';
+    const res = await api.get(`/version${suffix}`);
     const data = res as any;
-    APP_VERSION.value = data?.version || data?.data?.version || '0.02';
-  } catch {
-    APP_VERSION.value = '0.02';
+    const payload = data?.data || data || {};
+    APP_VERSION.value = payload.currentVersion || payload.version || fallbackVersion;
+    latestVersion.value = payload.latestVersion || payload.version || APP_VERSION.value || fallbackVersion;
+    versionCheckedAt.value = payload.checkedAt || '';
+    releaseUrl.value = payload.releaseUrl || payload.repo || '';
+    updateAvailable.value = Boolean(payload.updateAvailable);
+    versionError.value = payload.error || '';
+    if (forceRefresh && !silent) {
+      message.success(updateAvailable.value ? `检测到新版本 ${latestVersionLabel.value}` : '当前已经是最新版本');
+    }
+  } catch (err: any) {
+    APP_VERSION.value = APP_VERSION.value.trim() || fallbackVersion;
+    latestVersion.value = latestVersion.value.trim() || APP_VERSION.value;
+    versionError.value = String(err);
+    if (!silent) {
+      message.error('检查更新失败');
+    }
+  } finally {
+    updateChecking.value = false;
   }
+}
+
+function openReleasePage() {
+  if (!releaseUrl.value) {
+    message.warning('暂无可用的发布地址');
+    return;
+  }
+  window.open(releaseUrl.value, '_blank', 'noopener,noreferrer');
+}
+
+onMounted(async () => {
+  await fetchVersionInfo(false, true);
   try {
     const sysRes = await getSystemSettings();
     const sd = (sysRes as any)?.data || sysRes;
@@ -338,12 +388,46 @@ async function handleRestoreBackup() {
             <div class="relative z-10">
               <p class="text-xs font-semibold uppercase tracking-widest text-slate-500">系统版本</p>
               <p class="mt-2 text-3xl bg-gradient-to-r from-amber-600 to-orange-600 bg-clip-text text-transparent">{{ appVersionLabel }}</p>
-              <div class="mt-3 flex items-center gap-2">
+              <div class="mt-3 flex items-center gap-2 flex-wrap">
                 <span class="text-xs text-slate-500">当前版本</span>
                 <span class="text-xs font-semibold text-amber-600">{{ appVersionLabel }}</span>
+                <span class="text-xs font-semibold" :class="versionStatusTone">{{ versionStatusText }}</span>
               </div>
+              <div class="mt-3 flex items-center gap-2 flex-wrap">
+                <span class="text-xs text-slate-500">最新版本</span>
+                <span class="text-xs font-semibold text-slate-700">{{ latestVersionLabel }}</span>
+              </div>
+              <div class="mt-3 flex items-center gap-2 flex-wrap">
+                <NButton size="tiny" tertiary type="primary" :loading="updateChecking" @click="fetchVersionInfo(true)">
+                  检查更新
+                </NButton>
+                <NButton v-if="releaseUrl" size="tiny" tertiary @click="openReleasePage">
+                  查看发布
+                </NButton>
+              </div>
+              <p class="mt-3 text-xs text-slate-500">最近检查：{{ versionCheckedAtLabel }}</p>
+              <p v-if="versionError" class="mt-2 text-xs text-amber-600 break-all">{{ versionError }}</p>
+              <p v-if="updateAvailable" class="mt-2 text-xs text-amber-700">检测到新版本 {{ latestVersionLabel }}，可前往发布页查看更新说明并升级。</p>
+              <p v-else class="mt-2 text-xs text-emerald-700">当前运行版本与最新发布版本一致。</p>
             </div>
           </article>
+        </div>
+
+        <div v-if="updateAvailable" class="mb-6 rounded-3xl border border-amber-200 bg-gradient-to-r from-amber-50 to-orange-50 px-5 py-4">
+          <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+              <p class="text-sm font-semibold text-amber-900">发现可更新版本 {{ latestVersionLabel }}</p>
+              <p class="mt-1 text-sm text-amber-800">当前为 {{ appVersionLabel }}，建议查看 Release 内容后执行升级。</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <NButton size="small" type="primary" :loading="updateChecking" @click="fetchVersionInfo(true)">
+                重新检测
+              </NButton>
+              <NButton v-if="releaseUrl" size="small" tertiary type="primary" @click="openReleasePage">
+                查看更新
+              </NButton>
+            </div>
+          </div>
         </div>
 
         <!-- 设置表单部分 -->
@@ -624,9 +708,22 @@ async function handleRestoreBackup() {
               <p class="text-xs font-semibold uppercase tracking-widest text-slate-500">系统版本</p>
             </div>
             <p class="mt-2 text-3xl bg-gradient-to-r from-amber-600 to-orange-600 bg-clip-text text-transparent">{{ appVersionLabel }}</p>
-            <div class="mt-3 flex items-center gap-2">
+            <div class="mt-3 flex items-center gap-2 flex-wrap">
               <span class="text-xs text-slate-500">当前版本</span>
               <span class="text-xs font-semibold text-amber-600">{{ appVersionLabel }}</span>
+              <span class="text-xs font-semibold" :class="versionStatusTone">{{ versionStatusText }}</span>
+            </div>
+            <div class="mt-3 flex items-center gap-2 flex-wrap">
+              <span class="text-xs text-slate-500">最新版本</span>
+              <span class="text-xs font-semibold text-slate-700">{{ latestVersionLabel }}</span>
+            </div>
+            <div class="mt-3 flex items-center gap-2 flex-wrap">
+              <NButton size="tiny" tertiary type="primary" :loading="updateChecking" @click="fetchVersionInfo(true)">
+                检查更新
+              </NButton>
+              <NButton v-if="releaseUrl" size="tiny" tertiary @click="openReleasePage">
+                查看发布
+              </NButton>
             </div>
           </div>
         </div>
@@ -636,6 +733,10 @@ async function handleRestoreBackup() {
           <div class="mt-4 space-y-3">
             <p class="text-sm text-slate-600">DNS 管理系统是一个功能强大的域名管理工具，支持多服务商集成、SSL 证书管理和域名到期监控。</p>
             <p class="text-sm text-slate-600">版本: {{ appVersionLabel }}</p>
+            <p class="text-sm text-slate-600">最新发布: {{ latestVersionLabel }}</p>
+            <p class="text-sm" :class="updateAvailable ? 'text-amber-700' : 'text-emerald-700'">{{ versionStatusText }}</p>
+            <p class="text-sm text-slate-600">最近检查: {{ versionCheckedAtLabel }}</p>
+            <p v-if="versionError" class="text-sm text-amber-600 break-all">检查更新异常: {{ versionError }}</p>
             <p class="text-sm text-slate-600">版权所有 © {{ new Date().getFullYear() }}</p>
           </div>
         </div>
