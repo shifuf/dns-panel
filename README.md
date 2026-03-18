@@ -150,6 +150,12 @@ services:
 
 ## 更新流程
 
+### GitHub 自动发布
+
+- 推送到 `main` 后会自动触发 GitHub Actions 发布
+- 工作流会基于最新的 `v*` 标签自动计算下一个版本号，起始版本为 `v0.02`
+- Release 会自动附带 `frontend-build.zip` 和 `backend-build.zip`
+
 ### 自动更新
 
 ```bash

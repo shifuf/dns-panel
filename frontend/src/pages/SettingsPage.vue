@@ -6,6 +6,7 @@ import { useQueryClient } from '@tanstack/vue-query';
 import type { BackupPayload } from '@/types';
 import { getStoredUser, updatePassword, updateDomainExpirySettings, saveAuthData, getSystemSettings, updateSystemSettings, exportBackup, restoreBackup } from '@/services/auth';
 import { isStrongPassword } from '@/utils/validators';
+import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import TwoFactorSettings from '@/components/Settings/TwoFactorSettings.vue';
 import DnsCredentialManagement from '@/components/Settings/DnsCredentialManagement.vue';
 import api from '@/services/api';
@@ -20,6 +21,10 @@ const providerStore = useProviderStore();
 const user = getStoredUser();
 const isAdmin = computed(() => !user?.role || user.role === 'admin');
 const APP_VERSION = ref('...');
+const appVersionLabel = computed(() => {
+  const version = APP_VERSION.value.trim() || '0.02';
+  return version.startsWith('v') ? version : `v${version}`;
+});
 
 // System settings
 const systemSettingsLoading = ref(false);
@@ -39,9 +44,9 @@ onMounted(async () => {
   try {
     const res = await api.get('/version');
     const data = res as any;
-    APP_VERSION.value = data?.version || data?.data?.version || '0.1';
+    APP_VERSION.value = data?.version || data?.data?.version || '0.02';
   } catch {
-    APP_VERSION.value = '0.1';
+    APP_VERSION.value = '0.02';
   }
   try {
     const sysRes = await getSystemSettings();
@@ -93,8 +98,6 @@ async function handlePasswordChange() {
 }
 
 // Domain settings
-const DOMAINS_PER_PAGE_KEY = 'dns_domains_per_page';
-const domainsPerPage = ref('20');
 const expiryDisplayMode = ref<'date' | 'days'>('date');
 const expiryThresholdDays = ref('7');
 const expiryNotifyEnabled = ref(false);
@@ -128,9 +131,6 @@ const backupScopeSummary = computed(() => getSelectedScopes('backup').map((scope
 const restoreScopeSummary = computed(() => getSelectedScopes('restore').map((scope) => scope.toUpperCase()));
 
 onMounted(() => {
-  const raw = localStorage.getItem(DOMAINS_PER_PAGE_KEY);
-  if (raw) domainsPerPage.value = raw;
-
   if (user) {
     expiryDisplayMode.value = user.domainExpiryDisplayMode || 'date';
     expiryThresholdDays.value = String(user.domainExpiryThresholdDays || 7);
@@ -145,13 +145,6 @@ onMounted(() => {
     smtpFrom.value = user.smtpFrom || '';
   }
 });
-
-function saveDomainsPerPage() {
-  const val = parseInt(domainsPerPage.value);
-  if (isNaN(val) || val < 5) { message.error('每页至少 5 条'); return; }
-  localStorage.setItem(DOMAINS_PER_PAGE_KEY, String(val));
-  message.success('已保存');
-}
 
 async function saveExpirySettings() {
   try {
@@ -308,10 +301,10 @@ async function handleRestoreBackup() {
             <div class="absolute left-3 bottom-3 w-12 h-12 rounded-full bg-gradient-to-br from-blue-400/25 to-indigo-400/25 blur-lg" />
             <div class="relative z-10">
               <p class="text-xs font-semibold uppercase tracking-widest text-slate-500">域名分页</p>
-              <p class="mt-2 text-3xl text-slate-700">{{ domainsPerPage }} 条/页</p>
+              <p class="mt-2 text-3xl text-slate-700">{{ TABLE_PAGE_SIZE }} 条/页</p>
               <div class="mt-3 flex items-center gap-2">
-                <span class="text-xs text-slate-500">每页显示</span>
-                <span class="text-xs font-semibold text-blue-600">{{ domainsPerPage }}</span>
+                <span class="text-xs text-slate-500">统一默认</span>
+                <span class="text-xs font-semibold text-blue-600">所有表格自动分页</span>
               </div>
             </div>
           </article>
@@ -344,10 +337,10 @@ async function handleRestoreBackup() {
             <div class="absolute right-3 bottom-3 w-10 h-10 rounded-full bg-gradient-to-br from-amber-400/25 to-orange-400/25 blur-lg" />
             <div class="relative z-10">
               <p class="text-xs font-semibold uppercase tracking-widest text-slate-500">系统版本</p>
-              <p class="mt-2 text-3xl bg-gradient-to-r from-amber-600 to-orange-600 bg-clip-text text-transparent">{{ APP_VERSION }}</p>
+              <p class="mt-2 text-3xl bg-gradient-to-r from-amber-600 to-orange-600 bg-clip-text text-transparent">{{ appVersionLabel }}</p>
               <div class="mt-3 flex items-center gap-2">
                 <span class="text-xs text-slate-500">当前版本</span>
-                <span class="text-xs font-semibold text-amber-600">v{{ APP_VERSION }}</span>
+                <span class="text-xs font-semibold text-amber-600">{{ appVersionLabel }}</span>
               </div>
             </div>
           </article>
@@ -393,14 +386,6 @@ async function handleRestoreBackup() {
               <p class="bento-section-meta">统一设置展示与通知触发策略</p>
               <h3 class="mb-3 mt-2 text-base font-semibold text-slate-700">域名设置</h3>
               <div class="space-y-3">
-                <div class="settings-subpanel">
-                  <label class="mb-1 block text-sm text-slate-400">每页显示</label>
-                  <div class="flex gap-4">
-                    <NInput v-model:value="domainsPerPage" type="number" size="small" class="!w-24" />
-                    <NButton size="small" @click="saveDomainsPerPage">保存</NButton>
-                  </div>
-                </div>
-
                 <div class="settings-subpanel">
                   <label class="mb-2 block text-sm text-slate-400">到期显示方式</label>
                   <NRadioGroup v-model:value="expiryDisplayMode" size="small">
@@ -638,10 +623,10 @@ async function handleRestoreBackup() {
               <Info :size="14" class="text-amber-600" />
               <p class="text-xs font-semibold uppercase tracking-widest text-slate-500">系统版本</p>
             </div>
-            <p class="mt-2 text-3xl bg-gradient-to-r from-amber-600 to-orange-600 bg-clip-text text-transparent">{{ APP_VERSION }}</p>
+            <p class="mt-2 text-3xl bg-gradient-to-r from-amber-600 to-orange-600 bg-clip-text text-transparent">{{ appVersionLabel }}</p>
             <div class="mt-3 flex items-center gap-2">
               <span class="text-xs text-slate-500">当前版本</span>
-              <span class="text-xs font-semibold text-amber-600">v{{ APP_VERSION }}</span>
+              <span class="text-xs font-semibold text-amber-600">{{ appVersionLabel }}</span>
             </div>
           </div>
         </div>
@@ -650,7 +635,7 @@ async function handleRestoreBackup() {
           <p class="bento-section-meta">DNS 管理系统</p>
           <div class="mt-4 space-y-3">
             <p class="text-sm text-slate-600">DNS 管理系统是一个功能强大的域名管理工具，支持多服务商集成、SSL 证书管理和域名到期监控。</p>
-            <p class="text-sm text-slate-600">版本: v{{ APP_VERSION }}</p>
+            <p class="text-sm text-slate-600">版本: {{ appVersionLabel }}</p>
             <p class="text-sm text-slate-600">版权所有 © {{ new Date().getFullYear() }}</p>
           </div>
         </div>

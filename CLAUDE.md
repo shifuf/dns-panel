@@ -1,16 +1,11 @@
 # DNS Panel Project Rules
 
-## Version Numbering (MANDATORY)
+## Version Numbering
 
-Every code update MUST increment the version number in `backend/app.py`:
+Version releases are created automatically by GitHub Actions on every push to `main`.
 
-```python
-APP_VERSION = "0.1"  # <-- increment this on every change
-```
-
-- Version starts from `0.1`
-- Minor changes: increment patch (e.g., `0.1` -> `0.2`)
-- Feature additions: increment minor (e.g., `0.9` -> `1.0`)
-- The backend exposes `GET /api/version` (no auth required) returning `{"version": "X.Y"}`
+- The first automated release created by the workflow is `v0.02`
+- Subsequent releases automatically increment the last numeric segment of the latest `v*` tag
+- `backend/app.py` keeps a fallback `APP_VERSION` for local or offline use only; it is not meant to be manually incremented on every code change
+- The backend exposes `GET /api/version` (no auth required)
 - The frontend `SettingsPage.vue` reads from this endpoint dynamically
-- This rule applies regardless of which IDE, AI tool, or developer makes the change

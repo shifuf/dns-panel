@@ -8,6 +8,7 @@ import { useProviderStore } from '@/stores/provider';
 import { useCredentialResolver } from '@/composables/useCredentialResolver';
 import { useResponsive } from '@/composables/useResponsive';
 import { formatDateTime } from '@/utils/formatters';
+import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import type { Tunnel } from '@/types';
 import TunnelDetailsPanel from '@/components/Tunnels/TunnelDetailsPanel.vue';
 import TunnelPublicHostnamesDialog from '@/components/Tunnels/TunnelPublicHostnamesDialog.vue';
@@ -25,7 +26,7 @@ const createName = ref('');
 const expandedId = ref<string | null>(null);
 const publicHostnamesTunnel = ref<Tunnel | null>(null);
 const page = ref(1);
-const pageSize = ref(parseInt(localStorage.getItem('dns_tunnels_page_size') || '20'));
+const pageSize = TABLE_PAGE_SIZE;
 
 // Tunnels query
 const { data: tunnelsData, isLoading, refetch } = useQuery({
@@ -46,14 +47,11 @@ const tunnels = computed(() => {
 });
 
 const paginatedTunnels = computed(() => {
-  const start = (page.value - 1) * pageSize.value;
-  return tunnels.value.slice(start, start + pageSize.value);
+  const start = (page.value - 1) * pageSize;
+  return tunnels.value.slice(start, start + pageSize);
 });
 
-watch([searchKeyword, pageSize], () => { page.value = 1; });
-watch(pageSize, (size) => {
-  localStorage.setItem('dns_tunnels_page_size', String(size));
-});
+watch(searchKeyword, () => { page.value = 1; });
 
 const statusType: Record<string, 'success' | 'warning' | 'error' | 'default'> = {
   healthy: 'success', degraded: 'warning', down: 'error', inactive: 'default',
@@ -197,10 +195,8 @@ const columns = computed(() => [
       <div v-if="tunnels.length > pageSize" class="mt-4 flex justify-end">
         <NPagination
           v-model:page="page"
-          v-model:page-size="pageSize"
+          :page-size="pageSize"
           :item-count="tunnels.length"
-          :page-sizes="[20, 50, 100]"
-          show-size-picker
           show-quick-jumper
           size="small"
         />

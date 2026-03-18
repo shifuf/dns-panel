@@ -19,6 +19,7 @@ import { getDomains } from '@/services/domains';
 import AddZoneDialog from '@/components/Dashboard/AddZoneDialog.vue';
 import type { SslCredential, RenewResult } from '@/services/ssl';
 import { useResponsive } from '@/composables/useResponsive';
+import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import type { SslCertificate, SslCertificateDetail, SslCertificateStatus } from '@/types/ssl';
 import type { Domain } from '@/types';
 
@@ -171,7 +172,7 @@ const showCredList = ref(false);
 
 // ── Certificate list ───────────────────────────────────────────
 const page = ref(1);
-const pageSize = ref(20);
+const pageSize = TABLE_PAGE_SIZE;
 const searchKeyword = ref('');
 const filterCredentialId = ref<number | null>(null);
 const hasActiveApplying = ref(false);
@@ -186,21 +187,21 @@ const {
     'ssl-certificates',
     selectedCredentialId.value,
     page.value,
-    pageSize.value,
+    pageSize,
     searchKeyword.value,
     filterCredentialId.value,
   ]),
   queryFn: async () => {
-    if (!selectedCredentialId.value) return { data: [], pagination: { total: 0, page: 1, limit: 20, pages: 0 }, errors: undefined };
+    if (!selectedCredentialId.value) return { data: [], pagination: { total: 0, page: 1, limit: pageSize, pages: 0 }, errors: undefined };
     const res = await getSslCertificates(selectedCredentialId.value, {
       page: page.value,
-      limit: pageSize.value,
+      limit: pageSize,
       search: searchKeyword.value || undefined,
       filterCredentialId: filterCredentialId.value || undefined,
     });
     return {
       data: res.data || [],
-      pagination: res.pagination || { total: 0, page: 1, limit: 20, pages: 0 },
+      pagination: res.pagination || { total: 0, page: 1, limit: pageSize, pages: 0 },
       errors: res.errors,
     };
   },
@@ -1382,9 +1383,7 @@ const columns = computed(() => {
           v-model:page="page"
           :page-size="pageSize"
           :item-count="totalCount"
-          :page-sizes="[20, 50, 100]"
-          show-size-picker
-          @update:page-size="(s: number) => { pageSize = s; page = 1; }"
+          show-quick-jumper
         />
       </div>
     </section>

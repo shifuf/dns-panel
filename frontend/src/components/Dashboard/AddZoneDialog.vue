@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue';
-import { NModal, NInput, NButton, NSelect, NAlert, NTag, NSpin, NDataTable } from 'naive-ui';
+import { NModal, NInput, NButton, NSelect, NAlert, NTag, NSpin, NDataTable, NPagination } from 'naive-ui';
 import { useQueryClient, useMutation } from '@tanstack/vue-query';
 import { addZones } from '@/services/domains';
+import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import type { DnsCredential } from '@/types/dns';
 import type { AddZoneResult } from '@/services/domains';
 import { h } from 'vue';
@@ -20,6 +21,7 @@ const queryClient = useQueryClient();
 const credentialId = ref<number | null>(null);
 const domainsText = ref('');
 const results = ref<AddZoneResult[] | null>(null);
+const resultPage = ref(1);
 const submitError = ref('');
 
 watch(() => props.show, (open) => {
@@ -27,6 +29,7 @@ watch(() => props.show, (open) => {
     credentialId.value = props.initialCredentialId ?? props.credentials[0]?.id ?? null;
     domainsText.value = props.initialDomainsText ?? '';
     results.value = null;
+    resultPage.value = 1;
     submitError.value = '';
   }
 });
@@ -34,6 +37,12 @@ watch(() => props.show, (open) => {
 const credentialOptions = computed(() =>
   props.credentials.map(c => ({ label: c.name, value: c.id }))
 );
+
+const paginatedResults = computed(() => {
+  const list = results.value || [];
+  const start = (resultPage.value - 1) * TABLE_PAGE_SIZE;
+  return list.slice(start, start + TABLE_PAGE_SIZE);
+});
 
 function parseDomains(text: string): string[] {
   const seen = new Set<string>();
@@ -56,6 +65,7 @@ const mutation = useMutation({
   },
   onSuccess: (res) => {
     results.value = res.data?.results || [];
+    resultPage.value = 1;
     queryClient.invalidateQueries({ queryKey: ['domains'] });
   },
   onError: (err: any) => { submitError.value = String(err); },
@@ -109,15 +119,24 @@ function close() { emit('update:show', false); }
             { title: '域名', key: 'domain' },
             { title: '状态', key: 'status', width: 100, render(row: AddZoneResult) { return h(NTag, { type: row.success ? 'success' : 'error', size: 'small', bordered: false }, () => row.success ? (row.existed ? '已存在' : '成功') : '失败'); } },
           ]"
-          :data="results"
+          :data="paginatedResults"
           :row-key="(r: AddZoneResult) => r.domain"
           :bordered="false"
           size="small"
           class="table-scrollable"
           :max-height="300"
           :scroll-x="380"
-          :virtual-scroll="results.length > 120"
+          :virtual-scroll="paginatedResults.length > 120"
         />
+        <div v-if="results.length > TABLE_PAGE_SIZE" class="flex justify-end">
+          <NPagination
+            v-model:page="resultPage"
+            :page-size="TABLE_PAGE_SIZE"
+            :item-count="results.length"
+            show-quick-jumper
+            size="small"
+          />
+        </div>
         <div class="flex justify-end">
           <NButton type="primary" @click="close">完成</NButton>
         </div>

@@ -18,14 +18,13 @@ import { Edit2, Trash2, Check, X, Settings2, ArrowUp, ArrowDown } from 'lucide-v
 import { useProviderStore } from '@/stores/provider';
 import { useResponsive } from '@/composables/useResponsive';
 import { formatTTL } from '@/utils/formatters';
-import { TTL_OPTIONS } from '@/utils/constants';
+import { TTL_OPTIONS, TABLE_PAGE_SIZE } from '@/utils/constants';
 import type { DNSRecord } from '@/types';
 import type { DnsLine } from '@/types/dns';
 import type { RecordsResponseCapabilities } from '@/services/dns';
 
 type ColumnKey = 'type' | 'name' | 'content' | 'proxied' | 'line' | 'ttl' | 'enabled' | 'remark' | 'actions';
 
-const PAGE_SIZE_KEY = 'dns_records_page_size';
 const COLUMN_ORDER_KEY = 'dns_records_column_order_v1';
 const HIDDEN_COLUMNS_KEY = 'dns_records_hidden_columns_v1';
 
@@ -65,7 +64,7 @@ const mobileEditVisible = ref(false);
 const editForm = ref<any>({});
 
 const currentPage = ref(1);
-const pageSize = ref(parseInt(localStorage.getItem(PAGE_SIZE_KEY) || (isMobile.value ? '8' : '20')));
+const pageSize = TABLE_PAGE_SIZE;
 const checkedRowKeys = ref<string[]>([]);
 const columnOrder = ref<ColumnKey[]>([]);
 const hiddenColumns = ref<ColumnKey[]>([]);
@@ -109,22 +108,17 @@ watch(availableColumns, () => {
   initColumnPrefs();
 }, { immediate: true });
 
-watch(pageSize, (size) => {
-  localStorage.setItem(PAGE_SIZE_KEY, String(size));
-  currentPage.value = 1;
-});
-
 const visibleRecords = computed(() =>
   props.records.filter((r) => !(r.type === 'NS' && r.name === r.zoneName))
 );
 
 const paginatedRecords = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value;
-  return visibleRecords.value.slice(start, start + pageSize.value);
+  const start = (currentPage.value - 1) * pageSize;
+  return visibleRecords.value.slice(start, start + pageSize);
 });
 
-watch([() => visibleRecords.value.length, pageSize], () => {
-  const maxPage = Math.max(1, Math.ceil(visibleRecords.value.length / pageSize.value));
+watch(() => visibleRecords.value.length, () => {
+  const maxPage = Math.max(1, Math.ceil(visibleRecords.value.length / pageSize));
   if (currentPage.value > maxPage) currentPage.value = 1;
 });
 
@@ -588,10 +582,8 @@ const columns = computed(() => {
     <div v-if="visibleRecords.length > pageSize" class="mt-4 flex justify-end">
       <NPagination
         v-model:page="currentPage"
-        v-model:page-size="pageSize"
+        :page-size="pageSize"
         :item-count="visibleRecords.length"
-        :page-sizes="[10, 20, 50, 100, 200]"
-        show-size-picker
         show-quick-jumper
         size="small"
       />

@@ -1,4 +1,5 @@
 .ace-tool/
+.claude/
 .env
 
 # Runtime database files
@@ -11,6 +12,7 @@ backend/db/*.bak
 
 # Python artifacts
 backend/__pycache__/
+backend/**/__pycache__
 backend/**/*.pyc
 backend/**/*.pyo
 backend/**/*.pyd
