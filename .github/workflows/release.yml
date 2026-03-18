@@ -53,6 +53,7 @@ jobs:
 
             if (releaseTags.length === 0) {
               core.info(`No prior release tag found, using ${fallbackTag}`);
+              core.setOutput("previous_tag", "");
               core.setOutput("tag", fallbackTag);
               return;
             }
@@ -73,7 +74,43 @@ jobs:
 
             const nextTag = `v${formattedParts.join(".")}`;
             core.info(`Latest release tag ${latestTag}, next release tag ${nextTag}`);
+            core.setOutput("previous_tag", latestTag);
             core.setOutput("tag", nextTag);
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          notes_file="release-assets/release-notes.md"
+          mkdir -p release-assets
+
+          current_tag="${{ steps.version.outputs.tag }}"
+          previous_tag="${{ steps.version.outputs.previous_tag }}"
+
+          {
+            echo "# ${current_tag}"
+            echo
+            echo "## 更新内容"
+            echo
+
+            if [ -n "$previous_tag" ]; then
+              if git rev-list --count "${previous_tag}..${GITHUB_SHA}" >/dev/null 2>&1 && [ "$(git rev-list --count "${previous_tag}..${GITHUB_SHA}")" -gt 0 ]; then
+                git log "${previous_tag}..${GITHUB_SHA}" --reverse --pretty=format:'- %s (%h)'
+              else
+                echo "- 无代码变更"
+              fi
+            else
+              git log "${GITHUB_SHA}" --reverse --pretty=format:'- %s (%h)'
+            fi
+
+            echo
+            echo
+            echo "## 构建产物"
+            echo
+            echo "- frontend-build.zip"
+            echo "- backend-build.zip"
+          } > "$notes_file"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -111,7 +148,7 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Release ${{ steps.version.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          generate_release_notes: true
+          body_path: release-assets/release-notes.md
           files: |
             release-assets/frontend-build.zip
             release-assets/backend-build.zip
