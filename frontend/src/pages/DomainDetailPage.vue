@@ -262,6 +262,15 @@ const accelerationStatusDisplay = computed(() => {
   return accelerationStatusMeta.value;
 });
 
+const canEnableAccelerationWhenAddingRecord = computed(() =>
+  !accelerationConfig.value && accelerationCredentials.value.length > 0 && typeof credentialId.value === 'number' && !!zoneName.value,
+);
+
+const addRecordAccelerationLabel = computed(() => {
+  const selected = accelerationCredentials.value.find((item) => item.id === selectedAccelerationCredentialId.value);
+  return selected ? `创建后自动接入加速（${selected.name}）` : '创建后自动接入加速';
+});
+
 function copyText(text: string | undefined) {
   if (!text) return;
   navigator.clipboard.writeText(text).then(
@@ -408,8 +417,46 @@ const disableAccelerationMutation = useMutation({
 
 // Mutations
 const createMutation = useMutation({
-  mutationFn: (params: Parameters<typeof createDNSRecord>[1]) => createDNSRecord(zoneId.value, params, credentialId.value),
-  onSuccess: () => { message.success('记录已添加'); showAddDialog.value = false; refetchRecords(); },
+  mutationFn: async (params: Parameters<typeof createDNSRecord>[1] & { enableAcceleration?: boolean }) => {
+    const { enableAcceleration: enableAfterCreate, ...recordParams } = params;
+    const recordResult = await createDNSRecord(zoneId.value, recordParams, credentialId.value);
+    let accelerationResult: Awaited<ReturnType<typeof enableAcceleration>> | null = null;
+    if (
+      enableAfterCreate
+      && canEnableAccelerationWhenAddingRecord.value
+      && typeof credentialId.value === 'number'
+      && selectedAccelerationCredentialId.value
+      && zoneName.value
+    ) {
+      accelerationResult = await enableAcceleration({
+        zoneName: zoneName.value,
+        zoneId: zoneId.value,
+        dnsCredentialId: credentialId.value,
+        pluginCredentialId: selectedAccelerationCredentialId.value,
+        autoDnsRecord: true,
+      });
+    }
+    return { recordResult, accelerationResult };
+  },
+  onSuccess: async (result) => {
+    let text = '记录已添加';
+    if (result.accelerationResult) {
+      const added = result.accelerationResult.data?.dnsRecordsAdded?.length || 0;
+      const skipped = result.accelerationResult.data?.dnsRecordsSkipped?.length || 0;
+      const failed = result.accelerationResult.data?.dnsErrors?.length || 0;
+      text += '，并已提交加速接入';
+      if (added) text += `（新增 ${added} 条验证记录）`;
+      if (skipped) text += `（${skipped} 条验证记录已存在）`;
+      if (failed) text += `（${failed} 条验证记录写入失败）`;
+    }
+    message.success(text);
+    showAddDialog.value = false;
+    await refetchRecords();
+    await refetchAccelerationConfig();
+    await refetchDiscoveredAcceleration();
+    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
+    queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
+  },
   onError: (err: any) => message.error(String(err)),
 });
 
@@ -854,6 +901,8 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
       :lines="lines"
       :min-ttl="minTTL"
       :loading="createMutation.isPending.value"
+      :show-acceleration-toggle="canEnableAccelerationWhenAddingRecord"
+      :acceleration-toggle-label="addRecordAccelerationLabel"
       @submit="handleAddSubmit"
     />
     <AddAccelerationCredentialDialog

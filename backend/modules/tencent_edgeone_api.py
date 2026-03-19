@@ -133,7 +133,7 @@ class TencentEdgeOneApi:
 
     def list_zones(self, offset: int = 0, limit: int = 100) -> Dict[str, Any]:
         payload = {"Offset": max(0, int(offset)), "Limit": max(1, min(int(limit), 100))}
-        resp = self._tc3_request("DescribeZones", payload, version="2022-01-06")
+        resp = self._tc3_request("DescribeZones", payload)
         raw_zones = resp.get("Zones") or resp.get("ZoneSet") or []
         zones = [self._normalize_zone(item) for item in raw_zones if isinstance(item, dict)]
         return {
@@ -229,8 +229,7 @@ class TencentEdgeOneApi:
             raise TencentEdgeOneApiError("缺少站点 ID", 400)
         self._tc3_request(
             "ModifyZoneStatus",
-            {"ZoneId": zid, "Status": "online" if enabled else "offline"},
-            version="2022-01-06",
+            {"ZoneId": zid, "Paused": False if enabled else True},
         )
         return {"siteId": zid, "enabled": bool(enabled)}
 
@@ -238,7 +237,7 @@ class TencentEdgeOneApi:
         zid = str(zone_id or "").strip()
         if not zid:
             raise TencentEdgeOneApiError("缺少站点 ID", 400)
-        resp = self._tc3_request("DeleteZone", {"ZoneId": zid}, version="2022-01-06")
+        resp = self._tc3_request("DeleteZone", {"ZoneId": zid})
         return {"siteId": zid, "requestId": resp.get("RequestId")}
 
     @staticmethod

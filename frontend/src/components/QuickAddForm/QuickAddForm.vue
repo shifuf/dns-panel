@@ -11,6 +11,8 @@ const props = defineProps<{
   lines?: DnsLine[];
   minTtl?: number;
   loading?: boolean;
+  showAccelerationToggle?: boolean;
+  accelerationToggleLabel?: string;
 }>();
 
 const emit = defineEmits<{
@@ -32,13 +34,14 @@ const form = ref({
   weight: 0,
   line: '',
   remark: '',
+  enableAcceleration: false,
 });
 
 const validationError = ref('');
 
 watch(() => props.show, (open) => {
   if (open) {
-    form.value = { type: 'A', name: '', content: '', ttl: 1, proxied: false, priority: 10, weight: 0, line: '', remark: '' };
+    form.value = { type: 'A', name: '', content: '', ttl: 1, proxied: false, priority: 10, weight: 0, line: '', remark: '', enableAcceleration: false };
     validationError.value = '';
   }
 });
@@ -92,6 +95,7 @@ function handleSubmit() {
   if (caps.value?.supportsWeight) params.weight = form.value.weight;
   if (caps.value?.supportsLine && form.value.line) params.line = form.value.line;
   if (caps.value?.supportsRemark && form.value.remark) params.remark = form.value.remark;
+  if (props.showAccelerationToggle) params.enableAcceleration = Boolean(form.value.enableAcceleration);
 
   emit('submit', params);
 }
@@ -147,6 +151,16 @@ function handleSubmit() {
             <NInput v-model:value="form.remark" placeholder="备注信息" size="small" />
           </NCollapseItem>
         </NCollapse>
+
+        <NFormItem v-if="showAccelerationToggle" :show-feedback="false">
+          <div class="flex w-full items-center justify-between rounded-2xl border border-panel-border bg-panel-surface px-3 py-2">
+            <div>
+              <p class="text-sm font-medium text-slate-700">{{ accelerationToggleLabel || '创建后自动接入加速' }}</p>
+              <p class="text-xs text-slate-500">保存记录后自动创建或接管当前域名的加速配置</p>
+            </div>
+            <NSwitch v-model:value="form.enableAcceleration" />
+          </div>
+        </NFormItem>
 
         <p v-if="validationError" class="text-red-400 text-sm">{{ validationError }}</p>
 

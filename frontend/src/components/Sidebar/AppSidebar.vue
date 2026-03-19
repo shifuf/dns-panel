@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { useDialog } from 'naive-ui';
 import {
-  Globe2, LayoutDashboard, History, Settings, LogOut, ShieldCheck, Moon, Sun,
+  Globe2, LayoutDashboard, History, Settings, LogOut, ShieldCheck, Moon, Sun, Zap,
 } from 'lucide-vue-next';
 import { useTheme } from '@/composables/useTheme';
 import { useProviderStore } from '@/stores/provider';
@@ -172,6 +172,11 @@ function goToSsl() {
   navigate('/ssl');
 }
 
+function goToAccelerations() {
+  providerStore.selectProvider(null);
+  navigate('/accelerations');
+}
+
 
 function confirmLogout() {
   dialog.info({
@@ -209,7 +214,7 @@ async function navigate(path: string) {
       </div>
     </header>
 
-    <button class="nav-btn" :class="{ active: !providerStore.selectedProvider && route.path !== '/ssl' }" @click="goToDashboard">
+    <button class="nav-btn" :class="{ active: !providerStore.selectedProvider && route.path !== '/ssl' && route.path !== '/accelerations' }" @click="goToDashboard">
       <LayoutDashboard :size="18" />
       总览仪表盘
     </button>
@@ -217,6 +222,11 @@ async function navigate(path: string) {
     <button class="nav-btn" :class="{ active: route.path === '/ssl' }" @click="goToSsl">
       <ShieldCheck :size="18" />
       SSL 证书
+    </button>
+
+    <button class="nav-btn" :class="{ active: route.path === '/accelerations' }" @click="goToAccelerations">
+      <Zap :size="18" />
+      加速管理
     </button>
 
     <div class="providers-section">

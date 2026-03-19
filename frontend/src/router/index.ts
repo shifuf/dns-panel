@@ -57,6 +57,11 @@ const routes: RouteRecordRaw[] = [
         name: 'SSLCertificates',
         component: () => import('@/pages/SSLCertificatesPage.vue'),
       },
+      {
+        path: 'accelerations',
+        name: 'Accelerations',
+        component: () => import('@/pages/AccelerationsPage.vue'),
+      },
     ],
   },
   {
