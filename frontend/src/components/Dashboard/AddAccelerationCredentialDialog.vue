@@ -3,7 +3,6 @@ import { ref, computed, watch } from 'vue';
 import { NModal, NInput, NButton, NAlert, NSpin } from 'naive-ui';
 import { Eye, EyeOff, Plus } from 'lucide-vue-next';
 import { getProviders, createDnsCredential } from '@/services/dnsCredentials';
-import { useProviderStore } from '@/stores/provider';
 import { normalizeProviderType } from '@/utils/provider';
 import type { ProviderConfig, ProviderType } from '@/types/dns';
 import ProviderSelector from '@/components/Settings/ProviderSelector.vue';
@@ -18,54 +17,23 @@ const emit = defineEmits<{
   created: [];
 }>();
 
-const providerStore = useProviderStore();
-
 const providers = ref<ProviderConfig[]>([]);
 const loadingProviders = ref(false);
 const submitting = ref(false);
 const submitError = ref('');
 
 const formName = ref('');
-const formProvider = ref<ProviderType>('cloudflare');
+const formProvider = ref<ProviderType>('tencent_edgeone');
 const formSecrets = ref<Record<string, string>>({});
 const showSecretFields = ref<Record<string, boolean>>({});
 
-const selectedProviderConfig = computed(() =>
-  providers.value.find((p) => p.type === formProvider.value)
-);
-
 const visibleProviders = computed(() =>
-  providers.value.filter((p) => (p.category || 'dns') === 'dns' && p.type !== 'dnspod_token')
+  providers.value.filter((p) => (p.category || 'dns') === 'acceleration'),
 );
 
-function mergeProviders(list: ProviderConfig[]): ProviderConfig[] {
-  const map = new Map<ProviderType, ProviderConfig>();
-
-  for (const item of list) {
-    const type = normalizeProviderType(item.type);
-    const normalized: ProviderConfig = { ...item, type };
-    const existing = map.get(type);
-    if (!existing) {
-      map.set(type, normalized);
-      continue;
-    }
-
-    const fieldByKey = new Map<string, ProviderConfig['authFields'][number]>();
-    [...(existing.authFields || []), ...(normalized.authFields || [])].forEach((field) => {
-      if (!fieldByKey.has(field.key)) fieldByKey.set(field.key, field);
-    });
-
-    const preferNewName = /token/i.test(existing.name || '') && !/token/i.test(normalized.name || '');
-    map.set(type, {
-      ...existing,
-      name: preferNewName ? normalized.name : existing.name,
-      authFields: Array.from(fieldByKey.values()),
-      capabilities: existing.capabilities || normalized.capabilities,
-    });
-  }
-
-  return Array.from(map.values());
-}
+const selectedProviderConfig = computed(() =>
+  visibleProviders.value.find((p) => p.type === formProvider.value),
+);
 
 async function loadProviders() {
   if (providers.value.length > 0) return;
@@ -73,7 +41,10 @@ async function loadProviders() {
   submitError.value = '';
   try {
     const res = await getProviders();
-    providers.value = mergeProviders(res.data?.providers || []);
+    providers.value = (res.data?.providers || []).map((item) => ({
+      ...item,
+      type: normalizeProviderType(item.type),
+    }));
   } catch (err: any) {
     submitError.value = String(err);
   } finally {
@@ -87,11 +58,11 @@ function resetForm() {
   showSecretFields.value = {};
   submitError.value = '';
   const preset = props.presetProvider ? normalizeProviderType(props.presetProvider) : null;
-  if (preset && visibleProviders.value.some((p) => p.type === preset)) {
+  if (preset && visibleProviders.value.some((item) => item.type === preset)) {
     formProvider.value = preset;
     return;
   }
-  formProvider.value = visibleProviders.value[0]?.type || 'cloudflare';
+  formProvider.value = visibleProviders.value[0]?.type || 'tencent_edgeone';
 }
 
 watch(
@@ -100,7 +71,7 @@ watch(
     if (!open) return;
     await loadProviders();
     resetForm();
-  }
+  },
 );
 
 watch(
@@ -108,12 +79,8 @@ watch(
   () => {
     formSecrets.value = {};
     showSecretFields.value = {};
-  }
+  },
 );
-
-function close() {
-  emit('update:show', false);
-}
 
 function toggleSecretVisibility(key: string) {
   showSecretFields.value = {
@@ -122,39 +89,19 @@ function toggleSecretVisibility(key: string) {
   };
 }
 
+function close() {
+  emit('update:show', false);
+}
+
 async function handleSubmit() {
   if (!formName.value.trim()) {
     submitError.value = '请输入账户别名';
     return;
   }
   const secrets = { ...formSecrets.value };
-  Object.keys(secrets).forEach((k) => {
-    if (!secrets[k]) delete secrets[k];
+  Object.keys(secrets).forEach((key) => {
+    if (!secrets[key]) delete secrets[key];
   });
-
-  if (formProvider.value === 'dnspod') {
-    const hasTC3 = Boolean(secrets.secretId && secrets.secretKey);
-    const hasTC3Partial = Boolean(secrets.secretId || secrets.secretKey);
-    const hasLegacy = Boolean(
-      (secrets.tokenId && secrets.token) ||
-      (!secrets.tokenId && secrets.token && String(secrets.token).includes(','))
-    );
-    const hasLegacyPartial = Boolean(secrets.tokenId || secrets.token);
-
-    if (!hasTC3 && !hasLegacy) {
-      submitError.value = '请填写 SecretId/SecretKey 或 DNSPod Token（二选一）';
-      return;
-    }
-    if (hasTC3Partial && !hasTC3) {
-      submitError.value = 'SecretId/SecretKey 需同时填写';
-      return;
-    }
-    if (hasLegacyPartial && !hasLegacy) {
-      submitError.value = 'DNSPod Token 请填写 ID + Token 或组合格式 ID,Token';
-      return;
-    }
-  }
-
   submitting.value = true;
   submitError.value = '';
   try {
@@ -163,7 +110,6 @@ async function handleSubmit() {
       provider: formProvider.value,
       secrets,
     });
-    await providerStore.loadData();
     emit('created');
     close();
   } catch (err: any) {
@@ -178,7 +124,7 @@ async function handleSubmit() {
   <NModal
     :show="show"
     preset="card"
-    title="添加 DNS 账户"
+    title="添加加速账户"
     :style="{ width: '640px' }"
     :mask-closable="!submitting"
     @update:show="emit('update:show', $event)"
@@ -191,11 +137,11 @@ async function handleSubmit() {
       <template v-else>
         <div>
           <label class="mb-1 block text-sm text-slate-500">账户别名</label>
-          <NInput v-model:value="formName" size="small" placeholder="例如：公司主账号" />
+          <NInput v-model:value="formName" size="small" placeholder="例如：EdgeOne 主账号" />
         </div>
 
         <div>
-          <label class="mb-2 block text-sm text-slate-500">选择服务商</label>
+          <label class="mb-2 block text-sm text-slate-500">选择加速厂商</label>
           <ProviderSelector
             :providers="visibleProviders"
             :selected-provider="formProvider"

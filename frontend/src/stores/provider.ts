@@ -18,9 +18,18 @@ function readCache<T>(key: string): T[] {
   }
 }
 
+function isDnsCategory(provider: ProviderConfig): boolean {
+  if (provider.category) return provider.category === 'dns';
+  const normalized = normalizeProviderType(provider.type);
+  return normalized !== 'tencent_ssl' && normalized !== 'tencent_edgeone';
+}
+
 export const useProviderStore = defineStore('provider', () => {
-  const cachedProviders = readCache<ProviderConfig>(CACHE_KEY_PROVIDERS);
-  const cachedCredentials = readCache<DnsCredential>(CACHE_KEY_CREDENTIALS);
+  const rawCachedProviders = readCache<ProviderConfig>(CACHE_KEY_PROVIDERS);
+  const rawCachedCredentials = readCache<DnsCredential>(CACHE_KEY_CREDENTIALS);
+  const cachedProviders = rawCachedProviders.filter((item) => isDnsCategory(item));
+  const cachedProviderSet = new Set(cachedProviders.map((item) => normalizeProviderType(item.type)));
+  const cachedCredentials = rawCachedCredentials.filter((item) => cachedProviderSet.has(normalizeProviderType(item.provider)));
 
   const providers = ref<ProviderConfig[]>(cachedProviders);
   const credentials = ref<DnsCredential[]>(cachedCredentials);
@@ -94,6 +103,15 @@ export const useProviderStore = defineStore('provider', () => {
 
   const currentCapabilities = computed(() => getProviderCapabilities.value(selectedProvider.value));
 
+  function filterDnsProviders(providerList: ProviderConfig[]): ProviderConfig[] {
+    return providerList.filter((item) => isDnsCategory(item));
+  }
+
+  function filterDnsCredentials(providerList: ProviderConfig[], credentialList: DnsCredential[]): DnsCredential[] {
+    const providerSet = new Set(filterDnsProviders(providerList).map((item) => item.type));
+    return credentialList.filter((item) => providerSet.has(normalizeProviderType(item.provider)));
+  }
+
   async function loadData() {
     try {
       const hasCache = providers.value.length > 0;
@@ -118,16 +136,16 @@ export const useProviderStore = defineStore('provider', () => {
         provider: normalizeProviderType(c.provider),
       }));
 
-      providers.value = providerList;
-      credentials.value = credentialList;
+      providers.value = filterDnsProviders(providerList);
+      credentials.value = filterDnsCredentials(providerList, credentialList);
 
       // Persist to localStorage for next session's instant render
       try {
-        localStorage.setItem(CACHE_KEY_PROVIDERS, JSON.stringify(providerList));
-        localStorage.setItem(CACHE_KEY_CREDENTIALS, JSON.stringify(credentialList));
+        localStorage.setItem(CACHE_KEY_PROVIDERS, JSON.stringify(providers.value));
+        localStorage.setItem(CACHE_KEY_CREDENTIALS, JSON.stringify(credentials.value));
       } catch { /* quota exceeded – non-critical */ }
 
-      if (credentialList.length > 0) {
+      if (credentials.value.length > 0) {
         const savedProviderRaw = localStorage.getItem(STORAGE_KEY_PROVIDER);
 
         // Empty string = explicit "no provider" (dashboard / SSL page) — preserve it
@@ -138,7 +156,7 @@ export const useProviderStore = defineStore('provider', () => {
         const savedProvider = savedProviderRaw ? normalizeProviderType(savedProviderRaw as ProviderType) : null;
         const savedCredential = localStorage.getItem(STORAGE_KEY_CREDENTIAL);
 
-        const providersWithCreds = [...new Set(credentialList.map(c => normalizeProviderType(c.provider)))];
+        const providersWithCreds = [...new Set(credentials.value.map(c => normalizeProviderType(c.provider)))];
 
         const providerToSelect = (savedProvider && providersWithCreds.includes(savedProvider))
           ? savedProvider
@@ -150,7 +168,7 @@ export const useProviderStore = defineStore('provider', () => {
         }
 
         const credsForProvider = providerToSelect
-          ? credentialList.filter(c => normalizeProviderType(c.provider) === providerToSelect)
+          ? credentials.value.filter(c => normalizeProviderType(c.provider) === providerToSelect)
           : [];
 
         let nextCredential: number | 'all' | null = null;

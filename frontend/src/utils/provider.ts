@@ -28,6 +28,7 @@ const PROVIDER_DISPLAY_NAME_MAP: Record<ProviderType, string> = {
   powerdns: 'PowerDNS',
   spaceship: 'Spaceship',
   tencent_ssl: '腾讯云 SSL',
+  tencent_edgeone: '腾讯云 EdgeOne',
 };
 
 export function getProviderDisplayName(provider: ProviderType | string | null | undefined): string {

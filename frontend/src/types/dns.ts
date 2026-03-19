@@ -12,7 +12,10 @@ export type ProviderType =
   | 'namesilo'
   | 'powerdns'
   | 'spaceship'
-  | 'tencent_ssl';
+  | 'tencent_ssl'
+  | 'tencent_edgeone';
+
+export type ProviderCategory = 'dns' | 'ssl' | 'acceleration';
 
 export interface DnsCredential {
   id: number;
@@ -44,6 +47,7 @@ export interface ProviderCapabilities {
 export interface ProviderConfig {
   type: ProviderType;
   name: string;
+  category?: ProviderCategory;
   icon?: string;
   authFields: AuthField[];
   capabilities?: ProviderCapabilities;

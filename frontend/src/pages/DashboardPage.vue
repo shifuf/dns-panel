@@ -12,6 +12,7 @@ import { getDomains, refreshDomains, deleteZone } from '@/services/domains';
 import { getLogs } from '@/services/logs';
 import { lookupDomainExpiry } from '@/services/domainExpiry';
 import { listEsaSites, ESA_SUPPORTED_REGIONS } from '@/services/aliyunEsa';
+import { listAccelerationConfigs, type DomainAccelerationConfig } from '@/services/accelerations';
 import {
   runDomainInspection,
   listSyncJobs,
@@ -407,6 +408,18 @@ const { data: auditLogsData } = useQuery({
   },
 });
 
+const { data: accelerationConfigsData } = useQuery({
+  queryKey: ['acceleration-configs-dashboard'],
+  queryFn: async () => {
+    try {
+      const res = await listAccelerationConfigs();
+      return res.data?.items || [];
+    } catch {
+      return [] as DomainAccelerationConfig[];
+    }
+  },
+});
+
 const logs24h = computed<Log[]>(() => logs24hData.value || []);
 const auditLogs = computed<Log[]>(() => auditLogsData.value || []);
 const remoteSyncJobs = computed<SyncJob[]>(() => remoteSyncJobsData.value || []);
@@ -414,6 +427,39 @@ const remoteAlertRules = computed<AlertRule[]>(() => remoteAlertRulesData.value 
 const remoteAlertEvents = computed<AlertEvent[]>(() => remoteAlertEventsData.value || []);
 const remoteSavedViews = computed<DashboardViewPreset[]>(() => remoteSavedViewsData.value || []);
 const remoteTagItems = computed<DomainTagEntry[]>(() => remoteDomainTagsData.value || []);
+const accelerationConfigs = computed<DomainAccelerationConfig[]>(() => accelerationConfigsData.value || []);
+
+function getAccelerationKey(domain: Domain): string {
+  return `${domain.credentialId ?? 'none'}::${String(domain.name || '').toLowerCase()}`;
+}
+
+const accelerationConfigMap = computed(() => {
+  const map = new Map<string, DomainAccelerationConfig>();
+  for (const item of accelerationConfigs.value) {
+    map.set(`${item.dnsCredentialId}::${String(item.zoneName || '').toLowerCase()}`, item);
+  }
+  return map;
+});
+
+function getAccelerationConfig(domain: Domain): DomainAccelerationConfig | null {
+  return accelerationConfigMap.value.get(getAccelerationKey(domain)) || null;
+}
+
+function getAccelerationLabel(domain: Domain): string {
+  const config = getAccelerationConfig(domain);
+  if (!config) return '未接入';
+  if (config.verified) return '已验证';
+  if (config.lastError) return '异常';
+  return '待验证';
+}
+
+function getAccelerationType(domain: Domain): 'success' | 'warning' | 'error' | 'default' {
+  const config = getAccelerationConfig(domain);
+  if (!config) return 'default';
+  if (config.verified) return 'success';
+  if (config.lastError) return 'error';
+  return 'warning';
+}
 
 const mergedSyncJobs = computed<SyncJob[]>(() => {
   const map = new Map<string, SyncJob>();
@@ -1237,6 +1283,24 @@ const columns = computed<DataTableColumns<Domain>>(() => {
         }, () => row.status);
       },
     },
+  );
+
+  if (!isEsaPanel.value) {
+    cols.push({
+      title: '加速',
+      key: 'acceleration',
+      width: 110,
+      render(row) {
+        return h(NTag, {
+          type: getAccelerationType(row),
+          size: 'small',
+          bordered: false,
+        }, () => getAccelerationLabel(row));
+      },
+    });
+  }
+
+  cols.push(
     {
       title: '更新时间',
       key: 'updatedAt',
@@ -1660,6 +1724,9 @@ watch(domains, (list) => {
               <NTag :type="getStatusType(domain.status)" size="small" :bordered="false">
                 {{ domain.status }}
               </NTag>
+              <NTag v-if="!isEsaPanel" :type="getAccelerationType(domain)" size="small" :bordered="false">
+                {{ getAccelerationLabel(domain) }}
+              </NTag>
             </div>
           </div>
           <div class="flex items-center justify-between text-xs text-slate-500">
@@ -1682,7 +1749,7 @@ watch(domains, (list) => {
         :bordered="false"
         size="small"
         class="table-scrollable !bg-transparent"
-        :scroll-x="1060"
+        :scroll-x="1180"
         :max-height="620"
         :virtual-scroll="paginatedDomains.length > 120"
       />

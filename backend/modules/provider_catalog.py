@@ -313,6 +313,30 @@ PROVIDER_CAPABILITIES: List[Dict[str, Any]] = [
         "retryableErrors": [],
         "maxRetries": 2,
     },
+    {
+        "provider": "tencent_edgeone",
+        "name": "腾讯云 EdgeOne",
+        "category": "acceleration",
+        "supportsWeight": False,
+        "supportsLine": False,
+        "supportsStatus": False,
+        "supportsRemark": False,
+        "supportsUrlForward": False,
+        "supportsLogs": False,
+        "remarkMode": "unsupported",
+        "paging": "server",
+        "requiresDomainId": False,
+        "recordTypes": [],
+        "authFields": [
+            {"name": "secretId", "label": "SecretId", "type": "text", "required": True, "placeholder": "腾讯云 SecretId"},
+            {"name": "secretKey", "label": "SecretKey", "type": "password", "required": True, "placeholder": "腾讯云 SecretKey"},
+            {"name": "planId", "label": "套餐 PlanId", "type": "text", "required": False, "placeholder": "可选，默认使用免费/默认套餐", "helpText": "如账号下存在多个套餐，可填写指定 PlanId；留空时由接口按默认策略创建站点"},
+        ],
+        "domainCacheTtl": 0,
+        "recordCacheTtl": 0,
+        "retryableErrors": [],
+        "maxRetries": 2,
+    },
 ]
 
 
@@ -326,4 +350,3 @@ def get_provider_capabilities(provider: str) -> Dict[str, Any] | None:
         if str(item.get("provider") or "") == p:
             return item
     return None
-

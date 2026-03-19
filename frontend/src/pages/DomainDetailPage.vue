@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { useQuery, useMutation } from '@tanstack/vue-query';
-import { NButton, NSpin, NTag, useMessage } from 'naive-ui';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
+import { NAlert, NButton, NSelect, NSpin, NTag, useMessage } from 'naive-ui';
 import { Plus, RefreshCw, Globe, ListTree, Activity, Check, Settings, Zap } from 'lucide-vue-next';
 import {
   getDNSRecords,
@@ -16,20 +16,32 @@ import {
   batchDeleteDNSRecords,
   batchSetDNSRecordStatus,
 } from '@/services/dns';
+import { getDomainById } from '@/services/domains';
+import { getDnsCredentials, getProviders } from '@/services/dnsCredentials';
+import {
+  listAccelerationConfigs,
+  enableAcceleration,
+  verifyAcceleration,
+  syncAcceleration,
+  disableAcceleration,
+  type DomainAccelerationConfig,
+} from '@/services/accelerations';
 import type { RecordsResponseCapabilities } from '@/services/dns';
 import { useProviderStore } from '@/stores/provider';
 import { useBreadcrumbStore } from '@/stores/breadcrumb';
 import { useCredentialResolver } from '@/composables/useCredentialResolver';
 import { useResponsive } from '@/composables/useResponsive';
 import type { DNSRecord } from '@/types';
-import type { DnsLine } from '@/types/dns';
+import type { DnsCredential, DnsLine } from '@/types/dns';
 import { normalizeProviderType } from '@/utils/provider';
 import DNSRecordTable from '@/components/DNSRecordTable/DNSRecordTable.vue';
 import QuickAddForm from '@/components/QuickAddForm/QuickAddForm.vue';
+import AddAccelerationCredentialDialog from '@/components/Dashboard/AddAccelerationCredentialDialog.vue';
 
 const route = useRoute();
 const router = useRouter();
 const message = useMessage();
+const queryClient = useQueryClient();
 const providerStore = useProviderStore();
 const breadcrumbStore = useBreadcrumbStore();
 const { credentialId } = useCredentialResolver();
@@ -37,6 +49,8 @@ const { isMobile } = useResponsive();
 
 const zoneId = computed(() => route.params.zoneId as string);
 const showAddDialog = ref(false);
+const showAddAccelerationCredential = ref(false);
+const selectedAccelerationCredentialId = ref<number | null>(null);
 
 const capabilities = computed<RecordsResponseCapabilities>(() => {
   const apiCaps = recordsData.value?.capabilities;
@@ -51,6 +65,15 @@ const capabilities = computed<RecordsResponseCapabilities>(() => {
 });
 const isCloudflare = computed(() => providerStore.selectedProvider === 'cloudflare');
 
+const { data: domainData } = useQuery({
+  queryKey: computed(() => ['domain-detail', zoneId.value, credentialId.value]),
+  queryFn: async () => {
+    const res = await getDomainById(zoneId.value, credentialId.value);
+    return res.data?.domain || null;
+  },
+  enabled: computed(() => !!zoneId.value),
+});
+
 // DNS records
 const { data: recordsData, isLoading: recordsLoading, refetch: refetchRecords } = useQuery({
   queryKey: computed(() => ['dns-records', zoneId.value, credentialId.value]),
@@ -62,6 +85,9 @@ const { data: recordsData, isLoading: recordsLoading, refetch: refetchRecords } 
 });
 
 const records = computed(() => recordsData.value?.records || []);
+const zoneName = computed(() =>
+  domainData.value?.name || records.value[0]?.zoneName || ''
+);
 const visibleRecords = computed(() =>
   records.value.filter((r) => !(r.type === 'NS' && r.name === r.zoneName))
 );
@@ -91,6 +117,58 @@ const { data: minTTLData } = useQuery({
 });
 const minTTL = computed(() => minTTLData.value ?? 1);
 
+const { data: accelerationCredentialData, refetch: refetchAccelerationCredentials } = useQuery({
+  queryKey: ['acceleration-credentials'],
+  queryFn: async () => {
+    const [providersRes, credentialsRes] = await Promise.all([
+      getProviders(),
+      getDnsCredentials(),
+    ]);
+    const accelerationProviderSet = new Set(
+      (providersRes.data?.providers || [])
+        .filter((item) => (item.category || 'dns') === 'acceleration')
+        .map((item) => normalizeProviderType(item.type)),
+    );
+    return (credentialsRes.data?.credentials || []).filter((item) =>
+      accelerationProviderSet.has(normalizeProviderType(item.provider)),
+    ) as DnsCredential[];
+  },
+});
+
+const accelerationCredentials = computed(() => accelerationCredentialData.value || []);
+
+watch(accelerationCredentials, (list) => {
+  if (!list.length) {
+    selectedAccelerationCredentialId.value = null;
+    return;
+  }
+  if (selectedAccelerationCredentialId.value && list.some((item) => item.id === selectedAccelerationCredentialId.value)) {
+    return;
+  }
+  selectedAccelerationCredentialId.value = list[0].id;
+}, { immediate: true });
+
+const { data: accelerationConfigData, isLoading: accelerationLoading, refetch: refetchAccelerationConfig } = useQuery({
+  queryKey: computed(() => ['acceleration-config', zoneName.value, credentialId.value]),
+  queryFn: async () => {
+    if (!zoneName.value || typeof credentialId.value !== 'number') return null;
+    const res = await listAccelerationConfigs({
+      zoneName: zoneName.value,
+      dnsCredentialId: credentialId.value,
+    });
+    return res.data?.items?.[0] || null;
+  },
+  enabled: computed(() => !!zoneName.value && typeof credentialId.value === 'number'),
+});
+
+const accelerationConfig = computed<DomainAccelerationConfig | null>(() => accelerationConfigData.value || null);
+
+watch(accelerationConfig, (config) => {
+  if (config?.pluginCredentialId) {
+    selectedAccelerationCredentialId.value = config.pluginCredentialId;
+  }
+}, { immediate: true });
+
 // Keep provider context in sync when navigating from dashboard with credentialId.
 watch(
   [credentialId, () => providerStore.credentials.length],
@@ -110,11 +188,109 @@ watch(
 );
 
 // Set breadcrumb label
-watch(() => records.value, (recs) => {
-  if (recs.length > 0 && recs[0].zoneName) {
-    breadcrumbStore.setLabel(`zone:${zoneId.value}`, recs[0].zoneName);
+watch(zoneName, () => {
+  if (zoneName.value) {
+    breadcrumbStore.setLabel(`zone:${zoneId.value}`, zoneName.value);
   }
 }, { immediate: true });
+
+const accelerationStatusMeta = computed(() => {
+  const config = accelerationConfig.value;
+  if (!config) return { type: 'default' as const, label: '未接入', detail: '尚未接入加速' };
+  if (config.verified) return { type: 'success' as const, label: '已验证', detail: config.siteStatus || '加速已生效' };
+  if (config.lastError) return { type: 'error' as const, label: '异常', detail: config.lastError };
+  return { type: 'warning' as const, label: '待验证', detail: config.verifyStatus || config.siteStatus || '等待验证' };
+});
+
+function copyText(text: string | undefined) {
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(
+    () => message.success('已复制'),
+    () => message.error('复制失败'),
+  );
+}
+
+const enableAccelerationMutation = useMutation({
+  mutationFn: async () => {
+    const pluginCredentialId = selectedAccelerationCredentialId.value;
+    if (!zoneName.value || typeof credentialId.value !== 'number' || !pluginCredentialId) {
+      throw new Error('缺少域名、DNS 凭证或 EdgeOne 凭证');
+    }
+    return enableAcceleration({
+      zoneName: zoneName.value,
+      zoneId: zoneId.value,
+      dnsCredentialId: credentialId.value,
+      pluginCredentialId,
+      autoDnsRecord: true,
+    });
+  },
+  onSuccess: async (res) => {
+    const added = res.data?.dnsRecordsAdded || [];
+    const errors = res.data?.dnsErrors || [];
+    let text = '已提交加速接入';
+    if (added.length) text += `，已自动创建 ${added.length} 条验证记录`;
+    if (errors.length) text += `，${errors.length} 条记录创建失败`;
+    if (res.data?.config?.verified) text += '，验证已完成';
+    message.success(text);
+    await refetchAccelerationConfig();
+    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+const verifyAccelerationMutation = useMutation({
+  mutationFn: async () => {
+    if (!zoneName.value || typeof credentialId.value !== 'number') {
+      throw new Error('缺少域名或 DNS 凭证');
+    }
+    return verifyAcceleration({
+      zoneName: zoneName.value,
+      dnsCredentialId: credentialId.value,
+    });
+  },
+  onSuccess: async (res) => {
+    message.success(res.data?.config?.verified ? '加速验证成功' : '已提交加速验证');
+    await refetchAccelerationConfig();
+    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+const syncAccelerationMutation = useMutation({
+  mutationFn: async () => {
+    if (!zoneName.value || typeof credentialId.value !== 'number') {
+      throw new Error('缺少域名或 DNS 凭证');
+    }
+    return syncAcceleration({
+      zoneName: zoneName.value,
+      dnsCredentialId: credentialId.value,
+    });
+  },
+  onSuccess: async () => {
+    message.success('加速状态已同步');
+    await refetchAccelerationConfig();
+    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+const disableAccelerationMutation = useMutation({
+  mutationFn: async () => {
+    if (!zoneName.value || typeof credentialId.value !== 'number') {
+      throw new Error('缺少域名或 DNS 凭证');
+    }
+    return disableAcceleration({
+      zoneName: zoneName.value,
+      dnsCredentialId: credentialId.value,
+    });
+  },
+  onSuccess: async () => {
+    message.success('已移除本地加速配置');
+    await refetchAccelerationConfig();
+    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
 
 // Mutations
 const createMutation = useMutation({
@@ -312,6 +488,150 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
     </section>
 
     <section class="bento-card col-span-12">
+      <div class="mb-4 flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+        <div>
+          <p class="bento-section-title">加速管理</p>
+          <p class="bento-section-meta">接入 EdgeOne 后可自动生成域名归属验证记录，并支持手动验证与状态同步</p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <NTag size="small" :bordered="false" :type="accelerationStatusMeta.type">
+            {{ accelerationStatusMeta.label }}
+          </NTag>
+          <NTag v-if="accelerationConfig?.remoteSiteId" size="small" :bordered="false">
+            Site {{ accelerationConfig.remoteSiteId }}
+          </NTag>
+        </div>
+      </div>
+
+      <div v-if="accelerationLoading" class="flex justify-center py-10">
+        <NSpin size="large" />
+      </div>
+
+      <div v-else class="space-y-4">
+        <NAlert v-if="accelerationConfig?.lastError" type="warning" :bordered="false">
+          {{ accelerationConfig.lastError }}
+        </NAlert>
+
+        <div v-if="!accelerationCredentials.length" class="rounded-2xl border border-dashed border-panel-border bg-panel-surface p-5">
+          <p class="text-sm font-semibold text-slate-700">暂无可用的加速账户</p>
+          <p class="mt-1 text-sm text-slate-500">先添加一个 EdgeOne 账户，再为当前域名接入加速。</p>
+          <div class="mt-4">
+            <NButton size="small" type="primary" @click="showAddAccelerationCredential = true">
+              添加加速账户
+            </NButton>
+          </div>
+        </div>
+
+        <template v-else>
+          <div class="grid gap-4 md:grid-cols-[280px_1fr]">
+            <div>
+              <label class="mb-2 block text-sm text-slate-500">加速厂商账户</label>
+              <NSelect
+                v-model:value="selectedAccelerationCredentialId"
+                size="small"
+                :options="accelerationCredentials.map((item) => ({ label: item.name, value: item.id }))"
+                placeholder="选择 EdgeOne 账户"
+              />
+            </div>
+            <div class="rounded-2xl border border-panel-border bg-panel-surface p-4">
+              <div class="flex flex-wrap items-center gap-2">
+                <NButton
+                  v-if="!accelerationConfig"
+                  size="small"
+                  type="primary"
+                  :loading="enableAccelerationMutation.isPending.value"
+                  @click="enableAccelerationMutation.mutate()"
+                >
+                  接入 EdgeOne
+                </NButton>
+                <template v-else>
+                  <NButton
+                    size="small"
+                    secondary
+                    :loading="syncAccelerationMutation.isPending.value"
+                    @click="syncAccelerationMutation.mutate()"
+                  >
+                    刷新状态
+                  </NButton>
+                  <NButton
+                    v-if="!accelerationConfig.verified"
+                    size="small"
+                    type="primary"
+                    :loading="verifyAccelerationMutation.isPending.value"
+                    @click="verifyAccelerationMutation.mutate()"
+                  >
+                    手动验证
+                  </NButton>
+                  <NButton
+                    size="small"
+                    tertiary
+                    :loading="disableAccelerationMutation.isPending.value"
+                    @click="disableAccelerationMutation.mutate()"
+                  >
+                    移除配置
+                  </NButton>
+                </template>
+                <NButton size="small" secondary @click="showAddAccelerationCredential = true">
+                  新增加速账户
+                </NButton>
+              </div>
+              <p class="mt-3 text-sm text-slate-500">
+                {{ accelerationStatusMeta.detail || '当前还没有加速接入状态' }}
+              </p>
+            </div>
+          </div>
+
+          <div v-if="accelerationConfig" class="grid gap-4 md:grid-cols-3">
+            <article class="rounded-2xl border border-panel-border bg-panel-surface p-4">
+              <p class="text-xs uppercase tracking-widest text-slate-500">站点状态</p>
+              <p class="mt-2 text-lg font-semibold text-slate-800">{{ accelerationConfig.siteStatus || '-' }}</p>
+              <p class="mt-1 text-xs text-slate-500">验证状态：{{ accelerationConfig.verifyStatus || '-' }}</p>
+            </article>
+            <article class="rounded-2xl border border-panel-border bg-panel-surface p-4">
+              <p class="text-xs uppercase tracking-widest text-slate-500">接入模式</p>
+              <p class="mt-2 text-lg font-semibold text-slate-800">{{ accelerationConfig.accessType || 'partial' }}</p>
+              <p class="mt-1 text-xs text-slate-500">区域：{{ accelerationConfig.area || 'global' }}</p>
+            </article>
+            <article class="rounded-2xl border border-panel-border bg-panel-surface p-4">
+              <p class="text-xs uppercase tracking-widest text-slate-500">最近同步</p>
+              <p class="mt-2 text-lg font-semibold text-slate-800">{{ accelerationConfig.lastSyncedAt ? new Date(accelerationConfig.lastSyncedAt).toLocaleString('zh-CN') : '-' }}</p>
+              <p class="mt-1 text-xs text-slate-500">套餐：{{ accelerationConfig.planId || '默认' }}</p>
+            </article>
+          </div>
+
+          <div v-if="accelerationConfig && accelerationConfig.verifyRecordName" class="rounded-2xl border border-panel-border bg-panel-surface p-4">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <p class="text-sm font-semibold text-slate-700">验证记录</p>
+                <p class="text-xs text-slate-500">接入时会自动写入当前 DNS 服务商，也可以复制后手动补录</p>
+              </div>
+            </div>
+            <div class="mt-4 grid gap-3 md:grid-cols-3">
+              <div class="rounded-xl bg-white/60 p-3">
+                <p class="text-xs text-slate-500">类型</p>
+                <button class="mt-1 text-left text-sm font-medium text-slate-800" @click="copyText(accelerationConfig.verifyRecordType)">
+                  {{ accelerationConfig.verifyRecordType || 'TXT' }}
+                </button>
+              </div>
+              <div class="rounded-xl bg-white/60 p-3">
+                <p class="text-xs text-slate-500">主机记录</p>
+                <button class="mt-1 break-all text-left text-sm font-medium text-slate-800" @click="copyText(accelerationConfig.verifyRecordName)">
+                  {{ accelerationConfig.verifyRecordName }}
+                </button>
+              </div>
+              <div class="rounded-xl bg-white/60 p-3">
+                <p class="text-xs text-slate-500">记录值</p>
+                <button class="mt-1 break-all text-left text-sm font-medium text-slate-800" @click="copyText(accelerationConfig.verifyRecordValue)">
+                  {{ accelerationConfig.verifyRecordValue }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <section class="bento-card col-span-12">
       <div class="mb-4">
         <p class="bento-section-title">记录列表</p>
         <p class="bento-section-meta">支持批量启用/禁用、批量删除、字段自定义显示</p>
@@ -341,6 +661,10 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
       :min-ttl="minTTL"
       :loading="createMutation.isPending.value"
       @submit="handleAddSubmit"
+    />
+    <AddAccelerationCredentialDialog
+      v-model:show="showAddAccelerationCredential"
+      @created="() => { refetchAccelerationCredentials(); }"
     />
   </div>
 </template>

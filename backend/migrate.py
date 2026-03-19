@@ -149,6 +149,36 @@ MIGRATIONS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_ssl_certs_cred ON ssl_certificates(credentialId)",
     "CREATE INDEX IF NOT EXISTS idx_ssl_certs_status ON ssl_certificates(status)",
 
+    # ── domain_accelerations table ──
+    """
+    CREATE TABLE IF NOT EXISTS domain_accelerations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      dnsCredentialId INTEGER NOT NULL,
+      zoneName TEXT NOT NULL,
+      pluginProvider TEXT NOT NULL,
+      pluginCredentialId INTEGER NOT NULL,
+      remoteSiteId TEXT DEFAULT '',
+      siteStatus TEXT DEFAULT '',
+      verifyStatus TEXT DEFAULT '',
+      verified INTEGER NOT NULL DEFAULT 0,
+      paused INTEGER NOT NULL DEFAULT 0,
+      accessType TEXT DEFAULT 'partial',
+      area TEXT DEFAULT 'global',
+      planId TEXT DEFAULT '',
+      verifyRecordName TEXT DEFAULT '',
+      verifyRecordType TEXT DEFAULT '',
+      verifyRecordValue TEXT DEFAULT '',
+      lastError TEXT DEFAULT '',
+      lastSyncedAt TEXT,
+      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(userId, dnsCredentialId, zoneName, pluginProvider)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_domain_accelerations_user_zone ON domain_accelerations(userId, zoneName)",
+    "CREATE INDEX IF NOT EXISTS idx_domain_accelerations_dns_cred ON domain_accelerations(dnsCredentialId)",
+
     # ── system_settings table (global config, not per-user) ──
     """
     CREATE TABLE IF NOT EXISTS system_settings (

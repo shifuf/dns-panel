@@ -1,11 +1,12 @@
 import api from './api';
 import { ApiResponse } from '@/types';
-import { DnsCredential, ProviderConfig, DnsCredentialSecrets, ProviderType, ProviderCapabilities } from '@/types/dns';
+import { DnsCredential, ProviderConfig, DnsCredentialSecrets, ProviderType, ProviderCapabilities, ProviderCategory } from '@/types/dns';
 import { normalizeProviderType } from '@/utils/provider';
 
 type ProviderCapabilitiesApi = {
   provider?: string;
   type?: string;
+  category?: ProviderCategory;
   name: string;
   icon?: string;
   supportsWeight?: boolean;
@@ -58,6 +59,7 @@ export async function getProviders(): Promise<ApiResponse<{ providers: ProviderC
       const normalized: ProviderConfig = {
         type,
         name: p.name,
+        category: p.category || 'dns',
         authFields: (p.authFields || []).map((f, idx) => ({
           key: f.key || f.name || `field_${idx}`,
           label: f.label,

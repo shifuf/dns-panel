@@ -25,6 +25,8 @@ from modules.provider_catalog import get_all_provider_capabilities, get_provider
 from modules.two_factor import generate_base32_secret, make_otpauth_url, make_qr_data_url, verify_totp
 from modules.cloudflare_api import CloudflareApi, CloudflareApiError
 from modules.dnspod_api import DnspodApi, DnspodApiError
+from modules.acceleration_registry import AccelerationPluginError, build_acceleration_plugin
+from modules.tencent_edgeone_api import TencentEdgeOneApi, TencentEdgeOneApiError
 
 # ── Application version ─────────────────────────────────────────
 # Fallback version for local/offline environments. GitHub Releases are the
@@ -97,6 +99,7 @@ PROVIDER_NAMES = {
     "powerdns": "PowerDNS",
     "dnsla": "DNSLA",
     "tencent_ssl": "腾讯云 SSL",
+    "tencent_edgeone": "腾讯云 EdgeOne",
 }
 DEFAULT_LOG_RETENTION_DAYS = 90
 DEFAULT_RETRY_MAX_ATTEMPTS = 3
@@ -337,6 +340,18 @@ def export_backup_payload(user_id: int, scopes: List[str]) -> Dict[str, Any]:
                 """,
                 (user_id,),
             ).fetchall()
+            accel_rows = c.execute(
+                """
+                SELECT id, dnsCredentialId, zoneName, pluginProvider, pluginCredentialId, remoteSiteId,
+                       siteStatus, verifyStatus, verified, paused, accessType, area, planId,
+                       verifyRecordName, verifyRecordType, verifyRecordValue, lastError,
+                       lastSyncedAt, createdAt, updatedAt
+                FROM domain_accelerations
+                WHERE userId = ?
+                ORDER BY createdAt ASC, id ASC
+                """,
+                (user_id,),
+            ).fetchall() if table_exists("domain_accelerations") else []
             payload["data"]["dns"] = {
                 "credentials": [
                     {
@@ -350,7 +365,32 @@ def export_backup_payload(user_id: int, scopes: List[str]) -> Dict[str, Any]:
                         "updatedAt": row["updatedAt"],
                     }
                     for row in rows
-                ]
+                ],
+                "accelerations": [
+                    {
+                        "id": int(row["id"]),
+                        "dnsCredentialId": int(row["dnsCredentialId"]),
+                        "zoneName": row["zoneName"],
+                        "pluginProvider": row["pluginProvider"],
+                        "pluginCredentialId": int(row["pluginCredentialId"]),
+                        "remoteSiteId": row["remoteSiteId"],
+                        "siteStatus": row["siteStatus"],
+                        "verifyStatus": row["verifyStatus"],
+                        "verified": bool(row["verified"]),
+                        "paused": bool(row["paused"]),
+                        "accessType": row["accessType"],
+                        "area": row["area"],
+                        "planId": row["planId"],
+                        "verifyRecordName": row["verifyRecordName"],
+                        "verifyRecordType": row["verifyRecordType"],
+                        "verifyRecordValue": row["verifyRecordValue"],
+                        "lastError": row["lastError"],
+                        "lastSyncedAt": row["lastSyncedAt"],
+                        "createdAt": row["createdAt"],
+                        "updatedAt": row["updatedAt"],
+                    }
+                    for row in accel_rows
+                ],
             }
 
         if "ssl" in selected:
@@ -430,6 +470,7 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
 
     result = {
         "dnsCredentials": 0,
+        "domainAccelerations": 0,
         "sslCredentials": 0,
         "sslCertificates": 0,
     }
@@ -440,8 +481,11 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
             if isinstance(dns_block, dict):
                 cred_items = dns_block.get("credentials")
                 if isinstance(cred_items, list):
+                    credential_id_map: Dict[int, int] = {}
                     if overwrite:
                         c.execute("DELETE FROM dns_credentials WHERE userId = ? AND provider != 'tencent_ssl'", (user_id,))
+                        if table_exists("domain_accelerations"):
+                            c.execute("DELETE FROM domain_accelerations WHERE userId = ?", (user_id,))
                     for item in cred_items:
                         if not isinstance(item, dict):
                             continue
@@ -466,7 +510,54 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                                 str(item.get("updatedAt") or now_iso()),
                             ),
                         )
+                        old_id = int(item.get("id") or 0)
+                        if old_id > 0:
+                            credential_id_map[old_id] = int(c.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
                         result["dnsCredentials"] += 1
+                    accel_items = dns_block.get("accelerations")
+                    if isinstance(accel_items, list) and table_exists("domain_accelerations"):
+                        for item in accel_items:
+                            if not isinstance(item, dict):
+                                continue
+                            dns_cred_id = credential_id_map.get(int(item.get("dnsCredentialId") or 0))
+                            plugin_cred_id = credential_id_map.get(int(item.get("pluginCredentialId") or 0))
+                            zone_name = str(item.get("zoneName") or "").strip()
+                            plugin_provider = str(item.get("pluginProvider") or "").strip()
+                            if not dns_cred_id or not plugin_cred_id or not zone_name or not plugin_provider:
+                                continue
+                            c.execute(
+                                """
+                                INSERT INTO domain_accelerations (
+                                  userId, dnsCredentialId, zoneName, pluginProvider, pluginCredentialId,
+                                  remoteSiteId, siteStatus, verifyStatus, verified, paused, accessType, area, planId,
+                                  verifyRecordName, verifyRecordType, verifyRecordValue, lastError,
+                                  lastSyncedAt, createdAt, updatedAt
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    user_id,
+                                    dns_cred_id,
+                                    zone_name,
+                                    plugin_provider,
+                                    plugin_cred_id,
+                                    str(item.get("remoteSiteId") or ""),
+                                    str(item.get("siteStatus") or ""),
+                                    str(item.get("verifyStatus") or ""),
+                                    1 if bool(item.get("verified")) else 0,
+                                    1 if bool(item.get("paused")) else 0,
+                                    str(item.get("accessType") or "partial"),
+                                    str(item.get("area") or "global"),
+                                    str(item.get("planId") or ""),
+                                    str(item.get("verifyRecordName") or ""),
+                                    str(item.get("verifyRecordType") or ""),
+                                    str(item.get("verifyRecordValue") or ""),
+                                    str(item.get("lastError") or ""),
+                                    item.get("lastSyncedAt"),
+                                    str(item.get("createdAt") or now_iso()),
+                                    str(item.get("updatedAt") or now_iso()),
+                                ),
+                            )
+                            result["domainAccelerations"] += 1
 
         if "ssl" in selected:
             ssl_block = data.get("ssl")
@@ -604,6 +695,36 @@ def init_db() -> None:
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_certs_user ON ssl_certificates(userId)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_certs_cred ON ssl_certificates(credentialId)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_certs_status ON ssl_certificates(status)")
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS domain_accelerations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              userId INTEGER NOT NULL,
+              dnsCredentialId INTEGER NOT NULL,
+              zoneName TEXT NOT NULL,
+              pluginProvider TEXT NOT NULL,
+              pluginCredentialId INTEGER NOT NULL,
+              remoteSiteId TEXT DEFAULT '',
+              siteStatus TEXT DEFAULT '',
+              verifyStatus TEXT DEFAULT '',
+              verified INTEGER NOT NULL DEFAULT 0,
+              paused INTEGER NOT NULL DEFAULT 0,
+              accessType TEXT DEFAULT 'partial',
+              area TEXT DEFAULT 'global',
+              planId TEXT DEFAULT '',
+              verifyRecordName TEXT DEFAULT '',
+              verifyRecordType TEXT DEFAULT '',
+              verifyRecordValue TEXT DEFAULT '',
+              lastError TEXT DEFAULT '',
+              lastSyncedAt TEXT,
+              createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(userId, dnsCredentialId, zoneName, pluginProvider)
+            )
+            """
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_domain_accelerations_user_zone ON domain_accelerations(userId, zoneName)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_domain_accelerations_dns_cred ON domain_accelerations(dnsCredentialId)")
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS system_settings (
@@ -1229,6 +1350,7 @@ class H(BaseHTTPRequestHandler):
                         "/api/logs/*",
                         "/api/domain-expiry/*",
                         "/api/dashboard/*",
+                        "/api/accelerations/*",
                         "/api/ssl/*",
                     ],
                     "proxyBase": LEGACY,
@@ -1263,6 +1385,9 @@ class H(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/dashboard"):
             self._dashboard(path, q, b)
+            return
+        if path.startswith("/api/accelerations"):
+            self._acceleration_routes(path, q, b)
             return
         if path.startswith("/api/ssl"):
             self._ssl_routes(path, q, b)
