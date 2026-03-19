@@ -223,6 +223,24 @@ class TencentEdgeOneApi:
             raise TencentEdgeOneApiError("未找到 EdgeOne 站点", 404)
         return matched
 
+    def modify_zone_status(self, zone_id: str, enabled: bool) -> Dict[str, Any]:
+        zid = str(zone_id or "").strip()
+        if not zid:
+            raise TencentEdgeOneApiError("缺少站点 ID", 400)
+        self._tc3_request(
+            "ModifyZoneStatus",
+            {"ZoneId": zid, "Status": "online" if enabled else "offline"},
+            version="2022-01-06",
+        )
+        return {"siteId": zid, "enabled": bool(enabled)}
+
+    def delete_zone(self, zone_id: str) -> Dict[str, Any]:
+        zid = str(zone_id or "").strip()
+        if not zid:
+            raise TencentEdgeOneApiError("缺少站点 ID", 400)
+        resp = self._tc3_request("DeleteZone", {"ZoneId": zid}, version="2022-01-06")
+        return {"siteId": zid, "requestId": resp.get("RequestId")}
+
     @staticmethod
     def _normalize_verification(raw: Dict[str, Any]) -> Dict[str, Any]:
         verification = raw.get("OwnershipVerification")
@@ -234,6 +252,24 @@ class TencentEdgeOneApi:
                 "recordValue": str(first.get("RecordValue") or first.get("Value") or ""),
                 "raw": verification,
             }
+        if isinstance(verification, dict):
+            candidates: List[Dict[str, Any]] = [verification]
+            dns_verification = verification.get("DnsVerification") or verification.get("DNSVerification")
+            if isinstance(dns_verification, dict):
+                candidates.insert(0, dns_verification)
+            elif isinstance(dns_verification, list):
+                candidates = [item for item in dns_verification if isinstance(item, dict)] + candidates
+            for item in candidates:
+                record_name = str(item.get("RecordName") or item.get("Name") or item.get("Host") or "")
+                record_value = str(item.get("RecordValue") or item.get("Value") or item.get("Content") or "")
+                if not record_name and not record_value:
+                    continue
+                return {
+                    "recordType": str(item.get("RecordType") or item.get("Type") or "TXT"),
+                    "recordName": record_name,
+                    "recordValue": record_value,
+                    "raw": verification,
+                }
 
         ascription = raw.get("Ascription")
         if isinstance(ascription, dict):
@@ -249,18 +285,28 @@ class TencentEdgeOneApi:
     @staticmethod
     def _normalize_zone(raw: Dict[str, Any]) -> Dict[str, Any]:
         status = str(raw.get("Status") or raw.get("ZoneStatus") or raw.get("State") or "unknown")
-        cname_status = str(raw.get("CnameStatus") or raw.get("OwnershipVerificationStatus") or "").strip()
+        cname_status = str(
+            raw.get("CnameStatus")
+            or raw.get("OwnershipVerificationStatus")
+            or raw.get("VerificationStatus")
+            or raw.get("AscriptionStatus")
+            or ""
+        ).strip()
         paused_raw = raw.get("Paused")
         if isinstance(paused_raw, str):
             paused = paused_raw.strip().lower() in {"1", "true", "yes", "on"}
         else:
             paused = bool(paused_raw)
+        if paused_raw is None:
+            paused = (status or "").strip().lower() in {"offline", "paused", "disabled", "suspended"}
+        verify_status_lower = (cname_status or status or "").strip().lower()
         return {
             "siteId": str(raw.get("ZoneId") or raw.get("Id") or ""),
             "zoneName": str(raw.get("ZoneName") or raw.get("Name") or ""),
             "status": status or "unknown",
             "verifyStatus": cname_status or status or "unknown",
-            "verified": (status or "").lower() in {"active", "online", "enabled", "success", "verified"} or (cname_status or "").lower() in {"finished", "active", "verified", "success"},
+            "verified": (status or "").lower() in {"active", "online", "enabled", "success", "verified"}
+            or verify_status_lower in {"finished", "active", "verified", "success", "completed"},
             "paused": paused,
             "type": str(raw.get("Type") or raw.get("AccessType") or ""),
             "area": str(raw.get("Area") or raw.get("Region") or ""),

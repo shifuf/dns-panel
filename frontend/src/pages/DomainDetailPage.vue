@@ -20,11 +20,15 @@ import { getDomainById } from '@/services/domains';
 import { getDnsCredentials, getProviders } from '@/services/dnsCredentials';
 import {
   listAccelerationConfigs,
+  discoverAccelerationSites,
   enableAcceleration,
   verifyAcceleration,
   syncAcceleration,
   disableAcceleration,
+  setAccelerationSiteStatus,
+  deleteRemoteAcceleration,
   type DomainAccelerationConfig,
+  type DiscoveredAccelerationSite,
 } from '@/services/accelerations';
 import type { RecordsResponseCapabilities } from '@/services/dns';
 import { useProviderStore } from '@/stores/provider';
@@ -163,9 +167,29 @@ const { data: accelerationConfigData, isLoading: accelerationLoading, refetch: r
 
 const accelerationConfig = computed<DomainAccelerationConfig | null>(() => accelerationConfigData.value || null);
 
+const { data: discoveredAccelerationData, isLoading: discoveringAcceleration, refetch: refetchDiscoveredAcceleration } = useQuery({
+  queryKey: computed(() => ['acceleration-discover', zoneName.value]),
+  queryFn: async () => {
+    if (!zoneName.value) return [];
+    const res = await discoverAccelerationSites({ zoneName: zoneName.value });
+    return res.data?.items || [];
+  },
+  enabled: computed(() => !!zoneName.value),
+});
+
+const discoveredAccelerationSites = computed<DiscoveredAccelerationSite[]>(() => discoveredAccelerationData.value || []);
+
 watch(accelerationConfig, (config) => {
   if (config?.pluginCredentialId) {
     selectedAccelerationCredentialId.value = config.pluginCredentialId;
+  }
+}, { immediate: true });
+
+watch(discoveredAccelerationSites, (list) => {
+  if (accelerationConfig.value?.pluginCredentialId) return;
+  if (selectedAccelerationCredentialId.value && list.some((item) => item.pluginCredentialId === selectedAccelerationCredentialId.value)) return;
+  if (list[0]?.pluginCredentialId) {
+    selectedAccelerationCredentialId.value = list[0].pluginCredentialId;
   }
 }, { immediate: true });
 
@@ -197,9 +221,45 @@ watch(zoneName, () => {
 const accelerationStatusMeta = computed(() => {
   const config = accelerationConfig.value;
   if (!config) return { type: 'default' as const, label: '未接入', detail: '尚未接入加速' };
+  if (config.paused) return { type: 'warning' as const, label: '已暂停', detail: config.siteStatus || '加速站点当前已暂停' };
   if (config.verified) return { type: 'success' as const, label: '已验证', detail: config.siteStatus || '加速已生效' };
   if (config.lastError) return { type: 'error' as const, label: '异常', detail: config.lastError };
   return { type: 'warning' as const, label: '待验证', detail: config.verifyStatus || config.siteStatus || '等待验证' };
+});
+
+const selectedDiscoveredSite = computed<DiscoveredAccelerationSite | null>(() => {
+  if (!selectedAccelerationCredentialId.value) return discoveredAccelerationSites.value[0] || null;
+  return discoveredAccelerationSites.value.find((item) => item.pluginCredentialId === selectedAccelerationCredentialId.value) || discoveredAccelerationSites.value[0] || null;
+});
+
+const effectiveAccelerationView = computed(() => {
+  if (accelerationConfig.value) {
+    return {
+      source: 'local' as const,
+      site: accelerationConfig.value,
+      credentialName: accelerationCredentials.value.find((item) => item.id === accelerationConfig.value?.pluginCredentialId)?.name || '',
+    };
+  }
+  if (selectedDiscoveredSite.value) {
+    return {
+      source: 'remote' as const,
+      site: selectedDiscoveredSite.value.site,
+      credentialName: selectedDiscoveredSite.value.pluginCredentialName,
+    };
+  }
+  return null;
+});
+
+const accelerationStatusDisplay = computed(() => {
+  const current = effectiveAccelerationView.value;
+  if (!current) return { type: 'default' as const, label: '未接入', detail: '尚未接入加速' };
+  const site = current.site;
+  if (current.source === 'remote') {
+    if (site.paused) return { type: 'warning' as const, label: '远端已暂停', detail: site.siteStatus || 'EdgeOne 远端站点当前已暂停' };
+    if (site.verified) return { type: 'success' as const, label: '远端已接入', detail: site.siteStatus || 'EdgeOne 已存在站点' };
+    return { type: 'warning' as const, label: '远端待接管', detail: site.verifyStatus || site.siteStatus || 'EdgeOne 已存在站点，尚未纳入本地管理' };
+  }
+  return accelerationStatusMeta.value;
 });
 
 function copyText(text: string | undefined) {
@@ -226,14 +286,65 @@ const enableAccelerationMutation = useMutation({
   },
   onSuccess: async (res) => {
     const added = res.data?.dnsRecordsAdded || [];
+    const skipped = res.data?.dnsRecordsSkipped || [];
     const errors = res.data?.dnsErrors || [];
     let text = '已提交加速接入';
     if (added.length) text += `，已自动创建 ${added.length} 条验证记录`;
+    if (skipped.length) text += `，${skipped.length} 条验证记录已存在`;
     if (errors.length) text += `，${errors.length} 条记录创建失败`;
     if (res.data?.config?.verified) text += '，验证已完成';
     message.success(text);
     await refetchAccelerationConfig();
+    await refetchDiscoveredAcceleration();
     queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+const accelerationSiteStatusMutation = useMutation({
+  mutationFn: async (enabled: boolean) => {
+    const current = effectiveAccelerationView.value;
+    if (!zoneName.value || !current) {
+      throw new Error('缺少可操作的加速站点');
+    }
+    return setAccelerationSiteStatus({
+      zoneName: zoneName.value,
+      dnsCredentialId: typeof credentialId.value === 'number' ? credentialId.value : undefined,
+      pluginCredentialId: current.source === 'remote' ? selectedDiscoveredSite.value?.pluginCredentialId : undefined,
+      remoteSiteId: current.site.remoteSiteId,
+      enabled,
+    });
+  },
+  onSuccess: async () => {
+    message.success('加速站点状态已更新');
+    await refetchAccelerationConfig();
+    await refetchDiscoveredAcceleration();
+    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
+    queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+const deleteRemoteAccelerationMutation = useMutation({
+  mutationFn: async () => {
+    const current = effectiveAccelerationView.value;
+    if (!zoneName.value || !current) {
+      throw new Error('缺少可删除的加速站点');
+    }
+    return deleteRemoteAcceleration({
+      zoneName: zoneName.value,
+      dnsCredentialId: typeof credentialId.value === 'number' ? credentialId.value : undefined,
+      pluginCredentialId: current.source === 'remote' ? selectedDiscoveredSite.value?.pluginCredentialId : undefined,
+      remoteSiteId: current.site.remoteSiteId,
+      deleteLocalConfig: true,
+    });
+  },
+  onSuccess: async () => {
+    message.success('远端加速站点已删除');
+    await refetchAccelerationConfig();
+    await refetchDiscoveredAcceleration();
+    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
+    queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
   },
   onError: (err: any) => message.error(String(err)),
 });
@@ -251,6 +362,7 @@ const verifyAccelerationMutation = useMutation({
   onSuccess: async (res) => {
     message.success(res.data?.config?.verified ? '加速验证成功' : '已提交加速验证');
     await refetchAccelerationConfig();
+    await refetchDiscoveredAcceleration();
     queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
   },
   onError: (err: any) => message.error(String(err)),
@@ -269,6 +381,7 @@ const syncAccelerationMutation = useMutation({
   onSuccess: async () => {
     message.success('加速状态已同步');
     await refetchAccelerationConfig();
+    await refetchDiscoveredAcceleration();
     queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
   },
   onError: (err: any) => message.error(String(err)),
@@ -287,6 +400,7 @@ const disableAccelerationMutation = useMutation({
   onSuccess: async () => {
     message.success('已移除本地加速配置');
     await refetchAccelerationConfig();
+    await refetchDiscoveredAcceleration();
     queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
   },
   onError: (err: any) => message.error(String(err)),
@@ -494,22 +608,30 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
           <p class="bento-section-meta">接入 EdgeOne 后可自动生成域名归属验证记录，并支持手动验证与状态同步</p>
         </div>
         <div class="flex flex-wrap items-center gap-2">
-          <NTag size="small" :bordered="false" :type="accelerationStatusMeta.type">
-            {{ accelerationStatusMeta.label }}
+          <NTag size="small" :bordered="false" :type="accelerationStatusDisplay.type">
+            {{ accelerationStatusDisplay.label }}
           </NTag>
-          <NTag v-if="accelerationConfig?.remoteSiteId" size="small" :bordered="false">
-            Site {{ accelerationConfig.remoteSiteId }}
+          <NTag v-if="effectiveAccelerationView?.site?.remoteSiteId" size="small" :bordered="false">
+            Site {{ effectiveAccelerationView.site.remoteSiteId }}
           </NTag>
         </div>
       </div>
 
-      <div v-if="accelerationLoading" class="flex justify-center py-10">
+      <div v-if="accelerationLoading || discoveringAcceleration" class="flex justify-center py-10">
         <NSpin size="large" />
       </div>
 
       <div v-else class="space-y-4">
         <NAlert v-if="accelerationConfig?.lastError" type="warning" :bordered="false">
           {{ accelerationConfig.lastError }}
+        </NAlert>
+
+        <NAlert
+          v-if="!accelerationConfig && selectedDiscoveredSite"
+          type="info"
+          :bordered="false"
+        >
+          检测到 EdgeOne 中已存在当前域名站点，来源账户：{{ selectedDiscoveredSite.pluginCredentialName }}。可以直接接管到面板中继续管理。
         </NAlert>
 
         <div v-if="!accelerationCredentials.length" class="rounded-2xl border border-dashed border-panel-border bg-panel-surface p-5">
@@ -542,9 +664,9 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
                   :loading="enableAccelerationMutation.isPending.value"
                   @click="enableAccelerationMutation.mutate()"
                 >
-                  接入 EdgeOne
+                  {{ selectedDiscoveredSite ? '接管已有站点' : '接入 EdgeOne' }}
                 </NButton>
-                <template v-else>
+                <template v-if="accelerationConfig">
                   <NButton
                     size="small"
                     secondary
@@ -564,6 +686,23 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
                   </NButton>
                   <NButton
                     size="small"
+                    secondary
+                    :loading="accelerationSiteStatusMutation.isPending.value"
+                    @click="accelerationSiteStatusMutation.mutate(Boolean(accelerationConfig?.paused))"
+                  >
+                    {{ accelerationConfig?.paused ? '恢复站点' : '暂停站点' }}
+                  </NButton>
+                  <NButton
+                    size="small"
+                    tertiary
+                    type="error"
+                    :loading="deleteRemoteAccelerationMutation.isPending.value"
+                    @click="deleteRemoteAccelerationMutation.mutate()"
+                  >
+                    删除远端
+                  </NButton>
+                  <NButton
+                    size="small"
                     tertiary
                     :loading="disableAccelerationMutation.isPending.value"
                     @click="disableAccelerationMutation.mutate()"
@@ -571,35 +710,68 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
                     移除配置
                   </NButton>
                 </template>
+                <template v-else-if="selectedDiscoveredSite">
+                  <NButton
+                    size="small"
+                    secondary
+                    :loading="syncAccelerationMutation.isPending.value"
+                    @click="refetchDiscoveredAcceleration()"
+                  >
+                    刷新远端
+                  </NButton>
+                  <NButton
+                    size="small"
+                    secondary
+                    :loading="accelerationSiteStatusMutation.isPending.value"
+                    @click="accelerationSiteStatusMutation.mutate(Boolean(selectedDiscoveredSite.site.paused))"
+                  >
+                    {{ selectedDiscoveredSite.site.paused ? '恢复远端' : '暂停远端' }}
+                  </NButton>
+                  <NButton
+                    size="small"
+                    tertiary
+                    type="error"
+                    :loading="deleteRemoteAccelerationMutation.isPending.value"
+                    @click="deleteRemoteAccelerationMutation.mutate()"
+                  >
+                    删除远端
+                  </NButton>
+                </template>
                 <NButton size="small" secondary @click="showAddAccelerationCredential = true">
                   新增加速账户
                 </NButton>
               </div>
               <p class="mt-3 text-sm text-slate-500">
-                {{ accelerationStatusMeta.detail || '当前还没有加速接入状态' }}
+                {{ accelerationStatusDisplay.detail || '当前还没有加速接入状态' }}
               </p>
             </div>
           </div>
 
-          <div v-if="accelerationConfig" class="grid gap-4 md:grid-cols-3">
+          <div v-if="effectiveAccelerationView" class="grid gap-4 md:grid-cols-3">
             <article class="rounded-2xl border border-panel-border bg-panel-surface p-4">
               <p class="text-xs uppercase tracking-widest text-slate-500">站点状态</p>
-              <p class="mt-2 text-lg font-semibold text-slate-800">{{ accelerationConfig.siteStatus || '-' }}</p>
-              <p class="mt-1 text-xs text-slate-500">验证状态：{{ accelerationConfig.verifyStatus || '-' }}</p>
+              <p class="mt-2 text-lg font-semibold text-slate-800">{{ effectiveAccelerationView.site.siteStatus || '-' }}</p>
+              <p class="mt-1 text-xs text-slate-500">验证状态：{{ effectiveAccelerationView.site.verifyStatus || '-' }}</p>
             </article>
             <article class="rounded-2xl border border-panel-border bg-panel-surface p-4">
               <p class="text-xs uppercase tracking-widest text-slate-500">接入模式</p>
-              <p class="mt-2 text-lg font-semibold text-slate-800">{{ accelerationConfig.accessType || 'partial' }}</p>
-              <p class="mt-1 text-xs text-slate-500">区域：{{ accelerationConfig.area || 'global' }}</p>
+              <p class="mt-2 text-lg font-semibold text-slate-800">{{ effectiveAccelerationView.site.accessType || 'partial' }}</p>
+              <p class="mt-1 text-xs text-slate-500">区域：{{ effectiveAccelerationView.site.area || 'global' }}</p>
             </article>
             <article class="rounded-2xl border border-panel-border bg-panel-surface p-4">
-              <p class="text-xs uppercase tracking-widest text-slate-500">最近同步</p>
-              <p class="mt-2 text-lg font-semibold text-slate-800">{{ accelerationConfig.lastSyncedAt ? new Date(accelerationConfig.lastSyncedAt).toLocaleString('zh-CN') : '-' }}</p>
-              <p class="mt-1 text-xs text-slate-500">套餐：{{ accelerationConfig.planId || '默认' }}</p>
+              <p class="text-xs uppercase tracking-widest text-slate-500">{{ effectiveAccelerationView.source === 'local' ? '最近同步' : '远端账户' }}</p>
+              <p class="mt-2 text-lg font-semibold text-slate-800">
+                {{
+                  effectiveAccelerationView.source === 'local'
+                    ? (accelerationConfig?.lastSyncedAt ? new Date(accelerationConfig.lastSyncedAt).toLocaleString('zh-CN') : '-')
+                    : (effectiveAccelerationView.credentialName || '-')
+                }}
+              </p>
+              <p class="mt-1 text-xs text-slate-500">套餐：{{ effectiveAccelerationView.site.planId || '默认' }}</p>
             </article>
           </div>
 
-          <div v-if="accelerationConfig && accelerationConfig.verifyRecordName" class="rounded-2xl border border-panel-border bg-panel-surface p-4">
+          <div v-if="effectiveAccelerationView?.site?.verifyRecordName" class="rounded-2xl border border-panel-border bg-panel-surface p-4">
             <div class="flex flex-wrap items-center justify-between gap-2">
               <div>
                 <p class="text-sm font-semibold text-slate-700">验证记录</p>
@@ -609,21 +781,43 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
             <div class="mt-4 grid gap-3 md:grid-cols-3">
               <div class="rounded-xl bg-white/60 p-3">
                 <p class="text-xs text-slate-500">类型</p>
-                <button class="mt-1 text-left text-sm font-medium text-slate-800" @click="copyText(accelerationConfig.verifyRecordType)">
-                  {{ accelerationConfig.verifyRecordType || 'TXT' }}
+                <button class="mt-1 text-left text-sm font-medium text-slate-800" @click="copyText(effectiveAccelerationView.site.verifyRecordType)">
+                  {{ effectiveAccelerationView.site.verifyRecordType || 'TXT' }}
                 </button>
               </div>
               <div class="rounded-xl bg-white/60 p-3">
                 <p class="text-xs text-slate-500">主机记录</p>
-                <button class="mt-1 break-all text-left text-sm font-medium text-slate-800" @click="copyText(accelerationConfig.verifyRecordName)">
-                  {{ accelerationConfig.verifyRecordName }}
+                <button class="mt-1 break-all text-left text-sm font-medium text-slate-800" @click="copyText(effectiveAccelerationView.site.verifyRecordName)">
+                  {{ effectiveAccelerationView.site.verifyRecordName }}
                 </button>
               </div>
               <div class="rounded-xl bg-white/60 p-3">
                 <p class="text-xs text-slate-500">记录值</p>
-                <button class="mt-1 break-all text-left text-sm font-medium text-slate-800" @click="copyText(accelerationConfig.verifyRecordValue)">
-                  {{ accelerationConfig.verifyRecordValue }}
+                <button class="mt-1 break-all text-left text-sm font-medium text-slate-800" @click="copyText(effectiveAccelerationView.site.verifyRecordValue)">
+                  {{ effectiveAccelerationView.site.verifyRecordValue }}
                 </button>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="discoveredAccelerationSites.length > 1 && !accelerationConfig" class="rounded-2xl border border-panel-border bg-panel-surface p-4">
+            <p class="text-sm font-semibold text-slate-700">发现的远端站点</p>
+            <p class="mt-1 text-xs text-slate-500">如果同一域名在多个 EdgeOne 账户下已存在，这里会展示所有候选站点。</p>
+            <div class="mt-4 grid gap-3">
+              <div
+                v-for="item in discoveredAccelerationSites"
+                :key="`${item.pluginCredentialId}-${item.site.remoteSiteId}`"
+                class="rounded-xl border border-panel-border bg-white/60 p-3"
+              >
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <p class="text-sm font-medium text-slate-800">{{ item.pluginCredentialName }}</p>
+                    <p class="text-xs text-slate-500">Site {{ item.site.remoteSiteId || '-' }} · {{ item.site.siteStatus || 'unknown' }}</p>
+                  </div>
+                  <NButton size="small" secondary @click="selectedAccelerationCredentialId = item.pluginCredentialId">
+                    选择此账户
+                  </NButton>
+                </div>
               </div>
             </div>
           </div>
@@ -664,7 +858,7 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
     />
     <AddAccelerationCredentialDialog
       v-model:show="showAddAccelerationCredential"
-      @created="() => { refetchAccelerationCredentials(); }"
+      @created="() => { refetchAccelerationCredentials(); refetchDiscoveredAcceleration(); }"
     />
   </div>
 </template>

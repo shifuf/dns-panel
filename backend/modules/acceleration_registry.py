@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Protocol
 
 from modules.tencent_edgeone_api import TencentEdgeOneApi, TencentEdgeOneApiError
 
@@ -9,6 +9,31 @@ class AccelerationPluginError(Exception):
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
         self.status = int(status)
+
+
+class AccelerationPlugin(Protocol):
+    provider: str
+
+    def ensure_site(self, zone_name: str) -> Dict[str, Any]:
+        ...
+
+    def list_sites(self) -> list[Dict[str, Any]]:
+        ...
+
+    def discover_site(self, zone_name: str) -> Dict[str, Any] | None:
+        ...
+
+    def get_site(self, zone_name: str, site_id: str | None = None) -> Dict[str, Any]:
+        ...
+
+    def verify_site(self, zone_name: str, site_id: str | None = None) -> Dict[str, Any]:
+        ...
+
+    def set_site_status(self, zone_name: str, site_id: str | None, enabled: bool) -> Dict[str, Any]:
+        ...
+
+    def delete_site(self, zone_name: str, site_id: str | None = None) -> Dict[str, Any]:
+        ...
 
 
 class TencentEdgeOneAccelerationPlugin:
@@ -36,6 +61,43 @@ class TencentEdgeOneAccelerationPlugin:
         if created.get("planId") and not site.get("planId"):
             site["planId"] = created.get("planId")
         return site
+
+    def list_sites(self) -> list[Dict[str, Any]]:
+        offset = 0
+        limit = 100
+        out: list[Dict[str, Any]] = []
+        for _ in range(20):
+            result = self.api.list_zones(offset=offset, limit=limit)
+            zones = result.get("zones") or []
+            for zone in zones:
+                out.append(
+                    {
+                        "provider": self.provider,
+                        "remoteSiteId": str(zone.get("siteId") or ""),
+                        "zoneName": str(zone.get("zoneName") or ""),
+                        "siteStatus": str(zone.get("status") or "unknown"),
+                        "verifyStatus": str(zone.get("verifyStatus") or zone.get("status") or "unknown"),
+                        "verified": bool(zone.get("verified")),
+                        "paused": bool(zone.get("paused")),
+                        "accessType": str(zone.get("type") or "partial"),
+                        "area": str(zone.get("area") or "global"),
+                        "planId": str(zone.get("planId") or self._secrets.get("planId") or ""),
+                        "verifyRecordName": "",
+                        "verifyRecordType": "",
+                        "verifyRecordValue": "",
+                        "raw": zone.get("raw") if isinstance(zone.get("raw"), dict) else zone,
+                    }
+                )
+            if len(zones) < limit:
+                break
+            offset += limit
+        return out
+
+    def discover_site(self, zone_name: str) -> Dict[str, Any] | None:
+        existing = self.api.find_zone_by_name(zone_name)
+        if not existing:
+            return None
+        return self.get_site(zone_name, existing.get("siteId"))
 
     def get_site(self, zone_name: str, site_id: str | None = None) -> Dict[str, Any]:
         site = self.api.describe_zone(zone_name, zone_id=site_id)
@@ -75,8 +137,27 @@ class TencentEdgeOneAccelerationPlugin:
         self.api.identify_zone(zone_name)
         return self.get_site(zone_name, site_id=site_id)
 
+    def set_site_status(self, zone_name: str, site_id: str | None, enabled: bool) -> Dict[str, Any]:
+        target_site_id = str(site_id or "").strip()
+        if not target_site_id:
+            site = self.discover_site(zone_name)
+            if not site:
+                raise AccelerationPluginError("未找到要更新状态的加速站点", 404)
+            target_site_id = str(site.get("remoteSiteId") or "")
+        self.api.modify_zone_status(target_site_id, enabled)
+        return self.get_site(zone_name, target_site_id)
 
-def build_acceleration_plugin(provider: str, secrets: Dict[str, Any]) -> TencentEdgeOneAccelerationPlugin:
+    def delete_site(self, zone_name: str, site_id: str | None = None) -> Dict[str, Any]:
+        target_site_id = str(site_id or "").strip()
+        if not target_site_id:
+            site = self.discover_site(zone_name)
+            if not site:
+                raise AccelerationPluginError("未找到要删除的加速站点", 404)
+            target_site_id = str(site.get("remoteSiteId") or "")
+        return self.api.delete_zone(target_site_id)
+
+
+def build_acceleration_plugin(provider: str, secrets: Dict[str, Any]) -> AccelerationPlugin:
     provider_key = str(provider or "").strip().lower()
     if provider_key == "tencent_edgeone":
         return TencentEdgeOneAccelerationPlugin(secrets)

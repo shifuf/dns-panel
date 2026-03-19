@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -107,6 +108,8 @@ DEFAULT_RETRY_INTERVAL_SECONDS = 2
 DEFAULT_RETRY_TIMEOUT_SECONDS = 15
 DEFAULT_BACKUP_FILE_PREFIX = "dns-panel-backup"
 VALID_BACKUP_SCOPES = {"dns", "ssl"}
+ACCELERATION_SYNC_INTERVAL_SECONDS = max(0, int(os.getenv("ACCELERATION_SYNC_INTERVAL_SECONDS", "900") or "900"))
+ACCELERATION_SYNC_STARTUP_DELAY_SECONDS = max(0, int(os.getenv("ACCELERATION_SYNC_STARTUP_DELAY_SECONDS", "30") or "30"))
 
 
 def resolve_db() -> Path:
@@ -2119,10 +2122,119 @@ class H(BaseHTTPRequestHandler):
 
 attach_route_methods(H, globals())
 
+
+def _load_credential_secrets_from_row(row: sqlite3.Row | None) -> Dict[str, Any]:
+    if not row:
+        return {}
+    plain = decrypt_text(row["secrets"])
+    try:
+        parsed = json.loads(plain)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _sync_acceleration_row(row: sqlite3.Row) -> None:
+    provider = str(row["pluginProvider"] or "").strip().lower()
+    zone_name = norm_domain(row["zoneName"])
+    remote_site_id = str(row["remoteSiteId"] or "").strip()
+    plugin_credential_id = int(row["pluginCredentialId"])
+    user_id = int(row["userId"])
+
+    with conn() as c:
+        cred_row = c.execute(
+            "SELECT * FROM dns_credentials WHERE id = ? AND userId = ? LIMIT 1",
+            (plugin_credential_id, user_id),
+        ).fetchone()
+    if not cred_row:
+        raise ValueError("加速凭证不存在")
+
+    plugin = build_acceleration_plugin(provider, _load_credential_secrets_from_row(cred_row))
+    state = plugin.get_site(zone_name, remote_site_id)
+    with conn() as c:
+        c.execute(
+            """
+            UPDATE domain_accelerations
+            SET remoteSiteId = ?, siteStatus = ?, verifyStatus = ?, verified = ?, paused = ?,
+                accessType = ?, area = ?, planId = ?, verifyRecordName = ?, verifyRecordType = ?,
+                verifyRecordValue = ?, lastError = '', lastSyncedAt = ?, updatedAt = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                str(state.get("remoteSiteId") or ""),
+                str(state.get("siteStatus") or ""),
+                str(state.get("verifyStatus") or ""),
+                1 if bool(state.get("verified")) else 0,
+                1 if bool(state.get("paused")) else 0,
+                str(state.get("accessType") or "partial"),
+                str(state.get("area") or "global"),
+                str(state.get("planId") or ""),
+                str(state.get("verifyRecordName") or ""),
+                str(state.get("verifyRecordType") or "TXT"),
+                str(state.get("verifyRecordValue") or ""),
+                now_iso(),
+                int(row["id"]),
+            ),
+        )
+        c.commit()
+
+
+def sync_domain_accelerations_once() -> Dict[str, int]:
+    if not table_exists("domain_accelerations"):
+        return {"synced": 0, "failed": 0}
+
+    with conn() as c:
+        rows = c.execute(
+            "SELECT * FROM domain_accelerations ORDER BY updatedAt DESC, id DESC"
+        ).fetchall()
+
+    synced = 0
+    failed = 0
+    for row in rows:
+        try:
+            _sync_acceleration_row(row)
+            synced += 1
+        except Exception as exc:
+            failed += 1
+            try:
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE domain_accelerations
+                        SET lastError = ?, lastSyncedAt = ?, updatedAt = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (str(exc), now_iso(), int(row["id"])),
+                    )
+                    c.commit()
+            except Exception:
+                pass
+    return {"synced": synced, "failed": failed}
+
+
+def start_acceleration_sync_thread() -> threading.Thread | None:
+    if ACCELERATION_SYNC_INTERVAL_SECONDS <= 0:
+        return None
+
+    def _runner() -> None:
+        if ACCELERATION_SYNC_STARTUP_DELAY_SECONDS > 0:
+            time.sleep(ACCELERATION_SYNC_STARTUP_DELAY_SECONDS)
+        while True:
+            try:
+                sync_domain_accelerations_once()
+            except Exception:
+                pass
+            time.sleep(ACCELERATION_SYNC_INTERVAL_SECONDS)
+
+    thread = threading.Thread(target=_runner, name="acceleration-auto-sync", daemon=True)
+    thread.start()
+    return thread
+
 def main() -> None:
     init_db()
     from modules.cache import cache_ping
     redis_ok = cache_ping()
+    start_acceleration_sync_thread()
     s = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     print(json.dumps({"message": "Python Backend V2 started", "port": PORT, "legacyProxy": LEGACY, "databasePath": str(DB), "redis": "connected" if redis_ok else "unavailable (degraded mode)"}, ensure_ascii=False))
     try:
