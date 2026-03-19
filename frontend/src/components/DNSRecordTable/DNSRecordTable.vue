@@ -23,7 +23,7 @@ import type { DNSRecord } from '@/types';
 import type { DnsLine } from '@/types/dns';
 import type { RecordsResponseCapabilities } from '@/services/dns';
 
-type ColumnKey = 'type' | 'name' | 'content' | 'proxied' | 'line' | 'ttl' | 'enabled' | 'remark' | 'actions';
+type ColumnKey = 'type' | 'name' | 'content' | 'proxied' | 'line' | 'ttl' | 'enabled' | 'remark' | 'acceleration' | 'actions';
 
 const COLUMN_ORDER_KEY = 'dns_records_column_order_v1';
 const HIDDEN_COLUMNS_KEY = 'dns_records_hidden_columns_v1';
@@ -33,6 +33,8 @@ const props = defineProps<{
   lines?: DnsLine[];
   minTtl?: number;
   capabilities?: RecordsResponseCapabilities;
+  showAccelerationToggle?: boolean;
+  accelerationToggleLabel?: string;
 }>();
 
 const emit = defineEmits<{
@@ -80,6 +82,7 @@ const availableColumns = computed(() => {
   if (caps.value?.supportsLine && (props.lines || []).length > 0) list.push({ key: 'line', label: '线路' });
   if (caps.value?.supportsStatus) list.push({ key: 'enabled', label: '状态' });
   if (caps.value?.supportsRemark) list.push({ key: 'remark', label: '备注' });
+  if (props.showAccelerationToggle) list.push({ key: 'acceleration', label: '加速' });
   list.push({ key: 'actions', label: '操作' });
   return list;
 });
@@ -166,6 +169,7 @@ function startEdit(record: DNSRecord) {
     weight: record.weight,
     line: record.line,
     remark: record.remark,
+    enableAcceleration: false,
   };
   if (isMobile.value) mobileEditVisible.value = true;
 }
@@ -408,6 +412,24 @@ const columns = computed(() => {
         return h('span', { class: 'text-sm text-slate-500' }, row.remark || '-');
       },
     },
+    acceleration: {
+      title: '加速',
+      key: 'acceleration',
+      width: 120,
+      render(row: DNSRecord) {
+        if (!props.showAccelerationToggle) {
+          return h('span', { class: 'text-sm text-slate-400' }, '-');
+        }
+        if (editingId.value === row.id) {
+          return h(NSwitch, {
+            value: !!editForm.value.enableAcceleration,
+            'onUpdate:value': (v: boolean) => (editForm.value.enableAcceleration = v),
+            size: 'small',
+          });
+        }
+        return h('span', { class: 'text-xs text-slate-400' }, '编辑时可选');
+      },
+    },
     actions: {
       title: '',
       key: 'actions',
@@ -637,6 +659,18 @@ const columns = computed(() => {
           :value="!!editForm.proxied"
           size="small"
           @update:value="(v: boolean) => { editForm.proxied = v; }"
+        />
+      </div>
+
+      <div v-if="showAccelerationToggle" class="flex items-center justify-between rounded-lg border border-panel-border bg-panel-bg px-3 py-2">
+        <div>
+          <p class="text-sm text-slate-600">{{ accelerationToggleLabel || '修改后自动接入加速' }}</p>
+          <p class="text-xs text-slate-400">保存记录后自动创建或接管当前域名的加速配置</p>
+        </div>
+        <NSwitch
+          :value="!!editForm.enableAcceleration"
+          size="small"
+          @update:value="(v: boolean) => { editForm.enableAcceleration = v; }"
         />
       </div>
 

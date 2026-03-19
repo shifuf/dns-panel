@@ -159,3 +159,15 @@ export async function syncAllAccelerations(data?: {
   const response = await api.post('/accelerations/sync-all', data || {});
   return response as unknown as ApiResponse<{ items: DomainAccelerationConfig[]; errors: Array<{ zoneName: string; dnsCredentialId: number; error: string }>; synced: number; failed: number }>;
 }
+
+export async function createAccelerationVerifyRecord(data: {
+  zoneName: string;
+  zoneId?: string;
+  dnsCredentialId: number;
+  pluginCredentialId?: number;
+  remoteSiteId?: string;
+  verifyAfter?: boolean;
+}): Promise<ApiResponse<{ config?: DomainAccelerationConfig | null; site?: RemoteAccelerationSite | null; dnsRecordsAdded?: Array<{ zoneName: string; type: string; name: string; value: string }>; dnsRecordsSkipped?: Array<{ zoneName: string; type: string; name: string; value: string }>; dnsErrors?: Array<{ error: string; name?: string }> }>> {
+  const response = await api.post('/accelerations/create-verify-record', data);
+  return response as unknown as ApiResponse<{ config?: DomainAccelerationConfig | null; site?: RemoteAccelerationSite | null; dnsRecordsAdded?: Array<{ zoneName: string; type: string; name: string; value: string }>; dnsRecordsSkipped?: Array<{ zoneName: string; type: string; name: string; value: string }>; dnsErrors?: Array<{ error: string; name?: string }> }>;
+}

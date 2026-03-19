@@ -461,9 +461,45 @@ const createMutation = useMutation({
 });
 
 const updateMutation = useMutation({
-  mutationFn: (vars: { recordId: string; params: Parameters<typeof updateDNSRecord>[2] }) =>
-    updateDNSRecord(zoneId.value, vars.recordId, vars.params, credentialId.value),
-  onSuccess: () => { message.success('记录已更新'); refetchRecords(); },
+  mutationFn: async (vars: { recordId: string; params: Parameters<typeof updateDNSRecord>[2] & { enableAcceleration?: boolean } }) => {
+    const { enableAcceleration: enableAfterUpdate, ...recordParams } = vars.params;
+    const recordResult = await updateDNSRecord(zoneId.value, vars.recordId, recordParams, credentialId.value);
+    let accelerationResult: Awaited<ReturnType<typeof enableAcceleration>> | null = null;
+    if (
+      enableAfterUpdate
+      && canEnableAccelerationWhenAddingRecord.value
+      && typeof credentialId.value === 'number'
+      && selectedAccelerationCredentialId.value
+      && zoneName.value
+    ) {
+      accelerationResult = await enableAcceleration({
+        zoneName: zoneName.value,
+        zoneId: zoneId.value,
+        dnsCredentialId: credentialId.value,
+        pluginCredentialId: selectedAccelerationCredentialId.value,
+        autoDnsRecord: true,
+      });
+    }
+    return { recordResult, accelerationResult };
+  },
+  onSuccess: async (result) => {
+    let text = '记录已更新';
+    if (result.accelerationResult) {
+      const added = result.accelerationResult.data?.dnsRecordsAdded?.length || 0;
+      const skipped = result.accelerationResult.data?.dnsRecordsSkipped?.length || 0;
+      const failed = result.accelerationResult.data?.dnsErrors?.length || 0;
+      text += '，并已提交加速接入';
+      if (added) text += `（新增 ${added} 条验证记录）`;
+      if (skipped) text += `（${skipped} 条验证记录已存在）`;
+      if (failed) text += `（${failed} 条验证记录写入失败）`;
+    }
+    message.success(text);
+    await refetchRecords();
+    await refetchAccelerationConfig();
+    await refetchDiscoveredAcceleration();
+    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
+    queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
+  },
   onError: (err: any) => message.error(String(err)),
 });
 
@@ -888,6 +924,8 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
         :lines="lines"
         :min-ttl="minTTL"
         :capabilities="capabilities"
+        :show-acceleration-toggle="canEnableAccelerationWhenAddingRecord"
+        :acceleration-toggle-label="addRecordAccelerationLabel"
         @update="handleUpdate"
         @delete="handleDelete"
         @status-change="handleStatusChange"

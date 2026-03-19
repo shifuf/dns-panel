@@ -3250,6 +3250,65 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             self._ok(payload, "远端站点已导入")
             return
 
+        if self.command == "POST" and sub == "/create-verify-record":
+            zone_name = norm_domain(body.get("zoneName"))
+            zone_id = str(body.get("zoneId") or "").strip()
+            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
+            plugin_credential_id = self._parse_credential_id(body.get("pluginCredentialId"))
+            remote_site_id = str(body.get("remoteSiteId") or "").strip()
+            verify_after = True if body.get("verifyAfter", True) is True else self._parse_bool(body.get("verifyAfter"))
+            if not zone_name or not dns_credential_id:
+                self._err("缺少参数: zoneName, dnsCredentialId", 400)
+                return
+
+            row = _get_accel_row(dns_credential_id, zone_name)
+            if row:
+                plugin_credential_id = int(row["pluginCredentialId"])
+                remote_site_id = remote_site_id or str(row["remoteSiteId"] or "")
+            if not plugin_credential_id:
+                self._err("缺少参数: pluginCredentialId", 400)
+                return
+
+            plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
+            state = plugin.get_site(zone_name, remote_site_id)
+            dns_records_added, dns_records_skipped, dns_errors = _auto_create_verify_record(dns_credential_id, zone_name, zone_id, state)
+            if verify_after and (dns_records_added or dns_records_skipped) and not dns_errors:
+                try:
+                    import time as _time
+                    _time.sleep(2)
+                    state = plugin.verify_site(zone_name, state.get("remoteSiteId"))
+                except Exception:
+                    pass
+
+            serialized = None
+            if row:
+                updated = _upsert_accel_row(
+                    dns_credential_id,
+                    zone_name,
+                    int(plugin_cred_row["id"]),
+                    state,
+                    plugin_provider,
+                    dns_errors[0]["error"] if dns_errors else "",
+                )
+                serialized = _serialize_row(updated)
+            payload = {
+                "config": serialized,
+                "site": state if not serialized else None,
+                "dnsRecordsAdded": dns_records_added,
+                "dnsRecordsSkipped": dns_records_skipped,
+                "dnsErrors": dns_errors,
+            }
+            _write_accel_log(
+                "UPDATE",
+                "SUCCESS" if not dns_errors else "FAILED",
+                zone_name,
+                old_value=_serialize_row(row) if row else None,
+                new_value=payload,
+                error_message=dns_errors[0]["error"] if dns_errors else None,
+            )
+            self._ok(payload, "验证记录处理完成")
+            return
+
         if self.command == "POST" and sub == "/verify":
             zone_name = norm_domain(body.get("zoneName"))
             dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
