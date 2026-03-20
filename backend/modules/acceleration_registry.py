@@ -23,16 +23,16 @@ class AccelerationPlugin(Protocol):
     def discover_site(self, zone_name: str) -> Dict[str, Any] | None:
         ...
 
-    def get_site(self, zone_name: str, site_id: str | None = None) -> Dict[str, Any]:
+    def get_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
         ...
 
-    def verify_site(self, zone_name: str, site_id: str | None = None) -> Dict[str, Any]:
+    def verify_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
         ...
 
-    def set_site_status(self, zone_name: str, site_id: str | None, enabled: bool) -> Dict[str, Any]:
+    def set_site_status(self, zone_name: str, site_id: str | None, enabled: bool, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
         ...
 
-    def delete_site(self, zone_name: str, site_id: str | None = None) -> Dict[str, Any]:
+    def delete_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
         ...
 
 
@@ -73,16 +73,19 @@ class TencentEdgeOneAccelerationPlugin:
             return normalized_sub
         return f"{normalized_sub}.{zone}"
 
-    def _find_matching_domain(self, zone: Dict[str, Any], zone_name: str) -> Dict[str, Any] | None:
+    def _resolve_target_domain(self, zone_name: str, config: Dict[str, Any] | None = None) -> str:
+        return self._build_acceleration_domain(zone_name, config)
+
+    def _find_matching_domain(self, zone: Dict[str, Any], zone_name: str, config: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
         site_id = str(zone.get("siteId") or "")
         if not site_id:
             return None
-        target = TencentEdgeOneApi.normalize_zone_name(zone_name)
+        target = self._resolve_target_domain(zone_name, config)
         items = self.api.list_acceleration_domains(site_id).get("items") or []
         for item in items:
             if TencentEdgeOneApi.normalize_domain_name(item.get("domainName")) == target:
                 return item
-        return items[0] if items else None
+        return None
 
     def _to_state(
         self,
@@ -90,9 +93,11 @@ class TencentEdgeOneAccelerationPlugin:
         zone: Dict[str, Any],
         domain: Dict[str, Any] | None = None,
         verification: Dict[str, Any] | None = None,
+        config: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         verification = verification or {}
-        acceleration_domain = str(domain.get("domainName") or zone_name) if domain else str(zone_name)
+        fallback_domain = self._resolve_target_domain(zone_name, config) if config else str(zone_name)
+        acceleration_domain = str(domain.get("domainName") or fallback_domain) if domain else fallback_domain
         site_status = str(zone.get("status") or "unknown")
         domain_status = str(domain.get("domainStatus") or site_status) if domain else site_status
         verify_status = str(
@@ -146,16 +151,16 @@ class TencentEdgeOneAccelerationPlugin:
             if config and str(config.get("originValue") or "").strip():
                 domain_name = self._build_acceleration_domain(zone_name, config)
                 domain = self.api.upsert_acceleration_domain(str(zone.get("siteId") or ""), domain_name, config)
-                return self._to_state(zone_name, zone, domain, verification)
-            return self._to_state(zone_name, zone, None, verification)
+                return self._to_state(zone_name, zone, domain, verification, config)
+            return self._to_state(zone_name, zone, None, verification, config)
 
         if config and str(config.get("originValue") or "").strip():
             domain_name = self._build_acceleration_domain(zone_name, config)
             domain = self.api.upsert_acceleration_domain(str(zone.get("siteId") or ""), domain_name, config)
-            return self._to_state(zone_name, zone, domain)
+            return self._to_state(zone_name, zone, domain, None, config)
 
-        domain = self._find_matching_domain(zone, zone_name)
-        return self._to_state(zone_name, zone, domain)
+        domain = self._find_matching_domain(zone, zone_name, config)
+        return self._to_state(zone_name, zone, domain, None, config)
 
     def list_sites(self) -> list[Dict[str, Any]]:
         offset = 0
@@ -182,9 +187,9 @@ class TencentEdgeOneAccelerationPlugin:
             return None
         return self.get_site(zone_name, existing.get("siteId"))
 
-    def get_site(self, zone_name: str, site_id: str | None = None) -> Dict[str, Any]:
+    def get_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
         zone = self.api.describe_zone(zone_name, zone_id=site_id)
-        domain = self._find_matching_domain(zone, zone_name)
+        domain = self._find_matching_domain(zone, zone_name, config)
         verification: Dict[str, Any] = {}
         if not zone.get("verified"):
             try:
@@ -195,28 +200,28 @@ class TencentEdgeOneAccelerationPlugin:
                     zone = identified_zone
             except TencentEdgeOneApiError:
                 pass
-        return self._to_state(zone_name, zone, domain, verification)
+        return self._to_state(zone_name, zone, domain, verification, config)
 
-    def verify_site(self, zone_name: str, site_id: str | None = None) -> Dict[str, Any]:
+    def verify_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
         try:
             self.api.identify_zone(zone_name)
         except TencentEdgeOneApiError:
             pass
-        return self.get_site(zone_name, site_id=site_id)
+        return self.get_site(zone_name, site_id=site_id, config=config)
 
-    def set_site_status(self, zone_name: str, site_id: str | None, enabled: bool) -> Dict[str, Any]:
+    def set_site_status(self, zone_name: str, site_id: str | None, enabled: bool, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
         zone = self.api.describe_zone(zone_name, zone_id=site_id)
-        domain = self._find_matching_domain(zone, zone_name)
+        domain = self._find_matching_domain(zone, zone_name, config)
         if domain and domain.get("domainName"):
             self.api.modify_acceleration_domain_statuses(str(zone.get("siteId") or ""), [str(domain.get("domainName") or "")], enabled)
             domain = self.api.get_acceleration_domain(str(zone.get("siteId") or ""), str(domain.get("domainName") or ""))
-            return self._to_state(zone_name, zone, domain)
+            return self._to_state(zone_name, zone, domain, None, config)
         self.api.modify_zone_status(str(zone.get("siteId") or ""), enabled)
-        return self.get_site(zone_name, str(zone.get("siteId") or ""))
+        return self.get_site(zone_name, str(zone.get("siteId") or ""), config=config)
 
-    def delete_site(self, zone_name: str, site_id: str | None = None) -> Dict[str, Any]:
+    def delete_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
         zone = self.api.describe_zone(zone_name, zone_id=site_id)
-        domain = self._find_matching_domain(zone, zone_name)
+        domain = self._find_matching_domain(zone, zone_name, config)
         if domain and domain.get("domainName"):
             return self.api.delete_acceleration_domains(str(zone.get("siteId") or ""), [str(domain.get("domainName") or "")])
         return self.api.delete_zone(str(zone.get("siteId") or ""))

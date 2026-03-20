@@ -275,7 +275,7 @@ class TencentEdgeOneApi:
         ipv6_status = self._normalize_ipv6_status(config.get("ipv6Status"))
         if ipv6_status:
             payload["Ipv6Status"] = ipv6_status
-        resp = self._tc3_request("CreateAccelerationDomain", payload)
+        resp = self._request_acceleration_domain_with_port_fallback("CreateAccelerationDomain", payload)
         verification = self._normalize_verification(resp)
         current = self.get_acceleration_domain(zid, target_domain) or {
             "domainName": target_domain,
@@ -299,7 +299,7 @@ class TencentEdgeOneApi:
         ipv6_status = self._normalize_ipv6_status(config.get("ipv6Status"))
         if ipv6_status:
             payload["Ipv6Status"] = ipv6_status
-        self._tc3_request("ModifyAccelerationDomain", payload)
+        self._request_acceleration_domain_with_port_fallback("ModifyAccelerationDomain", payload)
         return self.get_acceleration_domain(zid, target_domain) or {
             "domainName": target_domain,
             "raw": {},
@@ -353,6 +353,28 @@ class TencentEdgeOneApi:
             raise TencentEdgeOneApiError("缺少站点 ID", 400)
         resp = self._tc3_request("DeleteZone", {"ZoneId": zid})
         return {"siteId": zid, "requestId": resp.get("RequestId")}
+
+    def _request_acceleration_domain_with_port_fallback(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return self._tc3_request(action, payload)
+        except TencentEdgeOneApiError as exc:
+            message = str(exc)
+            if "OriginInfo.HttpOriginPort" not in message and "OriginInfo.HttpsOriginPort" not in message:
+                raise
+            retry_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+            origin_info = retry_payload.get("OriginInfo")
+            if isinstance(origin_info, dict):
+                origin_info.pop("HttpOriginPort", None)
+                origin_info.pop("HttpsOriginPort", None)
+            return self._tc3_request(action, retry_payload)
+
+    @staticmethod
+    def _safe_port(value: Any, default: int) -> int:
+        try:
+            port = int(value)
+            return port if port > 0 else default
+        except Exception:
+            return default
 
     @staticmethod
     def _normalize_verification(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -487,8 +509,8 @@ class TencentEdgeOneApi:
             "backupOriginValue": str(origin_detail.get("BackupOrigin") or ""),
             "hostHeader": str(origin_detail.get("HostHeader") or ""),
             "originProtocol": str(origin_detail.get("OriginProtocol") or raw.get("OriginProtocol") or "FOLLOW"),
-            "httpOriginPort": int(origin_detail.get("HttpOriginPort") or raw.get("HttpOriginPort") or 80),
-            "httpsOriginPort": int(origin_detail.get("HttpsOriginPort") or raw.get("HttpsOriginPort") or 443),
+            "httpOriginPort": self._safe_port(origin_detail.get("HttpOriginPort") or raw.get("HttpOriginPort"), 80),
+            "httpsOriginPort": self._safe_port(origin_detail.get("HttpsOriginPort") or raw.get("HttpsOriginPort"), 443),
             "ipv6Status": str(raw.get("Ipv6Status") or raw.get("IPv6Status") or "follow"),
             "verifyRecordName": "",
             "verifyRecordType": "",

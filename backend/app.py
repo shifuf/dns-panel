@@ -2217,7 +2217,32 @@ def _sync_acceleration_row(row: sqlite3.Row) -> None:
         raise ValueError("加速凭证不存在")
 
     plugin = build_acceleration_plugin(provider, _load_credential_secrets_from_row(cred_row))
-    state = plugin.get_site(zone_name, remote_site_id)
+    row_config: Dict[str, Any] = {}
+    for key in (
+        "accelerationDomain",
+        "subDomain",
+        "originType",
+        "originValue",
+        "backupOriginValue",
+        "hostHeader",
+        "originProtocol",
+        "ipv6Status",
+    ):
+        value = row[key]
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            row_config[key] = text
+    for key in ("httpOriginPort", "httpsOriginPort"):
+        value = row[key]
+        if value in (None, ""):
+            continue
+        try:
+            row_config[key] = int(value)
+        except Exception:
+            pass
+    state = plugin.get_site(zone_name, remote_site_id, row_config or None)
     with conn() as c:
         c.execute(
             """

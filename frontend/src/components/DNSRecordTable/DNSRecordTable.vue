@@ -25,6 +25,13 @@ import type { RecordsResponseCapabilities } from '@/services/dns';
 
 type ColumnKey = 'type' | 'name' | 'content' | 'proxied' | 'line' | 'ttl' | 'enabled' | 'remark' | 'acceleration' | 'actions';
 
+type RecordAccelerationState = {
+  matched: boolean;
+  label: string;
+  type: 'success' | 'warning' | 'error' | 'default';
+  detail?: string;
+};
+
 const COLUMN_ORDER_KEY = 'dns_records_column_order_v1';
 const HIDDEN_COLUMNS_KEY = 'dns_records_hidden_columns_v1';
 
@@ -35,6 +42,7 @@ const props = defineProps<{
   capabilities?: RecordsResponseCapabilities;
   showAccelerationToggle?: boolean;
   accelerationToggleLabel?: string;
+  resolveAccelerationState?: (record: DNSRecord) => RecordAccelerationState | null | undefined;
 }>();
 
 const emit = defineEmits<{
@@ -169,7 +177,7 @@ function startEdit(record: DNSRecord) {
     weight: record.weight,
     line: record.line,
     remark: record.remark,
-    enableAcceleration: false,
+    enableAcceleration: Boolean(getAccelerationState(record)?.matched),
   };
   if (isMobile.value) mobileEditVisible.value = true;
 }
@@ -270,6 +278,45 @@ const orderedVisibleColumnKeys = computed(() => {
   const available = new Set(availableColumns.value.map((x) => x.key));
   return columnOrder.value.filter((key) => available.has(key) && !hiddenColumns.value.includes(key));
 });
+
+function getAccelerationState(record: DNSRecord) {
+  return props.resolveAccelerationState?.(record) || null;
+}
+
+function renderAccelerationTag(record: DNSRecord) {
+  const state = getAccelerationState(record);
+  if (!state) {
+    return h(NTag, {
+      size: 'small',
+      bordered: false,
+      type: 'default',
+    }, () => '未接入');
+  }
+  return h(
+    NTag,
+    {
+      size: 'small',
+      bordered: false,
+      type: state.type,
+    },
+    () => state.label,
+  );
+}
+
+function getAccelerationActionLabel(record: DNSRecord) {
+  const state = getAccelerationState(record);
+  if (state?.matched) return '已接入';
+  return '编辑时可选';
+}
+
+function getAccelerationActionHint(record: DNSRecord) {
+  const state = getAccelerationState(record);
+  return state?.detail || '保存记录后自动创建或接管当前域名的加速配置';
+}
+
+function isEditingAccelerationEnabled(record: DNSRecord) {
+  return Boolean(getAccelerationState(record)?.matched || editForm.value.enableAcceleration);
+}
 
 const columns = computed(() => {
   const defs: Record<ColumnKey, any> = {
@@ -415,19 +462,26 @@ const columns = computed(() => {
     acceleration: {
       title: '加速',
       key: 'acceleration',
-      width: 120,
+      width: 140,
       render(row: DNSRecord) {
         if (!props.showAccelerationToggle) {
           return h('span', { class: 'text-sm text-slate-400' }, '-');
         }
         if (editingId.value === row.id) {
-          return h(NSwitch, {
-            value: !!editForm.value.enableAcceleration,
-            'onUpdate:value': (v: boolean) => (editForm.value.enableAcceleration = v),
-            size: 'small',
-          });
+          return h('div', { class: 'flex flex-col items-start gap-1' }, [
+            h(NSwitch, {
+              value: isEditingAccelerationEnabled(row),
+              'onUpdate:value': (v: boolean) => (editForm.value.enableAcceleration = v),
+              size: 'small',
+            }),
+            h('span', { class: 'text-[11px] text-slate-400' }, getAccelerationActionHint(row)),
+          ]);
         }
-        return h('span', { class: 'text-xs text-slate-400' }, '编辑时可选');
+        const state = getAccelerationState(row);
+        return h('div', { class: 'flex flex-col items-start gap-1' }, [
+          renderAccelerationTag(row),
+          h('span', { class: 'text-[11px] text-slate-400' }, state?.detail || getAccelerationActionLabel(row)),
+        ]);
       },
     },
     actions: {
@@ -532,34 +586,41 @@ const columns = computed(() => {
         :key="record.id"
         class="rounded-lg border border-panel-border bg-panel-surface p-3"
       >
-        <div class="mb-2 flex items-center gap-4">
+        <div class="mb-3 flex items-start justify-between gap-3">
+          <div class="min-w-0 flex-1">
+            <div class="mb-2 flex flex-wrap items-center gap-2">
+              <NTag
+                size="small"
+                :bordered="true"
+                type="default"
+                class="record-type-tag"
+                :style="{
+                  '--tag-bg': `${typeColor[record.type] || '#64748B'}18`,
+                  '--tag-color': typeColor[record.type] || '#64748B',
+                  '--tag-border': `${typeColor[record.type] || '#64748B'}35`,
+                  backgroundColor: 'var(--tag-bg)',
+                  color: 'var(--tag-color)',
+                  borderColor: 'var(--tag-border)',
+                }"
+              >
+                {{ record.type }}
+              </NTag>
+              <NTag v-if="caps.supportsStatus" size="small" :type="record.enabled !== false ? 'success' : 'default'" :bordered="false">
+                {{ record.enabled !== false ? '启用' : '禁用' }}
+              </NTag>
+              <component :is="renderAccelerationTag(record)" v-if="showAccelerationToggle" />
+            </div>
+            <div class="truncate font-mono text-sm font-semibold text-slate-800">{{ record.name }}</div>
+            <div class="mt-1 break-all font-mono text-xs text-slate-500">{{ record.content }}</div>
+            <p v-if="showAccelerationToggle" class="mt-2 text-[11px] text-slate-400">
+              {{ getAccelerationActionHint(record) }}
+            </p>
+          </div>
           <NCheckbox
             :checked="checkedRowKeys.includes(record.id)"
             @update:checked="(checked: boolean) => toggleMobileChecked(record.id, checked)"
           />
-          <NTag
-            size="small"
-            :bordered="true"
-            type="default"
-            class="record-type-tag"
-            :style="{
-              '--tag-bg': `${typeColor[record.type] || '#64748B'}18`,
-              '--tag-color': typeColor[record.type] || '#64748B',
-              '--tag-border': `${typeColor[record.type] || '#64748B'}35`,
-              backgroundColor: 'var(--tag-bg)',
-              color: 'var(--tag-color)',
-              borderColor: 'var(--tag-border)',
-            }"
-          >
-            {{ record.type }}
-          </NTag>
-          <span class="min-w-0 flex-1 truncate text-sm font-mono text-slate-700">{{ record.name }}</span>
-          <NTag v-if="caps.supportsStatus" size="small" :type="record.enabled !== false ? 'success' : 'default'" :bordered="false">
-            {{ record.enabled !== false ? '启用' : '禁用' }}
-          </NTag>
         </div>
-
-        <p class="mb-2 truncate text-sm font-mono text-slate-500">{{ record.content }}</p>
         <div class="mb-2 flex items-center justify-between text-xs text-slate-500">
           <span>TTL: {{ formatTTL(record.ttl) }}</span>
           <span v-if="caps.supportsLine">{{ record.lineName || record.line || '-' }}</span>

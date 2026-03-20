@@ -3018,7 +3018,8 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
         plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(int(row["pluginCredentialId"]))
         zone_name = str(row["zoneName"] or "")
         remote_site_id = str(row["remoteSiteId"] or "")
-        state = plugin.verify_site(zone_name, remote_site_id) if verify else plugin.get_site(zone_name, remote_site_id)
+        row_config = _accel_config_from_source(_serialize_row(row) or {})
+        state = plugin.verify_site(zone_name, remote_site_id, row_config) if verify else plugin.get_site(zone_name, remote_site_id, row_config)
         return _upsert_accel_row(
             int(row["dnsCredentialId"]),
             zone_name,
@@ -3251,7 +3252,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                     try:
                         import time as _time
                         _time.sleep(2)
-                        state = plugin.verify_site(zone_name, state.get("remoteSiteId"))
+                        state = plugin.verify_site(zone_name, state.get("remoteSiteId"), accel_config or None)
                     except Exception:
                         pass
 
@@ -3332,7 +3333,10 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
 
             old_row = _get_accel_row(dns_credential_id, zone_name)
             plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-            state = plugin.get_site(zone_name, remote_site_id) if remote_site_id else plugin.discover_site(zone_name)
+            accel_config = _accel_config_from_source(body)
+            if not accel_config and old_row:
+                accel_config = _accel_config_from_source(_serialize_row(old_row) or {})
+            state = plugin.get_site(zone_name, remote_site_id, accel_config or None) if remote_site_id else plugin.discover_site(zone_name)
             if not state:
                 self._err("未找到可导入的远端站点", 404)
                 return
@@ -3346,7 +3350,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                     try:
                         import time as _time
                         _time.sleep(2)
-                        state = plugin.verify_site(zone_name, state.get("remoteSiteId"))
+                        state = plugin.verify_site(zone_name, state.get("remoteSiteId"), accel_config or None)
                     except Exception:
                         pass
 
@@ -3394,13 +3398,14 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                 return
 
             plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-            state = plugin.get_site(zone_name, remote_site_id)
+            row_config = _accel_config_from_source(_serialize_row(row) or {}) if row else _accel_config_from_source(body)
+            state = plugin.get_site(zone_name, remote_site_id, row_config)
             dns_records_added, dns_records_skipped, dns_errors = _auto_create_verify_record(dns_credential_id, zone_name, zone_id, state)
             if verify_after and (dns_records_added or dns_records_skipped) and not dns_errors:
                 try:
                     import time as _time
                     _time.sleep(2)
-                    state = plugin.verify_site(zone_name, state.get("remoteSiteId"))
+                    state = plugin.verify_site(zone_name, state.get("remoteSiteId"), row_config)
                 except Exception:
                     pass
 
@@ -3531,16 +3536,20 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             enabled = self._parse_bool(enabled_raw) if enabled_raw is not None else False
 
             row = _get_accel_row(dns_credential_id, zone_name) if dns_credential_id and zone_name else None
+            row_config: Dict[str, Any] = {}
             if row:
                 plugin_credential_id = int(row["pluginCredentialId"])
                 remote_site_id = remote_site_id or str(row["remoteSiteId"] or "")
                 zone_name = zone_name or str(row["zoneName"] or "")
+                row_config = _accel_config_from_source(_serialize_row(row) or {})
+            else:
+                row_config = _accel_config_from_source(body)
             if not zone_name or not plugin_credential_id:
                 self._err("缺少参数: zoneName, pluginCredentialId", 400)
                 return
 
             plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-            state = plugin.set_site_status(zone_name, remote_site_id, enabled)
+            state = plugin.set_site_status(zone_name, remote_site_id, enabled, row_config or None)
             if row:
                 previous = _serialize_row(row)
                 row = _upsert_accel_row(
@@ -3569,16 +3578,20 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             delete_local = True if delete_local_raw is True else self._parse_bool(delete_local_raw)
 
             row = _get_accel_row(dns_credential_id, zone_name) if dns_credential_id and zone_name else None
+            row_config: Dict[str, Any] = {}
             if row:
                 plugin_credential_id = int(row["pluginCredentialId"])
                 remote_site_id = remote_site_id or str(row["remoteSiteId"] or "")
                 zone_name = zone_name or str(row["zoneName"] or "")
+                row_config = _accel_config_from_source(_serialize_row(row) or {})
+            else:
+                row_config = _accel_config_from_source(body)
             if not zone_name or not plugin_credential_id:
                 self._err("缺少参数: zoneName, pluginCredentialId", 400)
                 return
 
             _plugin_cred_row, _plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-            plugin.delete_site(zone_name, remote_site_id)
+            plugin.delete_site(zone_name, remote_site_id, row_config or None)
 
             local_deleted = False
             if row and delete_local:
