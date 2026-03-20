@@ -7,14 +7,17 @@ import { RefreshCw, Plus, Globe, ShieldCheck } from 'lucide-vue-next';
 import {
   listAccelerationConfigs,
   listRemoteAccelerationSites,
+  enableAcceleration,
   importRemoteAcceleration,
   createAccelerationVerifyRecord,
   syncAcceleration,
   verifyAcceleration,
+  updateAccelerationConfig,
   disableAcceleration,
   setAccelerationSiteStatus,
   deleteRemoteAcceleration,
   syncAllAccelerations,
+  type AccelerationConfigInput,
   type DomainAccelerationConfig,
   type DiscoveredAccelerationSite,
 } from '@/services/accelerations';
@@ -24,6 +27,7 @@ import { getProviderDisplayName } from '@/utils/provider';
 import type { DnsCredential } from '@/types/dns';
 import type { Domain } from '@/types';
 import AddAccelerationCredentialDialog from '@/components/Dashboard/AddAccelerationCredentialDialog.vue';
+import AccelerationSiteDialog from '@/components/Acceleration/AccelerationSiteDialog.vue';
 
 type RowStatus = 'verified' | 'pending' | 'paused' | 'error';
 type LocalStatusFilter = 'all' | RowStatus;
@@ -52,11 +56,26 @@ type RemoteAccelerationRow = {
   searchText: string;
 };
 
+type AccelerationSiteDialogPayload = AccelerationConfigInput & {
+  zoneName: string;
+  dnsCredentialId: number;
+  pluginCredentialId: number;
+};
+
 const router = useRouter();
 const queryClient = useQueryClient();
 const message = useMessage();
 
 const showAddAccelerationCredential = ref(false);
+const showAccelerationSiteDialog = ref(false);
+const accelerationDialogMode = ref<'create' | 'edit'>('create');
+const accelerationDialogValue = ref<(Partial<DomainAccelerationConfig> & {
+  zoneName?: string;
+  dnsCredentialId?: number | null;
+  pluginCredentialId?: number | null;
+}) | null>(null);
+const accelerationDialogLockDomain = ref(false);
+const accelerationDialogLockPluginCredential = ref(false);
 const remoteImportTargets = ref<Record<string, number | null>>({});
 const localKeyword = ref('');
 const localStatusFilter = ref<LocalStatusFilter>('all');
@@ -164,6 +183,14 @@ const accelerationCredentialOptions = computed(() =>
     value: credential.id,
   })),
 );
+
+const availableCreateDomains = computed(() => {
+  const managedKeys = new Set(localRows.value.map((row) => getLocalKey(row)));
+  return dnsDomains.value.filter((domain) => {
+    const key = `${Number(domain.credentialId || 0)}::${normalizeText(domain.name)}`;
+    return Number(domain.credentialId || 0) > 0 && !managedKeys.has(key);
+  });
+});
 
 function refreshAccelerationViews() {
   queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
@@ -385,6 +412,36 @@ const importRemoteMutation = useMutation({
   onError: (err: any) => message.error(getErrorMessage(err)),
 });
 
+const saveAccelerationMutation = useMutation({
+  mutationFn: async (payload: AccelerationSiteDialogPayload) => {
+    if (accelerationDialogMode.value === 'edit') {
+      return updateAccelerationConfig(payload);
+    }
+    return enableAcceleration({
+      ...payload,
+      autoDnsRecord: true,
+    });
+  },
+  onSuccess: async (res) => {
+    if (accelerationDialogMode.value === 'edit') {
+      message.success('加速配置已更新');
+    } else {
+      const added = res.data?.dnsRecordsAdded?.length || 0;
+      const skipped = res.data?.dnsRecordsSkipped?.length || 0;
+      const failed = res.data?.dnsErrors?.length || 0;
+      let text = '加速域名已创建';
+      if (added) text += `，新增 ${added} 条验证记录`;
+      if (skipped) text += `，${skipped} 条验证记录已存在`;
+      if (failed) text += `，${failed} 条验证记录写入失败`;
+      message.success(text);
+    }
+    showAccelerationSiteDialog.value = false;
+    accelerationDialogValue.value = null;
+    await refreshCurrentPageData();
+  },
+  onError: (err: any) => message.error(getErrorMessage(err)),
+});
+
 async function runBatch<T>(options: {
   items: T[];
   emptyMessage: string;
@@ -559,6 +616,55 @@ function setRemoteOwnershipFilter(value: string | null) {
 
 function setRemotePluginCredentialFilter(value: string | number | null) {
   remotePluginCredentialFilter.value = value == null ? null : Number(value);
+}
+
+function openCreateAccelerationDialog() {
+  accelerationDialogMode.value = 'create';
+  accelerationDialogLockDomain.value = false;
+  accelerationDialogLockPluginCredential.value = false;
+  const firstDomain = availableCreateDomains.value[0] || dnsDomains.value[0] || null;
+  accelerationDialogValue.value = {
+    zoneName: firstDomain?.name || '',
+    dnsCredentialId: Number(firstDomain?.credentialId || 0) || null,
+    pluginCredentialId: accelerationCredentials.value[0]?.id || null,
+    subDomain: '@',
+    originType: 'IP_DOMAIN',
+    originProtocol: 'FOLLOW',
+    httpOriginPort: 80,
+    httpsOriginPort: 443,
+    ipv6Status: 'follow',
+  };
+  showAccelerationSiteDialog.value = true;
+}
+
+function openEditAccelerationDialog(config: LocalAccelerationRow) {
+  accelerationDialogMode.value = 'edit';
+  accelerationDialogLockDomain.value = true;
+  accelerationDialogLockPluginCredential.value = true;
+  accelerationDialogValue.value = { ...config };
+  showAccelerationSiteDialog.value = true;
+}
+
+function openRemoteConfigDialog(row: RemoteAccelerationRow) {
+  accelerationDialogMode.value = 'create';
+  accelerationDialogLockDomain.value = false;
+  accelerationDialogLockPluginCredential.value = false;
+  accelerationDialogValue.value = {
+    zoneName: row.zoneName,
+    dnsCredentialId: row.selectedDnsCredentialId,
+    pluginCredentialId: row.item.pluginCredentialId,
+    accelerationDomain: row.item.site.accelerationDomain,
+    subDomain: row.item.site.subDomain || '@',
+    originType: row.item.site.originType || 'IP_DOMAIN',
+    originValue: row.item.site.originValue || '',
+    backupOriginValue: row.item.site.backupOriginValue || '',
+    hostHeader: row.item.site.hostHeader || '',
+    originProtocol: row.item.site.originProtocol || 'FOLLOW',
+    httpOriginPort: row.item.site.httpOriginPort || 80,
+    httpsOriginPort: row.item.site.httpsOriginPort || 443,
+    ipv6Status: row.item.site.ipv6Status || 'follow',
+  };
+  showAccelerationSiteDialog.value = true;
 }
 
 function goToDomain(config: { zoneName: string; dnsCredentialId?: number | null }) {
@@ -747,6 +853,15 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
           <p class="page-subtitle">集中查看 EdgeOne 已接管列表、远端已有站点、验证接入状态、异常信息以及批量运维动作</p>
         </div>
         <div class="flex flex-wrap gap-2">
+          <NButton
+            size="small"
+            type="primary"
+            :disabled="!accelerationCredentials.length || !availableCreateDomains.length"
+            @click="openCreateAccelerationDialog"
+          >
+            <template #icon><Plus :size="14" /></template>
+            新增加速域名
+          </NButton>
           <NButton size="small" secondary @click="refreshCurrentPageData">
             <template #icon><RefreshCw :size="14" /></template>
             刷新列表
@@ -951,6 +1066,9 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
             <NButton size="small" secondary @click="goToDomain({ zoneName: config.zoneName, dnsCredentialId: config.dnsCredentialId })">
               <template #icon><Globe :size="14" /></template>
               打开域名
+            </NButton>
+            <NButton size="small" secondary @click="openEditAccelerationDialog(config)">
+              编辑配置
             </NButton>
             <NButton size="small" secondary :loading="syncConfigMutation.isPending.value" @click="syncConfigMutation.mutate(config)">
               刷新状态
@@ -1160,6 +1278,15 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
               接管站点
             </NButton>
             <NButton
+              v-if="!row.localConfig"
+              size="small"
+              secondary
+              :disabled="!row.selectedDnsCredentialId"
+              @click="openRemoteConfigDialog(row)"
+            >
+              按配置接管
+            </NButton>
+            <NButton
               size="small"
               secondary
               :loading="setSiteStatusMutation.isPending.value"
@@ -1184,6 +1311,18 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
     <AddAccelerationCredentialDialog
       v-model:show="showAddAccelerationCredential"
       @created="refreshCurrentPageData"
+    />
+    <AccelerationSiteDialog
+      :show="showAccelerationSiteDialog"
+      :loading="saveAccelerationMutation.isPending.value"
+      :mode="accelerationDialogMode"
+      :domains="accelerationDialogMode === 'edit' ? dnsDomains.filter((domain) => Number(domain.credentialId || 0) === Number(accelerationDialogValue?.dnsCredentialId || 0) && normalizeText(domain.name) === normalizeText(accelerationDialogValue?.zoneName)) : availableCreateDomains"
+      :acceleration-credentials="accelerationCredentials"
+      :value="accelerationDialogValue"
+      :lock-domain="accelerationDialogLockDomain"
+      :lock-plugin-credential="accelerationDialogLockPluginCredential"
+      @update:show="showAccelerationSiteDialog = $event"
+      @submit="saveAccelerationMutation.mutate"
     />
   </div>
 </template>

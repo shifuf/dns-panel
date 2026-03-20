@@ -314,10 +314,13 @@ const accelerationStatusDisplay = computed(() => {
 });
 
 const canEnableAccelerationWhenAddingRecord = computed(() =>
-  !accelerationConfig.value && accelerationCredentials.value.length > 0 && typeof credentialId.value === 'number' && !!zoneName.value,
+  accelerationCredentials.value.length > 0 && typeof credentialId.value === 'number' && !!zoneName.value,
 );
 
 const addRecordAccelerationLabel = computed(() => {
+  if (accelerationConfig.value) {
+    return '保存后同步当前记录到加速配置';
+  }
   const selected = accelerationCredentials.value.find((item) => item.id === selectedAccelerationCredentialId.value);
   return selected ? `创建后自动接入加速（${selected.name}）` : '创建后自动接入加速';
 });
@@ -544,22 +547,28 @@ const createMutation = useMutation({
   mutationFn: async (params: Parameters<typeof createDNSRecord>[1] & { enableAcceleration?: boolean }) => {
     const { enableAcceleration: enableAfterCreate, ...recordParams } = params;
     const recordResult = await createDNSRecord(zoneId.value, recordParams, credentialId.value);
-    let accelerationResult: Awaited<ReturnType<typeof enableAcceleration>> | null = null;
+    let accelerationResult: Awaited<ReturnType<typeof enableAcceleration | typeof updateAccelerationConfig>> | null = null;
     if (
       enableAfterCreate
-      && canEnableAccelerationWhenAddingRecord.value
       && typeof credentialId.value === 'number'
-      && selectedAccelerationCredentialId.value
       && zoneName.value
     ) {
-      accelerationResult = await enableAcceleration({
+      const payload = {
         zoneName: zoneName.value,
-        zoneId: zoneId.value,
         dnsCredentialId: credentialId.value,
-        pluginCredentialId: selectedAccelerationCredentialId.value,
-        autoDnsRecord: true,
+        pluginCredentialId: accelerationConfig.value?.pluginCredentialId || selectedAccelerationCredentialId.value || undefined,
         ...buildAccelerationConfigFromRecord(recordParams),
-      });
+      };
+      if (accelerationConfig.value?.pluginCredentialId) {
+        accelerationResult = await updateAccelerationConfig(payload);
+      } else if (selectedAccelerationCredentialId.value) {
+        accelerationResult = await enableAcceleration({
+          ...payload,
+          zoneId: zoneId.value,
+          pluginCredentialId: selectedAccelerationCredentialId.value,
+          autoDnsRecord: true,
+        });
+      }
     }
     return { recordResult, accelerationResult };
   },
@@ -589,22 +598,28 @@ const updateMutation = useMutation({
   mutationFn: async (vars: { recordId: string; params: Parameters<typeof updateDNSRecord>[2] & { enableAcceleration?: boolean } }) => {
     const { enableAcceleration: enableAfterUpdate, ...recordParams } = vars.params;
     const recordResult = await updateDNSRecord(zoneId.value, vars.recordId, recordParams, credentialId.value);
-    let accelerationResult: Awaited<ReturnType<typeof enableAcceleration>> | null = null;
+    let accelerationResult: Awaited<ReturnType<typeof enableAcceleration | typeof updateAccelerationConfig>> | null = null;
     if (
       enableAfterUpdate
-      && canEnableAccelerationWhenAddingRecord.value
       && typeof credentialId.value === 'number'
-      && selectedAccelerationCredentialId.value
       && zoneName.value
     ) {
-      accelerationResult = await enableAcceleration({
+      const payload = {
         zoneName: zoneName.value,
-        zoneId: zoneId.value,
         dnsCredentialId: credentialId.value,
-        pluginCredentialId: selectedAccelerationCredentialId.value,
-        autoDnsRecord: true,
+        pluginCredentialId: accelerationConfig.value?.pluginCredentialId || selectedAccelerationCredentialId.value || undefined,
         ...buildAccelerationConfigFromRecord(recordParams),
-      });
+      };
+      if (accelerationConfig.value?.pluginCredentialId) {
+        accelerationResult = await updateAccelerationConfig(payload);
+      } else if (selectedAccelerationCredentialId.value) {
+        accelerationResult = await enableAcceleration({
+          ...payload,
+          zoneId: zoneId.value,
+          pluginCredentialId: selectedAccelerationCredentialId.value,
+          autoDnsRecord: true,
+        });
+      }
     }
     return { recordResult, accelerationResult };
   },
