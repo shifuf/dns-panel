@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 class TencentEdgeOneApiError(Exception):
@@ -19,14 +19,21 @@ class TencentEdgeOneApiError(Exception):
 
 
 class TencentEdgeOneApi:
-    HOST = "teo.intl.tencentcloudapi.com"
+    HOST = "teo.tencentcloudapi.com"
     SERVICE = "teo"
     DEFAULT_VERSION = "2022-09-01"
 
-    def __init__(self, secret_id: str, secret_key: str, plan_id: str | None = None) -> None:
+    def __init__(
+        self,
+        secret_id: str,
+        secret_key: str,
+        plan_id: str | None = None,
+        endpoint: str | None = None,
+    ) -> None:
         self._secret_id = str(secret_id or "").strip()
         self._secret_key = str(secret_key or "").strip()
         self._plan_id = str(plan_id or "").strip()
+        self._host = str(endpoint or self.HOST).strip() or self.HOST
         if not self._secret_id or not self._secret_key:
             raise TencentEdgeOneApiError("缺少腾讯云 SecretId / SecretKey")
 
@@ -45,6 +52,10 @@ class TencentEdgeOneApi:
             value = value[2:]
         return value
 
+    @staticmethod
+    def normalize_domain_name(domain_name: str) -> str:
+        return TencentEdgeOneApi.normalize_zone_name(domain_name)
+
     def _tc3_request(self, action: str, payload: Dict[str, Any], version: str | None = None) -> Dict[str, Any]:
         payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         timestamp = int(time.time())
@@ -54,7 +65,7 @@ class TencentEdgeOneApi:
         canonical = (
             "POST\n/\n\n"
             f"content-type:{content_type}\n"
-            f"host:{self.HOST}\n\n"
+            f"host:{self._host}\n\n"
             "content-type;host\n"
             f"{hashed_payload}"
         )
@@ -80,7 +91,7 @@ class TencentEdgeOneApi:
         )
 
         headers = {
-            "Host": self.HOST,
+            "Host": self._host,
             "Content-Type": content_type,
             "Authorization": authorization,
             "X-TC-Action": action,
@@ -90,7 +101,7 @@ class TencentEdgeOneApi:
         }
 
         req = urllib.request.Request(
-            f"https://{self.HOST}/",
+            f"https://{self._host}/",
             method="POST",
             data=payload_json.encode("utf-8"),
             headers=headers,
@@ -223,14 +234,117 @@ class TencentEdgeOneApi:
             raise TencentEdgeOneApiError("未找到 EdgeOne 站点", 404)
         return matched
 
+    def list_acceleration_domains(self, zone_id: str, domain_name: str | None = None) -> Dict[str, Any]:
+        zid = str(zone_id or "").strip()
+        if not zid:
+            raise TencentEdgeOneApiError("缺少站点 ID", 400)
+        payload: Dict[str, Any] = {"ZoneId": zid}
+        if domain_name:
+            payload["Filters"] = [{
+                "Name": "domain-name",
+                "Values": [self.normalize_domain_name(domain_name)],
+            }]
+        resp = self._tc3_request("DescribeAccelerationDomains", payload)
+        raw_items = resp.get("AccelerationDomains") or resp.get("AccelerationDomainInfos") or []
+        items = [self._normalize_acceleration_domain(item) for item in raw_items if isinstance(item, dict)]
+        return {
+            "items": items,
+            "requestId": resp.get("RequestId"),
+        }
+
+    def get_acceleration_domain(self, zone_id: str, domain_name: str) -> Dict[str, Any] | None:
+        target = self.normalize_domain_name(domain_name)
+        if not target:
+            return None
+        items = self.list_acceleration_domains(zone_id, target).get("items") or []
+        for item in items:
+            if self.normalize_domain_name(item.get("domainName")) == target:
+                return item
+        return None
+
+    def create_acceleration_domain(self, zone_id: str, domain_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        zid = str(zone_id or "").strip()
+        target_domain = self.normalize_domain_name(domain_name)
+        if not zid or not target_domain:
+            raise TencentEdgeOneApiError("缺少站点 ID 或加速域名", 400)
+        payload: Dict[str, Any] = {
+            "ZoneId": zid,
+            "DomainName": target_domain,
+            "OriginInfo": self._build_origin_info(config),
+        }
+        ipv6_status = self._normalize_ipv6_status(config.get("ipv6Status"))
+        if ipv6_status:
+            payload["Ipv6Status"] = ipv6_status
+        resp = self._tc3_request("CreateAccelerationDomain", payload)
+        verification = self._normalize_verification(resp)
+        current = self.get_acceleration_domain(zid, target_domain) or {
+            "domainName": target_domain,
+            "raw": {},
+        }
+        current["verifyRecordName"] = str(verification.get("recordName") or current.get("verifyRecordName") or "")
+        current["verifyRecordType"] = str(verification.get("recordType") or current.get("verifyRecordType") or "TXT")
+        current["verifyRecordValue"] = str(verification.get("recordValue") or current.get("verifyRecordValue") or "")
+        return current
+
+    def modify_acceleration_domain(self, zone_id: str, domain_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        zid = str(zone_id or "").strip()
+        target_domain = self.normalize_domain_name(domain_name)
+        if not zid or not target_domain:
+            raise TencentEdgeOneApiError("缺少站点 ID 或加速域名", 400)
+        payload: Dict[str, Any] = {
+            "ZoneId": zid,
+            "DomainName": target_domain,
+            "OriginInfo": self._build_origin_info(config),
+        }
+        ipv6_status = self._normalize_ipv6_status(config.get("ipv6Status"))
+        if ipv6_status:
+            payload["Ipv6Status"] = ipv6_status
+        self._tc3_request("ModifyAccelerationDomain", payload)
+        return self.get_acceleration_domain(zid, target_domain) or {
+            "domainName": target_domain,
+            "raw": {},
+        }
+
+    def upsert_acceleration_domain(self, zone_id: str, domain_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        existing = self.get_acceleration_domain(zone_id, domain_name)
+        if existing:
+            return self.modify_acceleration_domain(zone_id, domain_name, config)
+        return self.create_acceleration_domain(zone_id, domain_name, config)
+
+    def modify_acceleration_domain_statuses(self, zone_id: str, domain_names: List[str], enabled: bool) -> Dict[str, Any]:
+        zid = str(zone_id or "").strip()
+        normalized = [self.normalize_domain_name(item) for item in domain_names if self.normalize_domain_name(item)]
+        if not zid or not normalized:
+            raise TencentEdgeOneApiError("缺少站点 ID 或加速域名", 400)
+        self._tc3_request(
+            "ModifyAccelerationDomainStatuses",
+            {
+                "ZoneId": zid,
+                "DomainNames": normalized,
+                "Status": "online" if enabled else "offline",
+            },
+        )
+        return {"zoneId": zid, "domainNames": normalized, "enabled": bool(enabled)}
+
+    def delete_acceleration_domains(self, zone_id: str, domain_names: List[str]) -> Dict[str, Any]:
+        zid = str(zone_id or "").strip()
+        normalized = [self.normalize_domain_name(item) for item in domain_names if self.normalize_domain_name(item)]
+        if not zid or not normalized:
+            raise TencentEdgeOneApiError("缺少站点 ID 或加速域名", 400)
+        resp = self._tc3_request(
+            "DeleteAccelerationDomains",
+            {
+                "ZoneId": zid,
+                "DomainNames": normalized,
+            },
+        )
+        return {"zoneId": zid, "domainNames": normalized, "requestId": resp.get("RequestId")}
+
     def modify_zone_status(self, zone_id: str, enabled: bool) -> Dict[str, Any]:
         zid = str(zone_id or "").strip()
         if not zid:
             raise TencentEdgeOneApiError("缺少站点 ID", 400)
-        self._tc3_request(
-            "ModifyZoneStatus",
-            {"ZoneId": zid, "Paused": False if enabled else True},
-        )
+        self._tc3_request("ModifyZoneStatus", {"ZoneId": zid, "Paused": False if enabled else True})
         return {"siteId": zid, "enabled": bool(enabled)}
 
     def delete_zone(self, zone_id: str) -> Dict[str, Any]:
@@ -242,7 +356,7 @@ class TencentEdgeOneApi:
 
     @staticmethod
     def _normalize_verification(raw: Dict[str, Any]) -> Dict[str, Any]:
-        verification = raw.get("OwnershipVerification")
+        verification = raw.get("OwnershipVerification") or raw.get("Identification")
         if isinstance(verification, list) and verification:
             first = verification[0] if isinstance(verification[0], dict) else {}
             return {
@@ -269,16 +383,6 @@ class TencentEdgeOneApi:
                     "recordValue": record_value,
                     "raw": verification,
                 }
-
-        ascription = raw.get("Ascription")
-        if isinstance(ascription, dict):
-            return {
-                "recordType": str(ascription.get("RecordType") or ascription.get("Type") or "TXT"),
-                "recordName": str(ascription.get("RecordName") or ascription.get("Name") or ""),
-                "recordValue": str(ascription.get("RecordValue") or ascription.get("Value") or ""),
-                "raw": ascription,
-            }
-
         return {"recordType": "TXT", "recordName": "", "recordValue": ""}
 
     @staticmethod
@@ -297,19 +401,98 @@ class TencentEdgeOneApi:
         else:
             paused = bool(paused_raw)
         if paused_raw is None:
-            paused = (status or "").strip().lower() in {"offline", "paused", "disabled", "suspended"}
+            paused = status.strip().lower() in {"offline", "paused", "disabled", "suspended"}
         verify_status_lower = (cname_status or status or "").strip().lower()
         return {
             "siteId": str(raw.get("ZoneId") or raw.get("Id") or ""),
             "zoneName": str(raw.get("ZoneName") or raw.get("Name") or ""),
             "status": status or "unknown",
             "verifyStatus": cname_status or status or "unknown",
-            "verified": (status or "").lower() in {"active", "online", "enabled", "success", "verified"}
+            "verified": status.lower() in {"active", "online", "enabled", "success", "verified"}
             or verify_status_lower in {"finished", "active", "verified", "success", "completed"},
             "paused": paused,
             "type": str(raw.get("Type") or raw.get("AccessType") or ""),
             "area": str(raw.get("Area") or raw.get("Region") or ""),
             "planId": str(raw.get("PlanId") or ""),
+            "createdAt": raw.get("CreatedOn") or raw.get("CreateTime"),
+            "updatedAt": raw.get("ModifiedOn") or raw.get("UpdateTime"),
+            "raw": raw,
+        }
+
+    @staticmethod
+    def _normalize_ipv6_status(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        mapping = {
+            "on": "follow",
+            "enable": "follow",
+            "enabled": "follow",
+            "follow": "follow",
+            "off": "close",
+            "disable": "close",
+            "disabled": "close",
+            "close": "close",
+        }
+        return mapping.get(text, "")
+
+    @staticmethod
+    def _build_origin_info(config: Dict[str, Any]) -> Dict[str, Any]:
+        origin_type = str(config.get("originType") or "IP_DOMAIN").strip().upper() or "IP_DOMAIN"
+        origin_value = str(config.get("originValue") or "").strip()
+        if not origin_value:
+            raise TencentEdgeOneApiError("缺少源站地址", 400)
+        info: Dict[str, Any] = {
+            "OriginType": origin_type,
+            "Origin": origin_value,
+        }
+        backup_origin = str(config.get("backupOriginValue") or "").strip()
+        if backup_origin:
+            info["BackupOrigin"] = backup_origin
+        host_header = str(config.get("hostHeader") or "").strip()
+        if host_header:
+            info["HostHeader"] = host_header
+        try:
+            http_port = int(config.get("httpOriginPort") or config.get("originPort") or 80)
+        except Exception:
+            http_port = 80
+        try:
+            https_port = int(config.get("httpsOriginPort") or config.get("originPort") or 443)
+        except Exception:
+            https_port = 443
+        info["HttpOriginPort"] = http_port
+        info["HttpsOriginPort"] = https_port
+        origin_protocol = str(config.get("originProtocol") or "FOLLOW").strip().upper()
+        if origin_protocol:
+            info["OriginProtocol"] = origin_protocol
+        return info
+
+    @staticmethod
+    def _normalize_acceleration_domain(raw: Dict[str, Any]) -> Dict[str, Any]:
+        origin_detail = raw.get("OriginDetail") if isinstance(raw.get("OriginDetail"), dict) else {}
+        domain_status = str(raw.get("DomainStatus") or raw.get("Status") or "unknown")
+        identification_status = str(raw.get("IdentificationStatus") or raw.get("VerifyStatus") or "")
+        verify_lower = identification_status.strip().lower()
+        status_lower = domain_status.strip().lower()
+        return {
+            "domainName": str(raw.get("DomainName") or raw.get("Name") or ""),
+            "domainStatus": domain_status or "unknown",
+            "siteId": str(raw.get("ZoneId") or ""),
+            "identificationStatus": identification_status or domain_status or "unknown",
+            "verified": verify_lower in {"finished", "verified", "success", "completed"}
+            or status_lower in {"online", "active"},
+            "paused": status_lower in {"offline", "paused", "disabled"},
+            "cnameTarget": str(raw.get("Cname") or raw.get("CNAME") or ""),
+            "cnameStatus": str(raw.get("CnameStatus") or identification_status or domain_status or "unknown"),
+            "originType": str(origin_detail.get("OriginType") or ""),
+            "originValue": str(origin_detail.get("Origin") or ""),
+            "backupOriginValue": str(origin_detail.get("BackupOrigin") or ""),
+            "hostHeader": str(origin_detail.get("HostHeader") or ""),
+            "originProtocol": str(origin_detail.get("OriginProtocol") or raw.get("OriginProtocol") or "FOLLOW"),
+            "httpOriginPort": int(origin_detail.get("HttpOriginPort") or raw.get("HttpOriginPort") or 80),
+            "httpsOriginPort": int(origin_detail.get("HttpsOriginPort") or raw.get("HttpsOriginPort") or 443),
+            "ipv6Status": str(raw.get("Ipv6Status") or raw.get("IPv6Status") or "follow"),
+            "verifyRecordName": "",
+            "verifyRecordType": "",
+            "verifyRecordValue": "",
             "createdAt": raw.get("CreatedOn") or raw.get("CreateTime"),
             "updatedAt": raw.get("ModifiedOn") or raw.get("UpdateTime"),
             "raw": raw,

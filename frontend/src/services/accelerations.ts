@@ -8,13 +8,27 @@ export interface DomainAccelerationConfig {
   pluginProvider: string;
   pluginCredentialId: number;
   remoteSiteId: string;
+  accelerationDomain?: string;
+  subDomain?: string;
   siteStatus: string;
+  domainStatus?: string;
   verifyStatus: string;
+  identificationStatus?: string;
   verified: boolean;
   paused: boolean;
   accessType: string;
   area: string;
   planId?: string;
+  cnameTarget?: string;
+  cnameStatus?: string;
+  originType?: string;
+  originValue?: string;
+  backupOriginValue?: string;
+  hostHeader?: string;
+  originProtocol?: string;
+  httpOriginPort?: number;
+  httpsOriginPort?: number;
+  ipv6Status?: string;
   verifyRecordName?: string;
   verifyRecordType?: string;
   verifyRecordValue?: string;
@@ -28,16 +42,44 @@ export interface RemoteAccelerationSite {
   provider: string;
   remoteSiteId: string;
   zoneName: string;
+  accelerationDomain?: string;
+  subDomain?: string;
   siteStatus: string;
+  domainStatus?: string;
   verifyStatus: string;
+  identificationStatus?: string;
   verified: boolean;
   paused: boolean;
   accessType: string;
   area: string;
   planId?: string;
+  cnameTarget?: string;
+  cnameStatus?: string;
+  originType?: string;
+  originValue?: string;
+  backupOriginValue?: string;
+  hostHeader?: string;
+  originProtocol?: string;
+  httpOriginPort?: number;
+  httpsOriginPort?: number;
+  ipv6Status?: string;
   verifyRecordName?: string;
   verifyRecordType?: string;
   verifyRecordValue?: string;
+}
+
+export interface AccelerationConfigInput {
+  accelerationDomain?: string;
+  subDomain?: string;
+  originType?: string;
+  originValue?: string;
+  backupOriginValue?: string;
+  hostHeader?: string;
+  originProtocol?: string;
+  httpOriginPort?: number;
+  httpsOriginPort?: number;
+  originPort?: number;
+  ipv6Status?: string;
 }
 
 export interface DiscoveredAccelerationSite {
@@ -72,10 +114,19 @@ export async function listAccelerationConfigs(params?: {
 }
 
 export async function enableAcceleration(
-  data: EnableAccelerationPayload,
+  data: EnableAccelerationPayload & AccelerationConfigInput,
 ): Promise<ApiResponse<EnableAccelerationResult>> {
   const response = await api.post('/accelerations/enable', data);
   return response as unknown as ApiResponse<EnableAccelerationResult>;
+}
+
+export async function updateAccelerationConfig(data: {
+  zoneName: string;
+  dnsCredentialId: number;
+  pluginCredentialId?: number;
+} & AccelerationConfigInput): Promise<ApiResponse<{ config: DomainAccelerationConfig }>> {
+  const response = await api.post('/accelerations/update-config', data);
+  return response as unknown as ApiResponse<{ config: DomainAccelerationConfig }>;
 }
 
 export async function verifyAcceleration(data: {
@@ -92,6 +143,14 @@ export async function syncAcceleration(data: {
 }): Promise<ApiResponse<{ config: DomainAccelerationConfig }>> {
   const response = await api.post('/accelerations/sync', data);
   return response as unknown as ApiResponse<{ config: DomainAccelerationConfig }>;
+}
+
+export async function checkAccelerationCname(data: {
+  zoneName: string;
+  dnsCredentialId: number;
+}): Promise<ApiResponse<{ config: DomainAccelerationConfig; effective: boolean }>> {
+  const response = await api.post('/accelerations/check-cname', data);
+  return response as unknown as ApiResponse<{ config: DomainAccelerationConfig; effective: boolean }>;
 }
 
 export async function disableAcceleration(data: {
@@ -125,7 +184,7 @@ export async function importRemoteAcceleration(data: {
   pluginCredentialId: number;
   remoteSiteId?: string;
   autoDnsRecord?: boolean;
-}): Promise<ApiResponse<EnableAccelerationResult>> {
+} & Partial<AccelerationConfigInput>): Promise<ApiResponse<EnableAccelerationResult>> {
   const response = await api.post('/accelerations/import-remote', data);
   return response as unknown as ApiResponse<EnableAccelerationResult>;
 }

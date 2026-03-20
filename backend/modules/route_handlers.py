@@ -2839,13 +2839,27 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             "pluginProvider": str(row["pluginProvider"] or ""),
             "pluginCredentialId": int(row["pluginCredentialId"]),
             "remoteSiteId": str(row["remoteSiteId"] or ""),
+            "accelerationDomain": str(row["accelerationDomain"] or ""),
+            "subDomain": str(row["subDomain"] or "@"),
             "siteStatus": str(row["siteStatus"] or ""),
+            "domainStatus": str(row["domainStatus"] or ""),
             "verifyStatus": str(row["verifyStatus"] or ""),
+            "identificationStatus": str(row["identificationStatus"] or ""),
             "verified": bool(row["verified"]),
             "paused": bool(row["paused"]),
             "accessType": str(row["accessType"] or "partial"),
             "area": str(row["area"] or "global"),
             "planId": str(row["planId"] or ""),
+            "cnameTarget": str(row["cnameTarget"] or ""),
+            "cnameStatus": str(row["cnameStatus"] or ""),
+            "originType": str(row["originType"] or ""),
+            "originValue": str(row["originValue"] or ""),
+            "backupOriginValue": str(row["backupOriginValue"] or ""),
+            "hostHeader": str(row["hostHeader"] or ""),
+            "originProtocol": str(row["originProtocol"] or "FOLLOW"),
+            "httpOriginPort": int(row["httpOriginPort"] or 80),
+            "httpsOriginPort": int(row["httpsOriginPort"] or 443),
+            "ipv6Status": str(row["ipv6Status"] or "follow"),
             "verifyRecordName": str(row["verifyRecordName"] or ""),
             "verifyRecordType": str(row["verifyRecordType"] or ""),
             "verifyRecordValue": str(row["verifyRecordValue"] or ""),
@@ -2883,20 +2897,37 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                 """
                 INSERT INTO domain_accelerations (
                   userId, dnsCredentialId, zoneName, pluginProvider, pluginCredentialId,
-                  remoteSiteId, siteStatus, verifyStatus, verified, paused, accessType, area, planId,
+                  remoteSiteId, accelerationDomain, subDomain, siteStatus, domainStatus, verifyStatus, identificationStatus,
+                  verified, paused, accessType, area, planId, cnameTarget, cnameStatus,
+                  originType, originValue, backupOriginValue, hostHeader, originProtocol,
+                  httpOriginPort, httpsOriginPort, ipv6Status,
                   verifyRecordName, verifyRecordType, verifyRecordValue, lastError, lastSyncedAt, updatedAt
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(userId, dnsCredentialId, zoneName, pluginProvider)
                 DO UPDATE SET
                   pluginCredentialId = excluded.pluginCredentialId,
                   remoteSiteId = excluded.remoteSiteId,
+                  accelerationDomain = excluded.accelerationDomain,
+                  subDomain = excluded.subDomain,
                   siteStatus = excluded.siteStatus,
+                  domainStatus = excluded.domainStatus,
                   verifyStatus = excluded.verifyStatus,
+                  identificationStatus = excluded.identificationStatus,
                   verified = excluded.verified,
                   paused = excluded.paused,
                   accessType = excluded.accessType,
                   area = excluded.area,
                   planId = excluded.planId,
+                  cnameTarget = excluded.cnameTarget,
+                  cnameStatus = excluded.cnameStatus,
+                  originType = excluded.originType,
+                  originValue = excluded.originValue,
+                  backupOriginValue = excluded.backupOriginValue,
+                  hostHeader = excluded.hostHeader,
+                  originProtocol = excluded.originProtocol,
+                  httpOriginPort = excluded.httpOriginPort,
+                  httpsOriginPort = excluded.httpsOriginPort,
+                  ipv6Status = excluded.ipv6Status,
                   verifyRecordName = excluded.verifyRecordName,
                   verifyRecordType = excluded.verifyRecordType,
                   verifyRecordValue = excluded.verifyRecordValue,
@@ -2911,13 +2942,27 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                     plugin_provider,
                     plugin_credential_id,
                     str(state.get("remoteSiteId") or ""),
+                    str(state.get("accelerationDomain") or ""),
+                    str(state.get("subDomain") or "@"),
                     str(state.get("siteStatus") or ""),
+                    str(state.get("domainStatus") or ""),
                     str(state.get("verifyStatus") or ""),
+                    str(state.get("identificationStatus") or ""),
                     1 if bool(state.get("verified")) else 0,
                     1 if bool(state.get("paused")) else 0,
                     str(state.get("accessType") or "partial"),
                     str(state.get("area") or "global"),
                     str(state.get("planId") or ""),
+                    str(state.get("cnameTarget") or ""),
+                    str(state.get("cnameStatus") or ""),
+                    str(state.get("originType") or ""),
+                    str(state.get("originValue") or ""),
+                    str(state.get("backupOriginValue") or ""),
+                    str(state.get("hostHeader") or ""),
+                    str(state.get("originProtocol") or "FOLLOW"),
+                    int(state.get("httpOriginPort") or 80),
+                    int(state.get("httpsOriginPort") or 443),
+                    str(state.get("ipv6Status") or "follow"),
                     str(state.get("verifyRecordName") or ""),
                     str(state.get("verifyRecordType") or "TXT"),
                     str(state.get("verifyRecordValue") or ""),
@@ -2951,17 +2996,23 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             if not row:
                 return []
             provider = str(row["provider"] or "").strip().lower()
-            return [row] if provider == "tencent_edgeone" else []
+            caps = get_provider_capabilities(provider) or {}
+            return [row] if str(caps.get("category") or "dns") == "acceleration" else []
         with conn() as c:
-            return c.execute(
+            rows = c.execute(
                 """
                 SELECT *
                 FROM dns_credentials
-                WHERE userId = ? AND provider = 'tencent_edgeone'
+                WHERE userId = ?
                 ORDER BY isDefault DESC, createdAt ASC
                 """,
                 (uid,),
             ).fetchall()
+        return [
+            row
+            for row in rows
+            if str((get_provider_capabilities(str(row["provider"] or "").strip().lower()) or {}).get("category") or "dns") == "acceleration"
+        ]
 
     def _refresh_row(row: Any, verify: bool = False) -> Any:
         plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(int(row["pluginCredentialId"]))
@@ -3003,6 +3054,36 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
 
     def _normalize_verify_value(value: Any) -> str:
         return str(value or "").strip().strip('"').strip("'")
+
+    def _accel_config_from_source(source: Any) -> Dict[str, Any]:
+        if not isinstance(source, dict):
+            return {}
+        config: Dict[str, Any] = {}
+        for key in (
+            "accelerationDomain",
+            "subDomain",
+            "originType",
+            "originValue",
+            "backupOriginValue",
+            "hostHeader",
+            "originProtocol",
+            "ipv6Status",
+        ):
+            value = source.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                config[key] = text
+        for key in ("httpOriginPort", "httpsOriginPort", "originPort"):
+            value = source.get(key)
+            if value is None or str(value).strip() == "":
+                continue
+            try:
+                config[key] = int(value)
+            except Exception:
+                pass
+        return config
 
     def _auto_create_verify_record(dns_credential_id: int, zone_name: str, zone_id: str, state: Dict[str, Any]) -> tuple[list, list, list]:
         record_name = str(state.get("verifyRecordName") or "").strip().rstrip(".")
@@ -3156,7 +3237,10 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
 
             old_row = _get_accel_row(dns_credential_id, zone_name)
             plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-            state = plugin.ensure_site(zone_name)
+            accel_config = _accel_config_from_source(body)
+            if not accel_config and old_row:
+                accel_config = _accel_config_from_source(_serialize_row(old_row) or {})
+            state = plugin.ensure_site(zone_name, accel_config or None)
             dns_records_added: list = []
             dns_records_skipped: list = []
             dns_errors: list = []
@@ -3193,6 +3277,46 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                 new_value=payload,
             )
             self._ok(payload, "加速接入成功", 201)
+            return
+
+        if self.command == "POST" and sub == "/update-config":
+            zone_name = norm_domain(body.get("zoneName"))
+            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
+            plugin_credential_id = self._parse_credential_id(body.get("pluginCredentialId"))
+            if not zone_name or not dns_credential_id:
+                self._err("缺少参数: zoneName, dnsCredentialId", 400)
+                return
+            existing_row = _get_accel_row(dns_credential_id, zone_name)
+            if existing_row:
+                plugin_credential_id = int(existing_row["pluginCredentialId"])
+            if not plugin_credential_id:
+                self._err("缺少参数: pluginCredentialId", 400)
+                return
+            plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
+            accel_config = _accel_config_from_source(body)
+            if not accel_config and existing_row:
+                accel_config = _accel_config_from_source(_serialize_row(existing_row) or {})
+            if not accel_config:
+                self._err("缺少加速配置内容", 400)
+                return
+            state = plugin.ensure_site(zone_name, accel_config)
+            row = _upsert_accel_row(
+                dns_credential_id,
+                zone_name,
+                int(plugin_cred_row["id"]),
+                state,
+                plugin_provider,
+                "",
+            )
+            serialized = _serialize_row(row)
+            _write_accel_log(
+                "UPDATE",
+                "SUCCESS",
+                zone_name,
+                old_value=_serialize_row(existing_row) if existing_row else None,
+                new_value=serialized,
+            )
+            self._ok({"config": serialized}, "加速配置已更新")
             return
 
         if self.command == "POST" and sub == "/import-remote":
@@ -3339,6 +3463,24 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             row = _refresh_row(row, verify=False)
             _write_accel_log("UPDATE", "SUCCESS", zone_name, old_value=previous, new_value=_serialize_row(row))
             self._ok({"config": _serialize_row(row)}, "加速状态已同步")
+            return
+
+        if self.command == "POST" and sub == "/check-cname":
+            zone_name = norm_domain(body.get("zoneName"))
+            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
+            if not zone_name or not dns_credential_id:
+                self._err("缺少参数: zoneName, dnsCredentialId", 400)
+                return
+            row = _get_accel_row(dns_credential_id, zone_name)
+            if not row:
+                self._err("未找到该域名的加速配置", 404)
+                return
+            previous = _serialize_row(row)
+            row = _refresh_row(row, verify=False)
+            serialized = _serialize_row(row)
+            effective = bool(serialized and (serialized.get("verified") or str(serialized.get("domainStatus") or "").strip().lower() in {"online", "active"}))
+            _write_accel_log("VERIFY", "SUCCESS", zone_name, old_value=previous, new_value=serialized)
+            self._ok({"config": serialized, "effective": effective}, "CNAME 生效状态已刷新")
             return
 
         if self.command == "POST" and sub == "/sync-all":

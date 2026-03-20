@@ -176,6 +176,13 @@ function normalizeText(value: unknown): string {
   return String(value || '').trim().toLowerCase();
 }
 
+function getPrimaryAccelerationDomain(item: {
+  accelerationDomain?: string;
+  zoneName?: string;
+}) {
+  return String(item.accelerationDomain || item.zoneName || '').trim();
+}
+
 function getErrorMessage(err: any): string {
   return String(err?.response?.data?.message || err?.message || err || '操作失败');
 }
@@ -204,9 +211,23 @@ function getLocalKey(config: DomainAccelerationConfig): string {
   return `${config.dnsCredentialId}::${normalizeText(config.zoneName)}`;
 }
 
-function getRowStatus(item: { verified?: boolean; paused?: boolean; lastError?: string }): RowStatus {
+function getRowStatus(item: {
+  verified?: boolean;
+  paused?: boolean;
+  lastError?: string;
+  domainStatus?: string;
+  cnameStatus?: string;
+  identificationStatus?: string;
+  verifyStatus?: string;
+}): RowStatus {
   if (item.paused) return 'paused';
-  if (item.verified) return 'verified';
+  const domainStatus = normalizeText(item.domainStatus);
+  const cnameStatus = normalizeText(item.cnameStatus || item.identificationStatus || item.verifyStatus);
+  if (
+    item.verified
+    || ['online', 'active', 'enabled'].includes(domainStatus)
+    || ['finished', 'active', 'verified', 'success', 'completed'].includes(cnameStatus)
+  ) return 'verified';
   if (String(item.lastError || '').trim()) return 'error';
   return 'pending';
 }
@@ -224,9 +245,17 @@ const localRows = computed<LocalAccelerationRow[]>(() =>
       hasError: Boolean(String(config.lastError || '').trim()),
       searchText: [
         config.zoneName,
+        config.accelerationDomain,
         config.remoteSiteId,
         config.siteStatus,
+        config.domainStatus,
         config.verifyStatus,
+        config.identificationStatus,
+        config.cnameStatus,
+        config.cnameTarget,
+        config.originValue,
+        config.hostHeader,
+        config.ipv6Status,
         config.accessType,
         config.area,
         config.lastError,
@@ -281,9 +310,16 @@ const remoteRows = computed<RemoteAccelerationRow[]>(() =>
       ownershipStatus: localConfig ? 'managed' : 'unmanaged',
       searchText: [
         zoneName,
+        item.site.accelerationDomain,
         item.site.remoteSiteId,
         item.site.siteStatus,
+        item.site.domainStatus,
         item.site.verifyStatus,
+        item.site.identificationStatus,
+        item.site.cnameStatus,
+        item.site.cnameTarget,
+        item.site.originValue,
+        item.site.hostHeader,
         item.site.accessType,
         item.site.area,
         item.site.planId,
@@ -824,9 +860,9 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
         <div v-for="config in filteredLocalRows" :key="config.key" class="panel-muted p-4">
           <div class="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <p class="text-sm font-semibold text-slate-700">{{ config.zoneName }}</p>
+              <p class="text-sm font-semibold text-slate-700">{{ getPrimaryAccelerationDomain(config) }}</p>
               <p class="mt-1 text-xs text-slate-500">
-                Site {{ config.remoteSiteId || '-' }} · DNS {{ config.dnsCredentialName }} · 加速 {{ config.pluginCredentialName }}
+                根域名 {{ config.zoneName }} · Site {{ config.remoteSiteId || '-' }} · DNS {{ config.dnsCredentialName }} · 加速 {{ config.pluginCredentialName }}
               </p>
             </div>
             <div class="flex flex-wrap gap-2">
@@ -837,26 +873,30 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
                 {{ config.paused ? '已暂停' : (config.verified ? '已验证' : '待验证') }}
               </NTag>
               <NTag v-if="config.hasError" size="small" :bordered="false" type="error">最近异常</NTag>
-              <NTag size="small" :bordered="false">{{ config.siteStatus || 'unknown' }}</NTag>
+              <NTag size="small" :bordered="false">{{ config.domainStatus || config.siteStatus || 'unknown' }}</NTag>
             </div>
           </div>
 
           <div class="mt-3 grid gap-3 md:grid-cols-4">
             <div>
-              <p class="text-xs text-slate-500">验证状态</p>
-              <p class="mt-1 text-sm text-slate-700">{{ config.verifyStatus || '-' }}</p>
+              <p class="text-xs text-slate-500">状态链路</p>
+              <p class="mt-1 text-sm text-slate-700">{{ config.domainStatus || config.siteStatus || '-' }}</p>
+              <p class="mt-1 text-xs text-slate-500">CNAME / 验证：{{ config.cnameStatus || config.identificationStatus || config.verifyStatus || '-' }}</p>
             </div>
             <div>
-              <p class="text-xs text-slate-500">接入模式</p>
-              <p class="mt-1 text-sm text-slate-700">{{ config.accessType || 'partial' }}</p>
+              <p class="text-xs text-slate-500">回源配置</p>
+              <p class="mt-1 break-all text-sm text-slate-700">{{ config.originValue || '-' }}</p>
+              <p class="mt-1 text-xs text-slate-500">{{ config.originProtocol || 'FOLLOW' }} · HTTP {{ config.httpOriginPort || 80 }} / HTTPS {{ config.httpsOriginPort || 443 }}</p>
             </div>
             <div>
-              <p class="text-xs text-slate-500">区域 / 套餐</p>
-              <p class="mt-1 text-sm text-slate-700">{{ config.area || 'global' }} / {{ config.planId || '默认' }}</p>
+              <p class="text-xs text-slate-500">CNAME / Host</p>
+              <p class="mt-1 break-all text-sm text-slate-700">{{ config.cnameTarget || '-' }}</p>
+              <p class="mt-1 text-xs text-slate-500">Host Header：{{ config.hostHeader || '未设置' }}</p>
             </div>
             <div>
-              <p class="text-xs text-slate-500">最近同步</p>
+              <p class="text-xs text-slate-500">最近同步 / 套餐</p>
               <p class="mt-1 text-sm text-slate-700">{{ config.lastSyncedAt ? new Date(config.lastSyncedAt).toLocaleString('zh-CN') : '-' }}</p>
+              <p class="mt-1 text-xs text-slate-500">{{ config.area || 'global' }} / {{ config.planId || '默认' }} · IPv6 {{ config.ipv6Status || 'follow' }}</p>
             </div>
           </div>
 
@@ -1001,9 +1041,9 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
         <div v-for="row in filteredRemoteRows" :key="row.key" class="panel-muted p-4">
           <div class="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <p class="text-sm font-semibold text-slate-700">{{ row.zoneName }}</p>
+              <p class="text-sm font-semibold text-slate-700">{{ getPrimaryAccelerationDomain(row.item.site) }}</p>
               <p class="mt-1 text-xs text-slate-500">
-                {{ row.item.pluginCredentialName }} · Site {{ row.item.site.remoteSiteId || '-' }}
+                根域名 {{ row.zoneName }} · {{ row.item.pluginCredentialName }} · Site {{ row.item.site.remoteSiteId || '-' }}
               </p>
             </div>
             <div class="flex flex-wrap gap-2">
@@ -1015,7 +1055,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
               </NTag>
               <NTag v-if="row.localConfig" size="small" :bordered="false" type="success">已接管</NTag>
               <NTag v-else size="small" :bordered="false" type="warning">待接管</NTag>
-              <NTag size="small" :bordered="false">{{ row.item.site.siteStatus || 'unknown' }}</NTag>
+              <NTag size="small" :bordered="false">{{ row.item.site.domainStatus || row.item.site.siteStatus || 'unknown' }}</NTag>
             </div>
           </div>
 
@@ -1023,18 +1063,21 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
             <div>
               <p class="text-xs text-slate-500">本地状态</p>
               <p class="mt-1 text-sm text-slate-700">{{ row.localConfig ? row.localConfig.dnsCredentialName : '未接管' }}</p>
+              <p class="mt-1 text-xs text-slate-500">CNAME / 验证：{{ row.item.site.cnameStatus || row.item.site.identificationStatus || row.item.site.verifyStatus || '-' }}</p>
             </div>
             <div>
               <p class="text-xs text-slate-500">候选 DNS 账户</p>
               <p class="mt-1 text-sm text-slate-700">{{ row.dnsCredentialName }}</p>
             </div>
             <div>
-              <p class="text-xs text-slate-500">接入模式</p>
-              <p class="mt-1 text-sm text-slate-700">{{ row.item.site.accessType || 'partial' }}</p>
+              <p class="text-xs text-slate-500">回源配置</p>
+              <p class="mt-1 break-all text-sm text-slate-700">{{ row.item.site.originValue || '-' }}</p>
+              <p class="mt-1 text-xs text-slate-500">{{ row.item.site.originProtocol || 'FOLLOW' }} · HTTP {{ row.item.site.httpOriginPort || 80 }} / HTTPS {{ row.item.site.httpsOriginPort || 443 }}</p>
             </div>
             <div>
-              <p class="text-xs text-slate-500">区域 / 套餐</p>
-              <p class="mt-1 text-sm text-slate-700">{{ row.item.site.area || 'global' }} / {{ row.item.site.planId || '默认' }}</p>
+              <p class="text-xs text-slate-500">CNAME / 套餐</p>
+              <p class="mt-1 break-all text-sm text-slate-700">{{ row.item.site.cnameTarget || '-' }}</p>
+              <p class="mt-1 text-xs text-slate-500">{{ row.item.site.area || 'global' }} / {{ row.item.site.planId || '默认' }} · IPv6 {{ row.item.site.ipv6Status || 'follow' }}</p>
             </div>
           </div>
 

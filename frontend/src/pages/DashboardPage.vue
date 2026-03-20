@@ -9,21 +9,9 @@ import { useProviderStore } from '@/stores/provider';
 import { useBreadcrumbStore } from '@/stores/breadcrumb';
 import { useResponsive } from '@/composables/useResponsive';
 import { getDomains, refreshDomains, deleteZone } from '@/services/domains';
-import { getDnsCredentials, getProviders } from '@/services/dnsCredentials';
 import { getLogs } from '@/services/logs';
 import { lookupDomainExpiry } from '@/services/domainExpiry';
 import { listEsaSites, ESA_SUPPORTED_REGIONS } from '@/services/aliyunEsa';
-import {
-  listAccelerationConfigs,
-  listRemoteAccelerationSites,
-  importRemoteAcceleration,
-  setAccelerationSiteStatus,
-  deleteRemoteAcceleration,
-  syncAllAccelerations,
-  syncAcceleration,
-  type DomainAccelerationConfig,
-  type DiscoveredAccelerationSite,
-} from '@/services/accelerations';
 import {
   runDomainInspection,
   listSyncJobs,
@@ -52,7 +40,6 @@ import { getProviderDisplayName } from '@/utils/provider';
 import ProviderAccountTabs from '@/components/Dashboard/ProviderAccountTabs.vue';
 import AddEsaSiteDialog from '@/components/Dashboard/AddEsaSiteDialog.vue';
 import AddDnsCredentialDialog from '@/components/Dashboard/AddDnsCredentialDialog.vue';
-import AddAccelerationCredentialDialog from '@/components/Dashboard/AddAccelerationCredentialDialog.vue';
 
 const router = useRouter();
 const route = useRoute();
@@ -76,7 +63,7 @@ const pageSize = TABLE_PAGE_SIZE;
 const showAddEsa = ref(false);
 const showAddCredential = ref(false);
 const panelMode = ref<'dns' | 'esa'>('dns');
-const quickFilter = ref<'all' | 'active' | 'issue' | 'expiring' | 'recent' | 'accelerated' | 'takeover'>('all');
+const quickFilter = ref<'all' | 'active' | 'issue' | 'expiring' | 'recent'>('all');
 const sortBy = ref<'updatedAt' | 'name' | 'status'>('updatedAt');
 const sortOrder = ref<'asc' | 'desc'>('desc');
 const lastRefreshedAt = ref<number | null>(null);
@@ -87,15 +74,10 @@ const showSyncCenter = ref(false);
 const showAlertCenter = ref(false);
 const showAuditCenter = ref(false);
 const showTagCenter = ref(false);
-const showAccelerationCenter = ref(false);
 const showSaveViewModal = ref(false);
-const showAddAccelerationCredential = ref(false);
 const newViewName = ref('');
 const activeTagDomain = ref('');
 const tagInput = ref('');
-const selectedRemoteAccelerationKeys = ref<string[]>([]);
-const remoteImportTargets = ref<Record<string, number | null>>({});
-const remoteImportTargetMap = ref<Record<string, number | null>>({});
 
 const sortOptions = [
   { label: '按更新时间', value: 'updatedAt' },
@@ -425,51 +407,6 @@ const { data: auditLogsData } = useQuery({
   },
 });
 
-const { data: accelerationConfigsData, refetch: refetchAccelerationConfigs } = useQuery({
-  queryKey: ['acceleration-configs-dashboard'],
-  queryFn: async () => {
-    try {
-      const res = await listAccelerationConfigs();
-      return res.data?.items || [];
-    } catch {
-      return [] as DomainAccelerationConfig[];
-    }
-  },
-});
-
-const { data: remoteAccelerationSitesData, refetch: refetchRemoteAccelerationSites } = useQuery({
-  queryKey: ['remote-acceleration-sites-dashboard'],
-  queryFn: async () => {
-    try {
-      const res = await listRemoteAccelerationSites();
-      return res.data?.items || [];
-    } catch {
-      return [] as DiscoveredAccelerationSite[];
-    }
-  },
-});
-
-const {
-  data: accelerationCredentialData,
-  refetch: refetchAccelerationCredentials,
-} = useQuery({
-  queryKey: ['acceleration-credentials-dashboard'],
-  queryFn: async () => {
-    const [providersRes, credentialsRes] = await Promise.all([
-      getProviders(),
-      getDnsCredentials(),
-    ]);
-    const accelerationProviderSet = new Set(
-      (providersRes.data?.providers || [])
-        .filter((item) => (item.category || 'dns') === 'acceleration')
-        .map((item) => String(item.type || '').trim().toLowerCase()),
-    );
-    return (credentialsRes.data?.credentials || []).filter((item) =>
-      accelerationProviderSet.has(String(item.provider || '').trim().toLowerCase()),
-    ) as DnsCredential[];
-  },
-});
-
 const logs24h = computed<Log[]>(() => logs24hData.value || []);
 const auditLogs = computed<Log[]>(() => auditLogsData.value || []);
 const remoteSyncJobs = computed<SyncJob[]>(() => remoteSyncJobsData.value || []);
@@ -477,122 +414,6 @@ const remoteAlertRules = computed<AlertRule[]>(() => remoteAlertRulesData.value 
 const remoteAlertEvents = computed<AlertEvent[]>(() => remoteAlertEventsData.value || []);
 const remoteSavedViews = computed<DashboardViewPreset[]>(() => remoteSavedViewsData.value || []);
 const remoteTagItems = computed<DomainTagEntry[]>(() => remoteDomainTagsData.value || []);
-const accelerationConfigs = computed<DomainAccelerationConfig[]>(() => accelerationConfigsData.value || []);
-const remoteAccelerationSites = computed<DiscoveredAccelerationSite[]>(() => remoteAccelerationSitesData.value || []);
-const accelerationCredentials = computed<DnsCredential[]>(() => accelerationCredentialData.value || []);
-
-function getAccelerationKey(domain: Domain): string {
-  return `${domain.credentialId ?? 'none'}::${String(domain.name || '').toLowerCase()}`;
-}
-
-const accelerationConfigMap = computed(() => {
-  const map = new Map<string, DomainAccelerationConfig>();
-  for (const item of accelerationConfigs.value) {
-    map.set(`${item.dnsCredentialId}::${String(item.zoneName || '').toLowerCase()}`, item);
-  }
-  return map;
-});
-
-const remoteAccelerationMap = computed(() => {
-  const map = new Map<string, DiscoveredAccelerationSite>();
-  for (const item of remoteAccelerationSites.value) {
-    const key = String(item.site.zoneName || '').toLowerCase();
-    if (!key) continue;
-    if (!map.has(key)) map.set(key, item);
-  }
-  return map;
-});
-
-function getAccelerationConfig(domain: Domain): DomainAccelerationConfig | null {
-  return accelerationConfigMap.value.get(getAccelerationKey(domain)) || null;
-}
-
-function getAccelerationLabel(domain: Domain): string {
-  const config = getAccelerationConfig(domain);
-  if (!config) return '未接入';
-  if (config.paused) return '已暂停';
-  if (config.verified) return '已验证';
-  if (config.lastError) return '异常';
-  return '待验证';
-}
-
-function getAccelerationType(domain: Domain): 'success' | 'warning' | 'error' | 'default' {
-  const config = getAccelerationConfig(domain);
-  if (!config) {
-    const remote = remoteAccelerationMap.value.get(String(domain.name || '').toLowerCase());
-    if (!remote) return 'default';
-    if (remote.site.paused) return 'warning';
-    return remote.site.verified ? 'success' : 'warning';
-  }
-  if (config.paused) return 'warning';
-  if (config.verified) return 'success';
-  if (config.lastError) return 'error';
-  return 'warning';
-}
-
-function getAccelerationBadge(domain: Domain): string {
-  const config = getAccelerationConfig(domain);
-  if (config) return getAccelerationLabel(domain);
-  const remote = remoteAccelerationMap.value.get(String(domain.name || '').toLowerCase());
-  if (!remote) return '未接入';
-  if (remote.site.paused) return '远端已暂停';
-  return remote.site.verified ? '远端已接入' : '远端待接管';
-}
-
-function getRemoteAccelerationKey(item: DiscoveredAccelerationSite): string {
-  return `${item.pluginCredentialId}::${String(item.site.remoteSiteId || item.site.zoneName || '').toLowerCase()}`;
-}
-
-const remoteAccelerationEntries = computed(() =>
-  remoteAccelerationSites.value.map((item) => {
-    const key = getRemoteAccelerationKey(item);
-    const zoneName = String(item.site.zoneName || '').trim();
-    const matches = domains.value.filter((domain) =>
-      String(domain.name || '').trim().toLowerCase() === zoneName.toLowerCase(),
-    );
-    const localConfig = accelerationConfigs.value.find((config) =>
-      String(config.zoneName || '').trim().toLowerCase() === zoneName.toLowerCase(),
-    ) || null;
-    const selectedDnsCredentialId = remoteImportTargets.value[key]
-      ?? localConfig?.dnsCredentialId
-      ?? matches[0]?.credentialId
-      ?? null;
-
-    return {
-      key,
-      zoneName,
-      item,
-      localConfig,
-      matches,
-      selectedDnsCredentialId,
-      dnsOptions: matches
-        .filter((domain) => typeof domain.credentialId === 'number')
-        .map((domain) => ({
-          label: `${domain.name} / ${domain.credentialName || getProviderDisplayName(domain.provider || '') || 'DNS 账户'}`,
-          value: domain.credentialId as number,
-        })),
-    };
-  }),
-);
-
-watch(remoteAccelerationEntries, (entries) => {
-  if (!entries.length) return;
-  const next = { ...remoteImportTargets.value };
-  let changed = false;
-  for (const entry of entries) {
-    if (next[entry.key] !== undefined) continue;
-    next[entry.key] = entry.selectedDnsCredentialId;
-    changed = true;
-  }
-  if (changed) {
-    remoteImportTargets.value = next;
-  }
-}, { immediate: true });
-
-const selectedRemoteAccelerationEntries = computed(() => {
-  const selected = new Set(selectedRemoteAccelerationKeys.value);
-  return remoteAccelerationEntries.value.filter((item) => selected.has(item.key));
-});
 
 const mergedSyncJobs = computed<SyncJob[]>(() => {
   const map = new Map<string, SyncJob>();
@@ -674,8 +495,6 @@ const filteredDomains = computed(() => {
   const filteredByQuick = domains.value.filter((d) => {
     if (quickFilter.value === 'active') return isDomainHealthy(d);
     if (quickFilter.value === 'issue') return isDomainIssue(d);
-    if (quickFilter.value === 'accelerated') return Boolean(getAccelerationConfig(d) || remoteAccelerationMap.value.get(String(d.name || '').toLowerCase()));
-    if (quickFilter.value === 'takeover') return !getAccelerationConfig(d) && Boolean(remoteAccelerationMap.value.get(String(d.name || '').toLowerCase()));
     if (quickFilter.value === 'recent') {
       const ts = d.updatedAt ? Date.parse(d.updatedAt) : NaN;
       if (!Number.isFinite(ts)) return false;
@@ -736,14 +555,6 @@ const activeDomainCount = computed(() =>
 
 const issueDomainCount = computed(() =>
   domains.value.filter((d) => isDomainIssue(d)).length,
-);
-
-const acceleratedDomainCount = computed(() =>
-  domains.value.filter((d) => Boolean(getAccelerationConfig(d) || remoteAccelerationMap.value.get(String(d.name || '').toLowerCase()))).length,
-);
-
-const takeoverDomainCount = computed(() =>
-  domains.value.filter((d) => !getAccelerationConfig(d) && Boolean(remoteAccelerationMap.value.get(String(d.name || '').toLowerCase()))).length,
 );
 
 const providerCount = computed(() =>
@@ -1252,160 +1063,6 @@ async function toggleRuleEnabled(rule: AlertRule, enabled: boolean) {
   } catch {}
 }
 
-async function refreshAccelerationDashboard() {
-  await Promise.all([
-    refetchAccelerationConfigs(),
-    refetchRemoteAccelerationSites(),
-  ]);
-  queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-  queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
-}
-
-const importRemoteAccelerationMutation = useMutation({
-  mutationFn: async (entryKey: string) => {
-    const entry = remoteAccelerationEntries.value.find((item) => item.key === entryKey);
-    if (!entry) {
-      throw new Error('远端站点不存在');
-    }
-    if (!entry.selectedDnsCredentialId) {
-      throw new Error('请选择要绑定的 DNS 账户');
-    }
-    return importRemoteAcceleration({
-      zoneName: entry.zoneName,
-      dnsCredentialId: entry.selectedDnsCredentialId,
-      pluginCredentialId: entry.item.pluginCredentialId,
-      remoteSiteId: entry.item.site.remoteSiteId,
-      autoDnsRecord: true,
-    });
-  },
-  onSuccess: async (res) => {
-    const added = res.data?.dnsRecordsAdded?.length || 0;
-    const skipped = res.data?.dnsRecordsSkipped?.length || 0;
-    const failed = res.data?.dnsErrors?.length || 0;
-    let text = '远端站点已接管';
-    if (added) text += `，新增 ${added} 条验证记录`;
-    if (skipped) text += `，${skipped} 条验证记录已存在`;
-    if (failed) text += `，${failed} 条记录写入失败`;
-    message.success(text);
-    await refreshAccelerationDashboard();
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const accelerationSiteStatusMutation = useMutation({
-  mutationFn: async (payload: { entryKey: string; enabled: boolean }) => {
-    const entry = remoteAccelerationEntries.value.find((item) => item.key === payload.entryKey);
-    if (!entry) {
-      throw new Error('远端站点不存在');
-    }
-    return setAccelerationSiteStatus({
-      zoneName: entry.zoneName,
-      dnsCredentialId: entry.localConfig?.dnsCredentialId,
-      pluginCredentialId: entry.item.pluginCredentialId,
-      remoteSiteId: entry.item.site.remoteSiteId,
-      enabled: payload.enabled,
-    });
-  },
-  onSuccess: async () => {
-    message.success('加速站点状态已更新');
-    await refreshAccelerationDashboard();
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const deleteRemoteAccelerationMutation = useMutation({
-  mutationFn: async (entryKey: string) => {
-    const entry = remoteAccelerationEntries.value.find((item) => item.key === entryKey);
-    if (!entry) {
-      throw new Error('远端站点不存在');
-    }
-    return deleteRemoteAcceleration({
-      zoneName: entry.zoneName,
-      dnsCredentialId: entry.localConfig?.dnsCredentialId,
-      pluginCredentialId: entry.item.pluginCredentialId,
-      remoteSiteId: entry.item.site.remoteSiteId,
-      deleteLocalConfig: true,
-    });
-  },
-  onSuccess: async () => {
-    message.success('远端加速站点已删除');
-    await refreshAccelerationDashboard();
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const syncSingleAccelerationMutation = useMutation({
-  mutationFn: async (entryKey: string) => {
-    const entry = remoteAccelerationEntries.value.find((item) => item.key === entryKey);
-    if (!entry?.localConfig?.dnsCredentialId) {
-      throw new Error('当前站点尚未纳入本地管理');
-    }
-    return syncAcceleration({
-      zoneName: entry.zoneName,
-      dnsCredentialId: entry.localConfig.dnsCredentialId,
-    });
-  },
-  onSuccess: async () => {
-    message.success('加速状态已同步');
-    await refreshAccelerationDashboard();
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const syncAllAccelerationsMutation = useMutation({
-  mutationFn: () => syncAllAccelerations(),
-  onSuccess: async (res) => {
-    const synced = Number(res.data?.synced || 0);
-    const failed = Number(res.data?.failed || 0);
-    if (failed > 0) {
-      message.warning(`加速配置批量同步完成：成功 ${synced}，失败 ${failed}`);
-    } else {
-      message.success(`已同步 ${synced} 个加速配置`);
-    }
-    await refreshAccelerationDashboard();
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-async function handleBatchImportRemoteAccelerations() {
-  const targets = selectedRemoteAccelerationEntries.value.filter((item) => !item.localConfig);
-  if (!targets.length) {
-    message.warning('请先勾选待接管的远端站点');
-    return;
-  }
-  let success = 0;
-  let failed = 0;
-  for (const entry of targets) {
-    try {
-      await importRemoteAccelerationMutation.mutateAsync(entry.key);
-      success += 1;
-    } catch {
-      failed += 1;
-    }
-  }
-  selectedRemoteAccelerationKeys.value = [];
-  if (failed > 0) {
-    message.warning(`批量接管完成：成功 ${success}，失败 ${failed}`);
-  } else {
-    message.success(`已接管 ${success} 个远端站点`);
-  }
-}
-
-function setRemoteImportTarget(entryKey: string, credentialId: number | null) {
-  remoteImportTargets.value = {
-    ...remoteImportTargets.value,
-    [entryKey]: credentialId,
-  };
-}
-
-function toggleRemoteAccelerationSelection(entryKey: string, checked: boolean) {
-  if (checked) {
-    selectedRemoteAccelerationKeys.value = Array.from(new Set([...selectedRemoteAccelerationKeys.value, entryKey]));
-    return;
-  }
-  selectedRemoteAccelerationKeys.value = selectedRemoteAccelerationKeys.value.filter((item) => item !== entryKey);
-}
-
 // Refresh
 async function handleRefresh() {
   const taskId = startLocalSyncTask({
@@ -1582,21 +1239,6 @@ const columns = computed<DataTableColumns<Domain>>(() => {
     },
   );
 
-  if (!isEsaPanel.value) {
-    cols.push({
-      title: '加速',
-      key: 'acceleration',
-      width: 110,
-      render(row) {
-        return h(NTag, {
-          type: getAccelerationType(row),
-          size: 'small',
-          bordered: false,
-        }, () => getAccelerationBadge(row));
-      },
-    });
-  }
-
   cols.push(
     {
       title: '更新时间',
@@ -1760,12 +1402,6 @@ watch(domains, (list) => {
         </button>
         <button class="bento-chip" :class="{ 'bento-chip-active': quickFilter === 'issue' }" @click="quickFilter = 'issue'">
           异常状态 ({{ issueDomainCount }})
-        </button>
-        <button class="bento-chip" :class="{ 'bento-chip-active': quickFilter === 'accelerated' }" @click="quickFilter = 'accelerated'">
-          已加速 ({{ acceleratedDomainCount }})
-        </button>
-        <button class="bento-chip" :class="{ 'bento-chip-active': quickFilter === 'takeover' }" @click="quickFilter = 'takeover'">
-          待接管 ({{ takeoverDomainCount }})
         </button>
       </div>
     </section>
@@ -1940,7 +1576,6 @@ watch(domains, (list) => {
           <template #icon><Trash2 :size="14" /></template>
           批量删除
         </NButton>
-        <NButton size="small" secondary @click="showAccelerationCenter = true">加速中心</NButton>
         <NButton size="small" secondary @click="showSyncCenter = true">同步任务</NButton>
         <NButton size="small" secondary @click="showAlertCenter = true">告警中心</NButton>
         <NButton size="small" secondary @click="showAuditCenter = true">变更审计</NButton>
@@ -2027,9 +1662,6 @@ watch(domains, (list) => {
               <NTag size="small" :bordered="false">{{ computeDomainHealthScore(domain) }}</NTag>
               <NTag :type="getStatusType(domain.status)" size="small" :bordered="false">
                 {{ domain.status }}
-              </NTag>
-              <NTag v-if="!isEsaPanel" :type="getAccelerationType(domain)" size="small" :bordered="false">
-                {{ getAccelerationBadge(domain) }}
               </NTag>
             </div>
           </div>
@@ -2122,154 +1754,6 @@ watch(domains, (list) => {
         </div>
       </article>
     </section>
-
-    <NDrawer v-model:show="showAccelerationCenter" placement="right" :width="760" :trap-focus="true">
-      <div class="h-full overflow-y-auto p-4">
-        <h3 class="text-base font-bold text-slate-700">加速中心</h3>
-        <p class="mt-1 text-xs text-slate-500">统一管理 EdgeOne 远端站点、本地接管状态、暂停恢复和远端删除</p>
-
-        <div class="mt-4 flex flex-wrap gap-2">
-          <NButton size="small" secondary @click="refetchRemoteAccelerationSites()">
-            刷新远端站点
-          </NButton>
-          <NButton
-            size="small"
-            secondary
-            :loading="syncAllAccelerationsMutation.isPending.value"
-            @click="syncAllAccelerationsMutation.mutate()"
-          >
-            同步全部配置
-          </NButton>
-          <NButton
-            size="small"
-            type="primary"
-            :disabled="selectedRemoteAccelerationEntries.filter((item) => !item.localConfig).length === 0"
-            :loading="importRemoteAccelerationMutation.isPending.value"
-            @click="handleBatchImportRemoteAccelerations"
-          >
-            批量接管
-          </NButton>
-          <NButton size="small" secondary @click="showAddAccelerationCredential = true">
-            新增加速账户
-          </NButton>
-        </div>
-
-        <div v-if="!accelerationCredentials.length" class="panel-muted mt-4 p-4">
-          <p class="text-sm font-semibold text-slate-700">暂无可用的加速账户</p>
-          <p class="mt-1 text-xs text-slate-500">先添加 EdgeOne 账户，才能查询和接管远端站点。</p>
-        </div>
-
-        <div v-else-if="remoteAccelerationEntries.length === 0" class="panel-muted mt-4 p-4">
-          <p class="text-sm font-semibold text-slate-700">未发现远端站点</p>
-          <p class="mt-1 text-xs text-slate-500">当前 EdgeOne 账户下还没有可管理的远端加速站点。</p>
-        </div>
-
-        <div v-else class="mt-4 space-y-3">
-          <div
-            v-for="entry in remoteAccelerationEntries"
-            :key="entry.key"
-            class="panel-muted p-4"
-          >
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div class="flex items-start gap-3">
-                <NCheckbox
-                  :checked="selectedRemoteAccelerationKeys.includes(entry.key)"
-                  :disabled="Boolean(entry.localConfig)"
-                  @update:checked="(checked) => toggleRemoteAccelerationSelection(entry.key, checked)"
-                />
-                <div>
-                  <p class="text-sm font-semibold text-slate-700">{{ entry.zoneName }}</p>
-                  <p class="mt-1 text-xs text-slate-500">
-                    {{ entry.item.pluginCredentialName }} · Site {{ entry.item.site.remoteSiteId || '-' }} · {{ entry.item.site.accessType || 'partial' }}
-                  </p>
-                </div>
-              </div>
-              <div class="flex flex-wrap gap-2">
-                <NTag size="small" :bordered="false" :type="entry.item.site.verified ? 'success' : 'warning'">
-                  {{ entry.item.site.verified ? '已验证' : (entry.item.site.paused ? '已暂停' : '待验证') }}
-                </NTag>
-                <NTag size="small" :bordered="false">
-                  {{ entry.item.site.siteStatus || 'unknown' }}
-                </NTag>
-                <NTag v-if="entry.localConfig" size="small" :bordered="false" type="success">
-                  已接管
-                </NTag>
-              </div>
-            </div>
-
-            <div class="mt-3 grid gap-3 md:grid-cols-3">
-              <div>
-                <p class="text-xs text-slate-500">本地绑定</p>
-                <p class="mt-1 text-sm text-slate-700">
-                  {{ entry.localConfig ? `DNS 账户 #${entry.localConfig.dnsCredentialId}` : '尚未接管' }}
-                </p>
-              </div>
-              <div>
-                <p class="text-xs text-slate-500">区域 / 套餐</p>
-                <p class="mt-1 text-sm text-slate-700">{{ entry.item.site.area || 'global' }} / {{ entry.item.site.planId || '默认' }}</p>
-              </div>
-              <div>
-                <p class="text-xs text-slate-500">匹配 DNS 域名</p>
-                <p class="mt-1 text-sm text-slate-700">{{ entry.matches.length ? `${entry.matches.length} 个候选账户` : '未匹配到本地域名' }}</p>
-              </div>
-            </div>
-
-            <div v-if="!entry.localConfig" class="mt-3">
-              <NSelect
-                :value="entry.selectedDnsCredentialId"
-                size="small"
-                :options="entry.dnsOptions"
-                placeholder="选择要绑定的 DNS 账户"
-                @update:value="(value) => setRemoteImportTarget(entry.key, value == null ? null : Number(value))"
-              />
-            </div>
-
-            <div class="mt-3 flex flex-wrap gap-2">
-              <NButton
-                v-if="!entry.localConfig"
-                size="small"
-                type="primary"
-                :disabled="!entry.selectedDnsCredentialId"
-                :loading="importRemoteAccelerationMutation.isPending.value"
-                @click="importRemoteAccelerationMutation.mutate(entry.key)"
-              >
-                接管站点
-              </NButton>
-              <NButton
-                v-if="entry.localConfig"
-                size="small"
-                secondary
-                :loading="syncSingleAccelerationMutation.isPending.value"
-                @click="syncSingleAccelerationMutation.mutate(entry.key)"
-              >
-                刷新本地
-              </NButton>
-              <NButton
-                size="small"
-                secondary
-                :loading="accelerationSiteStatusMutation.isPending.value"
-                @click="accelerationSiteStatusMutation.mutate({ entryKey: entry.key, enabled: Boolean(entry.item.site.paused) })"
-              >
-                {{ entry.item.site.paused ? '恢复站点' : '暂停站点' }}
-              </NButton>
-              <NButton
-                size="small"
-                tertiary
-                type="error"
-                :loading="deleteRemoteAccelerationMutation.isPending.value"
-                @click="deleteRemoteAccelerationMutation.mutate(entry.key)"
-              >
-                删除远端
-              </NButton>
-            </div>
-
-            <div v-if="entry.item.site.verifyRecordName" class="mt-3 rounded-xl bg-white/60 p-3 text-xs text-slate-500">
-              验证记录：{{ entry.item.site.verifyRecordType || 'TXT' }} / {{ entry.item.site.verifyRecordName }} / {{ entry.item.site.verifyRecordValue || '-' }}
-            </div>
-          </div>
-        </div>
-      </div>
-    </NDrawer>
 
     <NDrawer v-model:show="showSyncCenter" placement="right" :width="460" :trap-focus="true">
       <div class="h-full overflow-y-auto p-4">
@@ -2405,10 +1889,6 @@ watch(domains, (list) => {
       v-model:show="showAddCredential"
       :preset-provider="providerStore.selectedProvider"
       @created="refetch"
-    />
-    <AddAccelerationCredentialDialog
-      v-model:show="showAddAccelerationCredential"
-      @created="() => { refetchAccelerationCredentials(); refetchRemoteAccelerationSites(); }"
     />
   </div>
 </template>
