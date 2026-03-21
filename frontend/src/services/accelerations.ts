@@ -82,6 +82,18 @@ export interface AccelerationConfigInput {
   ipv6Status?: string;
 }
 
+export interface AccelerationSiteTarget {
+  zoneName: string;
+  dnsCredentialId?: number;
+  pluginCredentialId?: number;
+  remoteSiteId?: string;
+}
+
+export interface AccelerationSiteResult {
+  config?: DomainAccelerationConfig | null;
+  site?: RemoteAccelerationSite | null;
+}
+
 export interface DiscoveredAccelerationSite {
   pluginCredentialId: number;
   pluginCredentialName: string;
@@ -129,34 +141,28 @@ export async function updateAccelerationConfig(data: {
   return response as unknown as ApiResponse<{ config: DomainAccelerationConfig }>;
 }
 
-export async function verifyAcceleration(data: {
-  zoneName: string;
-  dnsCredentialId: number;
-}): Promise<ApiResponse<{ config: DomainAccelerationConfig }>> {
+export async function verifyAcceleration(
+  data: AccelerationSiteTarget & Partial<AccelerationConfigInput>,
+): Promise<ApiResponse<AccelerationSiteResult>> {
   const response = await api.post('/accelerations/verify', data);
-  return response as unknown as ApiResponse<{ config: DomainAccelerationConfig }>;
+  return response as unknown as ApiResponse<AccelerationSiteResult>;
 }
 
-export async function syncAcceleration(data: {
-  zoneName: string;
-  dnsCredentialId: number;
-}): Promise<ApiResponse<{ config: DomainAccelerationConfig }>> {
+export async function syncAcceleration(
+  data: AccelerationSiteTarget & Partial<AccelerationConfigInput>,
+): Promise<ApiResponse<AccelerationSiteResult>> {
   const response = await api.post('/accelerations/sync', data);
-  return response as unknown as ApiResponse<{ config: DomainAccelerationConfig }>;
+  return response as unknown as ApiResponse<AccelerationSiteResult>;
 }
 
-export async function checkAccelerationCname(data: {
-  zoneName: string;
-  dnsCredentialId: number;
-}): Promise<ApiResponse<{ config: DomainAccelerationConfig; effective: boolean }>> {
+export async function checkAccelerationCname(
+  data: AccelerationSiteTarget & Partial<AccelerationConfigInput>,
+): Promise<ApiResponse<AccelerationSiteResult & { effective: boolean }>> {
   const response = await api.post('/accelerations/check-cname', data);
-  return response as unknown as ApiResponse<{ config: DomainAccelerationConfig; effective: boolean }>;
+  return response as unknown as ApiResponse<AccelerationSiteResult & { effective: boolean }>;
 }
 
-export async function disableAcceleration(data: {
-  zoneName: string;
-  dnsCredentialId: number;
-}): Promise<ApiResponse<{ deleted: boolean }>> {
+export async function disableAcceleration(data: AccelerationSiteTarget): Promise<ApiResponse<{ deleted: boolean }>> {
   const response = await api.post('/accelerations/disable', data);
   return response as unknown as ApiResponse<{ deleted: boolean }>;
 }
@@ -189,24 +195,16 @@ export async function importRemoteAcceleration(data: {
   return response as unknown as ApiResponse<EnableAccelerationResult>;
 }
 
-export async function setAccelerationSiteStatus(data: {
-  zoneName: string;
-  dnsCredentialId?: number;
-  pluginCredentialId?: number;
-  remoteSiteId?: string;
-  enabled: boolean;
-}): Promise<ApiResponse<{ config?: DomainAccelerationConfig; site?: RemoteAccelerationSite }>> {
+export async function setAccelerationSiteStatus(
+  data: AccelerationSiteTarget & { enabled: boolean },
+): Promise<ApiResponse<AccelerationSiteResult>> {
   const response = await api.post('/accelerations/site-status', data);
-  return response as unknown as ApiResponse<{ config?: DomainAccelerationConfig; site?: RemoteAccelerationSite }>;
+  return response as unknown as ApiResponse<AccelerationSiteResult>;
 }
 
 export async function deleteRemoteAcceleration(data: {
-  zoneName: string;
-  dnsCredentialId?: number;
-  pluginCredentialId?: number;
-  remoteSiteId?: string;
   deleteLocalConfig?: boolean;
-}): Promise<ApiResponse<{ deleted: boolean; localDeleted?: boolean }>> {
+} & AccelerationSiteTarget): Promise<ApiResponse<{ deleted: boolean; localDeleted?: boolean }>> {
   const response = await api.post('/accelerations/delete-remote', data);
   return response as unknown as ApiResponse<{ deleted: boolean; localDeleted?: boolean }>;
 }
@@ -214,9 +212,9 @@ export async function deleteRemoteAcceleration(data: {
 export async function syncAllAccelerations(data?: {
   dnsCredentialId?: number;
   pluginCredentialId?: number;
-}): Promise<ApiResponse<{ items: DomainAccelerationConfig[]; errors: Array<{ zoneName: string; dnsCredentialId: number; error: string }>; synced: number; failed: number }>> {
+}): Promise<ApiResponse<{ items: Array<DomainAccelerationConfig | RemoteAccelerationSite>; errors: Array<{ zoneName: string; dnsCredentialId: number; error: string }>; synced: number; failed: number }>> {
   const response = await api.post('/accelerations/sync-all', data || {});
-  return response as unknown as ApiResponse<{ items: DomainAccelerationConfig[]; errors: Array<{ zoneName: string; dnsCredentialId: number; error: string }>; synced: number; failed: number }>;
+  return response as unknown as ApiResponse<{ items: Array<DomainAccelerationConfig | RemoteAccelerationSite>; errors: Array<{ zoneName: string; dnsCredentialId: number; error: string }>; synced: number; failed: number }>;
 }
 
 export async function createAccelerationVerifyRecord(data: {

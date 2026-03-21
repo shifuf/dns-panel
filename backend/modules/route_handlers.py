@@ -3014,6 +3014,27 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             if str((get_provider_capabilities(str(row["provider"] or "").strip().lower()) or {}).get("category") or "dns") == "acceleration"
         ]
 
+    def _serialize_remote_site_item(cred_row: Any, site: Dict[str, Any], provider: str | None = None) -> Dict[str, Any]:
+        provider_name = str(provider or cred_row["provider"] or "").strip().lower()
+        return {
+            "pluginCredentialId": int(cred_row["id"]),
+            "pluginCredentialName": str(cred_row["name"] or f"#{cred_row['id']}"),
+            "pluginProvider": provider_name,
+            "site": site,
+        }
+
+    def _list_remote_site_items(plugin_credential_id: int | None = None, zone_name: str | None = None) -> List[Dict[str, Any]]:
+        normalized_zone = norm_domain(zone_name)
+        items: List[Dict[str, Any]] = []
+        for cred_row in _list_acceleration_credential_rows(plugin_credential_id):
+            plugin_cred_row, provider, plugin = _build_plugin_by_credential(int(cred_row["id"]))
+            for site in plugin.list_sites():
+                zone = norm_domain(site.get("zoneName"))
+                if normalized_zone and zone != normalized_zone:
+                    continue
+                items.append(_serialize_remote_site_item(plugin_cred_row, site, provider))
+        return items
+
     def _refresh_row(row: Any, verify: bool = False) -> Any:
         plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(int(row["pluginCredentialId"]))
         zone_name = str(row["zoneName"] or "")
@@ -3028,6 +3049,52 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             plugin_provider,
             "",
         )
+
+    def _resolve_site_target(source: Any) -> Dict[str, Any]:
+        payload = source if isinstance(source, dict) else {}
+        zone_name = norm_domain(payload.get("zoneName"))
+        dns_credential_id = self._parse_credential_id(payload.get("dnsCredentialId"))
+        plugin_credential_id = self._parse_credential_id(payload.get("pluginCredentialId"))
+        remote_site_id = str(payload.get("remoteSiteId") or "").strip()
+        row = _get_accel_row(dns_credential_id, zone_name) if dns_credential_id and zone_name else None
+        if row:
+            zone_name = zone_name or str(row["zoneName"] or "")
+            plugin_credential_id = plugin_credential_id or int(row["pluginCredentialId"])
+            remote_site_id = remote_site_id or str(row["remoteSiteId"] or "")
+        row_config = _accel_config_from_source(_serialize_row(row) or {}) if row else {}
+        body_config = _accel_config_from_source(payload)
+        if body_config:
+            row_config.update(body_config)
+        if not zone_name:
+            raise ValueError("缺少参数: zoneName")
+        if not plugin_credential_id:
+            raise ValueError("缺少参数: pluginCredentialId")
+        plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
+        return {
+            "row": row,
+            "previous": _serialize_row(row) if row else None,
+            "zone_name": zone_name,
+            "dns_credential_id": int(row["dnsCredentialId"]) if row else dns_credential_id,
+            "plugin_cred_row": plugin_cred_row,
+            "plugin_provider": plugin_provider,
+            "plugin": plugin,
+            "remote_site_id": remote_site_id,
+            "row_config": row_config,
+        }
+
+    def _store_site_state(target: Dict[str, Any], state: Dict[str, Any], last_error: str = "") -> Dict[str, Any] | None:
+        dns_credential_id = target.get("dns_credential_id")
+        if not dns_credential_id:
+            return None
+        row = _upsert_accel_row(
+            int(dns_credential_id),
+            str(target.get("zone_name") or ""),
+            int(target["plugin_cred_row"]["id"]),
+            state,
+            str(target.get("plugin_provider") or ""),
+            last_error,
+        )
+        return _serialize_row(row)
 
     def _resolve_dns_api(dns_credential_id: int):
         dns_row = self._get_credential_row(uid, dns_credential_id)
@@ -3189,19 +3256,13 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             if not zone_name:
                 self._err("缺少参数: zoneName", 400)
                 return
-            found_items = []
+            found_items: List[Dict[str, Any]] = []
             for cred_row in _list_acceleration_credential_rows(plugin_credential_id):
-                provider = str(cred_row["provider"] or "").strip().lower()
-                plugin = build_acceleration_plugin(provider, self._credential_secrets(cred_row))
+                plugin_cred_row, provider, plugin = _build_plugin_by_credential(int(cred_row["id"]))
                 site = plugin.discover_site(zone_name)
                 if not site:
                     continue
-                found_items.append({
-                    "pluginCredentialId": int(cred_row["id"]),
-                    "pluginCredentialName": str(cred_row["name"] or f"#{cred_row['id']}"),
-                    "pluginProvider": provider,
-                    "site": site,
-                })
+                found_items.append(_serialize_remote_site_item(plugin_cred_row, site, provider))
             _write_accel_log("DISCOVER", "SUCCESS", zone_name, new_value={"count": len(found_items), "pluginCredentialId": plugin_credential_id})
             self._ok({"items": found_items}, "获取远端加速站点成功")
             return
@@ -3209,20 +3270,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
         if self.command == "GET" and sub == "/remote-sites":
             plugin_credential_id = self._parse_credential_id(first_or_none(q, "pluginCredentialId"))
             zone_name = norm_domain(first_or_none(q, "zoneName"))
-            all_items = []
-            for cred_row in _list_acceleration_credential_rows(plugin_credential_id):
-                provider = str(cred_row["provider"] or "").strip().lower()
-                plugin = build_acceleration_plugin(provider, self._credential_secrets(cred_row))
-                for site in plugin.list_sites():
-                    zone = norm_domain(site.get("zoneName"))
-                    if zone_name and zone != zone_name:
-                        continue
-                    all_items.append({
-                        "pluginCredentialId": int(cred_row["id"]),
-                        "pluginCredentialName": str(cred_row["name"] or f"#{cred_row['id']}"),
-                        "pluginProvider": provider,
-                        "site": site,
-                    })
+            all_items = _list_remote_site_items(plugin_credential_id, zone_name)
             self._ok({"items": all_items}, "获取远端加速站点列表成功")
             return
 
@@ -3439,183 +3487,106 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             return
 
         if self.command == "POST" and sub == "/verify":
-            zone_name = norm_domain(body.get("zoneName"))
-            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
-            if not zone_name or not dns_credential_id:
-                self._err("缺少参数: zoneName, dnsCredentialId", 400)
-                return
-            row = _get_accel_row(dns_credential_id, zone_name)
-            if not row:
-                self._err("未找到该域名的加速配置", 404)
-                return
-            previous = _serialize_row(row)
-            row = _refresh_row(row, verify=True)
-            _write_accel_log("VERIFY", "SUCCESS", zone_name, old_value=previous, new_value=_serialize_row(row))
-            self._ok({"config": _serialize_row(row)}, "已提交加速验证")
+            target = _resolve_site_target(body)
+            state = target["plugin"].verify_site(target["zone_name"], target["remote_site_id"], target["row_config"] or None)
+            serialized = _store_site_state(target, state)
+            payload = {"config": serialized, "site": state if not serialized else None}
+            _write_accel_log("VERIFY", "SUCCESS", target["zone_name"], old_value=target["previous"], new_value=payload)
+            self._ok(payload, "已提交加速验证")
             return
 
         if self.command == "POST" and sub == "/sync":
-            zone_name = norm_domain(body.get("zoneName"))
-            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
-            if not zone_name or not dns_credential_id:
-                self._err("缺少参数: zoneName, dnsCredentialId", 400)
-                return
-            row = _get_accel_row(dns_credential_id, zone_name)
-            if not row:
-                self._err("未找到该域名的加速配置", 404)
-                return
-            previous = _serialize_row(row)
-            row = _refresh_row(row, verify=False)
-            _write_accel_log("UPDATE", "SUCCESS", zone_name, old_value=previous, new_value=_serialize_row(row))
-            self._ok({"config": _serialize_row(row)}, "加速状态已同步")
+            target = _resolve_site_target(body)
+            state = target["plugin"].get_site(target["zone_name"], target["remote_site_id"], target["row_config"] or None)
+            serialized = _store_site_state(target, state)
+            payload = {"config": serialized, "site": state if not serialized else None}
+            _write_accel_log("UPDATE", "SUCCESS", target["zone_name"], old_value=target["previous"], new_value=payload)
+            self._ok(payload, "加速状态已同步")
             return
 
         if self.command == "POST" and sub == "/check-cname":
-            zone_name = norm_domain(body.get("zoneName"))
-            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
-            if not zone_name or not dns_credential_id:
-                self._err("缺少参数: zoneName, dnsCredentialId", 400)
-                return
-            row = _get_accel_row(dns_credential_id, zone_name)
-            if not row:
-                self._err("未找到该域名的加速配置", 404)
-                return
-            previous = _serialize_row(row)
-            row = _refresh_row(row, verify=False)
-            serialized = _serialize_row(row)
-            effective = bool(serialized and (serialized.get("verified") or str(serialized.get("domainStatus") or "").strip().lower() in {"online", "active"}))
-            _write_accel_log("VERIFY", "SUCCESS", zone_name, old_value=previous, new_value=serialized)
-            self._ok({"config": serialized, "effective": effective}, "CNAME 生效状态已刷新")
+            target = _resolve_site_target(body)
+            state = target["plugin"].get_site(target["zone_name"], target["remote_site_id"], target["row_config"] or None)
+            serialized = _store_site_state(target, state)
+            site_data = serialized or state
+            effective = bool(site_data and (site_data.get("verified") or str(site_data.get("domainStatus") or "").strip().lower() in {"online", "active"}))
+            payload = {"config": serialized, "site": state if not serialized else None, "effective": effective}
+            _write_accel_log("VERIFY", "SUCCESS", target["zone_name"], old_value=target["previous"], new_value=payload)
+            self._ok(payload, "CNAME 生效状态已刷新")
             return
 
         if self.command == "POST" and sub == "/sync-all":
             dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
             plugin_credential_id = self._parse_credential_id(body.get("pluginCredentialId"))
-            sql = "SELECT * FROM domain_accelerations WHERE userId = ?"
-            params: List[Any] = [uid]
-            if dns_credential_id:
-                sql += " AND dnsCredentialId = ?"
-                params.append(dns_credential_id)
-            if plugin_credential_id:
-                sql += " AND pluginCredentialId = ?"
-                params.append(plugin_credential_id)
-            sql += " ORDER BY updatedAt DESC, id DESC"
-            with conn() as c:
-                rows = c.execute(sql, params).fetchall()
-
-            items = []
+            rows: list[Dict[str, Any]] = []
             errors = []
-            for row in rows:
+            for item in _list_remote_site_items(plugin_credential_id):
+                site = item.get("site") if isinstance(item.get("site"), dict) else {}
+                target_body = {
+                    "zoneName": site.get("zoneName"),
+                    "pluginCredentialId": item.get("pluginCredentialId"),
+                    "remoteSiteId": site.get("remoteSiteId"),
+                }
                 try:
-                    refreshed = _refresh_row(row, verify=False)
-                    items.append(_serialize_row(refreshed))
+                    target = _resolve_site_target(target_body)
+                    if dns_credential_id and target.get("dns_credential_id") != dns_credential_id:
+                        continue
+                    state = target["plugin"].get_site(target["zone_name"], target["remote_site_id"], target["row_config"] or None)
+                    serialized = _store_site_state(target, state)
+                    rows.append(serialized or state)
                 except Exception as exc:
                     errors.append({
-                        "zoneName": str(row["zoneName"] or ""),
-                        "dnsCredentialId": int(row["dnsCredentialId"]),
+                        "zoneName": str(site.get("zoneName") or ""),
+                        "dnsCredentialId": int(dns_credential_id or 0),
                         "error": str(exc),
                     })
             _write_accel_log(
                 "UPDATE",
                 "SUCCESS" if not errors else "FAILED",
                 "*",
-                new_value={"synced": len(items), "failed": len(errors), "dnsCredentialId": dns_credential_id, "pluginCredentialId": plugin_credential_id},
+                new_value={"synced": len(rows), "failed": len(errors), "dnsCredentialId": dns_credential_id, "pluginCredentialId": plugin_credential_id},
                 error_message=errors[0]["error"] if errors else None,
             )
-            self._ok({"items": items, "errors": errors, "synced": len(items), "failed": len(errors)}, "加速配置批量同步完成")
+            self._ok({"items": rows, "errors": errors, "synced": len(rows), "failed": len(errors)}, "远端加速站点批量同步完成")
             return
 
         if self.command == "POST" and sub == "/site-status":
-            zone_name = norm_domain(body.get("zoneName"))
-            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
-            plugin_credential_id = self._parse_credential_id(body.get("pluginCredentialId"))
-            remote_site_id = str(body.get("remoteSiteId") or "").strip()
+            target = _resolve_site_target(body)
             enabled_raw = body.get("enabled")
             if enabled_raw is None and "paused" in body:
                 enabled_raw = not self._parse_bool(body.get("paused"))
             enabled = self._parse_bool(enabled_raw) if enabled_raw is not None else False
-
-            row = _get_accel_row(dns_credential_id, zone_name) if dns_credential_id and zone_name else None
-            row_config: Dict[str, Any] = {}
-            if row:
-                plugin_credential_id = int(row["pluginCredentialId"])
-                remote_site_id = remote_site_id or str(row["remoteSiteId"] or "")
-                zone_name = zone_name or str(row["zoneName"] or "")
-                row_config = _accel_config_from_source(_serialize_row(row) or {})
-            else:
-                row_config = _accel_config_from_source(body)
-            if not zone_name or not plugin_credential_id:
-                self._err("缺少参数: zoneName, pluginCredentialId", 400)
-                return
-
-            plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-            state = plugin.set_site_status(zone_name, remote_site_id, enabled, row_config or None)
-            if row:
-                previous = _serialize_row(row)
-                row = _upsert_accel_row(
-                    int(row["dnsCredentialId"]),
-                    zone_name,
-                    int(plugin_cred_row["id"]),
-                    state,
-                    plugin_provider,
-                    "",
-                )
-                serialized = _serialize_row(row)
-                _write_accel_log("UPDATE", "SUCCESS", zone_name, old_value=previous, new_value=serialized)
-                self._ok({"config": serialized}, "加速站点状态已更新")
-                return
-
-            _write_accel_log("UPDATE", "SUCCESS", zone_name, new_value={"site": state, "enabled": enabled})
-            self._ok({"site": state}, "远端加速站点状态已更新")
+            state = target["plugin"].set_site_status(target["zone_name"], target["remote_site_id"], enabled, target["row_config"] or None)
+            serialized = _store_site_state(target, state)
+            payload = {"config": serialized, "site": state if not serialized else None}
+            _write_accel_log("UPDATE", "SUCCESS", target["zone_name"], old_value=target["previous"], new_value=payload)
+            self._ok(payload, "加速站点状态已更新")
             return
 
         if self.command == "POST" and sub == "/delete-remote":
-            zone_name = norm_domain(body.get("zoneName"))
-            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
-            plugin_credential_id = self._parse_credential_id(body.get("pluginCredentialId"))
-            remote_site_id = str(body.get("remoteSiteId") or "").strip()
+            target = _resolve_site_target(body)
             delete_local_raw = body.get("deleteLocalConfig", True)
             delete_local = True if delete_local_raw is True else self._parse_bool(delete_local_raw)
-
-            row = _get_accel_row(dns_credential_id, zone_name) if dns_credential_id and zone_name else None
-            row_config: Dict[str, Any] = {}
-            if row:
-                plugin_credential_id = int(row["pluginCredentialId"])
-                remote_site_id = remote_site_id or str(row["remoteSiteId"] or "")
-                zone_name = zone_name or str(row["zoneName"] or "")
-                row_config = _accel_config_from_source(_serialize_row(row) or {})
-            else:
-                row_config = _accel_config_from_source(body)
-            if not zone_name or not plugin_credential_id:
-                self._err("缺少参数: zoneName, pluginCredentialId", 400)
-                return
-
-            _plugin_cred_row, _plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-            plugin.delete_site(zone_name, remote_site_id, row_config or None)
-
+            target["plugin"].delete_site(target["zone_name"], target["remote_site_id"], target["row_config"] or None)
             local_deleted = False
-            if row and delete_local:
-                local_deleted = _delete_accel_row(int(row["dnsCredentialId"]), zone_name)
+            if target["row"] and delete_local and target.get("dns_credential_id"):
+                local_deleted = _delete_accel_row(int(target["dns_credential_id"]), target["zone_name"])
             _write_accel_log(
                 "DELETE",
                 "SUCCESS",
-                zone_name,
-                old_value=_serialize_row(row) if row else None,
-                new_value={"remoteDeleted": True, "localDeleted": local_deleted, "remoteSiteId": remote_site_id},
+                target["zone_name"],
+                old_value=target["previous"],
+                new_value={"remoteDeleted": True, "localDeleted": local_deleted, "remoteSiteId": target["remote_site_id"]},
             )
             self._ok({"deleted": True, "localDeleted": local_deleted}, "远端加速站点已删除")
             return
 
         if self.command == "POST" and sub == "/disable":
-            zone_name = norm_domain(body.get("zoneName"))
-            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
-            if not zone_name or not dns_credential_id:
-                self._err("缺少参数: zoneName, dnsCredentialId", 400)
-                return
-            old_row = _get_accel_row(dns_credential_id, zone_name)
-            _delete_accel_row(dns_credential_id, zone_name)
-            _write_accel_log("DELETE", "SUCCESS", zone_name, old_value=_serialize_row(old_row) if old_row else None, new_value={"deleted": True})
-            self._ok({"deleted": True}, "已移除加速配置")
+            target = _resolve_site_target(body)
+            if target["row"] and target.get("dns_credential_id"):
+                _delete_accel_row(int(target["dns_credential_id"]), target["zone_name"])
+            _write_accel_log("DELETE", "SUCCESS", target["zone_name"], old_value=target["previous"], new_value={"deleted": True, "remoteDeleted": False})
+            self._ok({"deleted": True}, "已移除本地缓存配置")
             return
     except (AccelerationPluginError, TencentEdgeOneApiError, ValueError) as exc:
         zone_name_for_log = norm_domain(body.get("zoneName") or first_or_none(q, "zoneName"))
