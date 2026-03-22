@@ -395,6 +395,8 @@ const importRemoteMutation = useMutation({
       dnsCredentialId: row.selectedDnsCredentialId,
       pluginCredentialId: row.item.pluginCredentialId,
       remoteSiteId: row.item.site.remoteSiteId,
+      accelerationDomain: row.item.site.accelerationDomain,
+      subDomain: row.item.site.subDomain,
       autoDnsRecord: true,
     });
   },
@@ -494,6 +496,8 @@ async function syncExistingRemoteSites() {
       dnsCredentialId: Number(row.selectedDnsCredentialId),
       pluginCredentialId: row.item.pluginCredentialId,
       remoteSiteId: row.item.site.remoteSiteId,
+      accelerationDomain: row.item.site.accelerationDomain,
+      subDomain: row.item.site.subDomain,
       autoDnsRecord: true,
     }),
   });
@@ -750,6 +754,8 @@ async function batchImportFilteredRemote() {
       dnsCredentialId: Number(row.selectedDnsCredentialId),
       pluginCredentialId: row.item.pluginCredentialId,
       remoteSiteId: row.item.site.remoteSiteId,
+      accelerationDomain: row.item.site.accelerationDomain,
+      subDomain: row.item.site.subDomain,
       autoDnsRecord: true,
     }),
   });

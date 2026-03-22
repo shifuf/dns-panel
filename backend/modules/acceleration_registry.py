@@ -96,47 +96,48 @@ class TencentEdgeOneAccelerationPlugin:
         config: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         verification = verification or {}
+        domain_data = domain if isinstance(domain, dict) else {}
         fallback_domain = self._resolve_target_domain(zone_name, config) if config else str(zone_name)
-        acceleration_domain = str(domain.get("domainName") or fallback_domain) if domain else fallback_domain
+        acceleration_domain = str(domain_data.get("domainName") or fallback_domain) if domain_data else fallback_domain
         site_status = str(zone.get("status") or "unknown")
-        domain_status = str(domain.get("domainStatus") or site_status) if domain else site_status
+        domain_status = str(domain_data.get("domainStatus") or site_status) if domain_data else site_status
         verify_status = str(
-            domain.get("identificationStatus")
-            or domain.get("cnameStatus")
+            domain_data.get("identificationStatus")
+            or domain_data.get("cnameStatus")
             or zone.get("verifyStatus")
             or domain_status
-        ) if domain else str(zone.get("verifyStatus") or site_status)
+        ) if domain_data else str(zone.get("verifyStatus") or site_status)
         return {
             "provider": self.provider,
             "remoteSiteId": str(zone.get("siteId") or ""),
             "zoneName": str(zone.get("zoneName") or zone_name),
             "siteStatus": site_status,
             "verifyStatus": verify_status,
-            "verified": bool(domain.get("verified")) if domain else bool(zone.get("verified")),
-            "paused": bool(domain.get("paused")) if domain else bool(zone.get("paused")),
+            "verified": bool(domain_data.get("verified")) if domain_data else bool(zone.get("verified")),
+            "paused": bool(domain_data.get("paused")) if domain_data else bool(zone.get("paused")),
             "accessType": str(zone.get("type") or "partial"),
             "area": str(zone.get("area") or "global"),
             "planId": str(zone.get("planId") or self._secrets.get("planId") or ""),
             "accelerationDomain": acceleration_domain,
             "subDomain": self._sub_domain(str(zone.get("zoneName") or zone_name), acceleration_domain),
             "domainStatus": domain_status,
-            "identificationStatus": str(domain.get("identificationStatus") or verify_status) if domain else verify_status,
-            "cnameTarget": str(domain.get("cnameTarget") or ""),
-            "cnameStatus": str(domain.get("cnameStatus") or verify_status) if domain else verify_status,
-            "originType": str(domain.get("originType") or "IP_DOMAIN"),
-            "originValue": str(domain.get("originValue") or ""),
-            "backupOriginValue": str(domain.get("backupOriginValue") or ""),
-            "hostHeader": str(domain.get("hostHeader") or ""),
-            "originProtocol": str(domain.get("originProtocol") or "FOLLOW"),
-            "httpOriginPort": int(domain.get("httpOriginPort") or 80),
-            "httpsOriginPort": int(domain.get("httpsOriginPort") or 443),
-            "ipv6Status": str(domain.get("ipv6Status") or "follow"),
-            "verifyRecordName": str(verification.get("recordName") or domain.get("verifyRecordName") or "") if domain else str(verification.get("recordName") or ""),
-            "verifyRecordType": str(verification.get("recordType") or domain.get("verifyRecordType") or "TXT") if domain else str(verification.get("recordType") or "TXT"),
-            "verifyRecordValue": str(verification.get("recordValue") or domain.get("verifyRecordValue") or "") if domain else str(verification.get("recordValue") or ""),
+            "identificationStatus": str(domain_data.get("identificationStatus") or verify_status) if domain_data else verify_status,
+            "cnameTarget": str(domain_data.get("cnameTarget") or ""),
+            "cnameStatus": str(domain_data.get("cnameStatus") or verify_status) if domain_data else verify_status,
+            "originType": str(domain_data.get("originType") or "IP_DOMAIN"),
+            "originValue": str(domain_data.get("originValue") or ""),
+            "backupOriginValue": str(domain_data.get("backupOriginValue") or ""),
+            "hostHeader": str(domain_data.get("hostHeader") or ""),
+            "originProtocol": str(domain_data.get("originProtocol") or "FOLLOW"),
+            "httpOriginPort": int(domain_data.get("httpOriginPort") or 80),
+            "httpsOriginPort": int(domain_data.get("httpsOriginPort") or 443),
+            "ipv6Status": str(domain_data.get("ipv6Status") or "follow"),
+            "verifyRecordName": str(verification.get("recordName") or domain_data.get("verifyRecordName") or ""),
+            "verifyRecordType": str(verification.get("recordType") or domain_data.get("verifyRecordType") or "TXT"),
+            "verifyRecordValue": str(verification.get("recordValue") or domain_data.get("verifyRecordValue") or ""),
             "raw": {
                 "zone": zone.get("raw") if isinstance(zone.get("raw"), dict) else zone,
-                "domain": domain.get("raw") if isinstance(domain and domain.get("raw"), dict) else domain,
+                "domain": domain_data.get("raw") if isinstance(domain_data.get("raw"), dict) else domain,
             },
         }
 

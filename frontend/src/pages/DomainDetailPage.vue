@@ -291,7 +291,7 @@ function getAccelerationComparableDomain(
   return normalizeAccelerationState(site?.accelerationDomain || site?.zoneName);
 }
 
-const accelerationStatusMeta = computed(() =>
+const accelerationStatusDisplay = computed(() =>
   getAccelerationStatusMeta(accelerationConfig.value, { lastError: accelerationConfig.value?.lastError }),
 );
 
@@ -443,6 +443,8 @@ const currentAccelerationTarget = computed(() => ({
   dnsCredentialId: accelerationConfig.value?.dnsCredentialId || (typeof credentialId.value === 'number' ? credentialId.value : undefined),
   pluginCredentialId: selectedDiscoveredSite.value?.pluginCredentialId || accelerationConfig.value?.pluginCredentialId || selectedAccelerationCredentialId.value || undefined,
   remoteSiteId: effectiveAccelerationView.value?.site.remoteSiteId || accelerationConfig.value?.remoteSiteId || undefined,
+  accelerationDomain: effectiveAccelerationView.value?.site.accelerationDomain || accelerationConfig.value?.accelerationDomain || undefined,
+  subDomain: effectiveAccelerationView.value?.site.subDomain || accelerationConfig.value?.subDomain || undefined,
 }));
 
 const canEnableAccelerationWhenAddingRecord = computed(() =>
