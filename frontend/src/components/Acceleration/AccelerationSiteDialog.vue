@@ -202,11 +202,19 @@ function handleSubmit() {
 
       <div class="grid gap-4 md:grid-cols-2">
         <NFormItem label="子域名前缀" :show-feedback="false">
-          <NInput v-model:value="form.subDomain" placeholder="@ / www / api" />
+          <NInput
+            v-model:value="form.subDomain"
+            :disabled="mode === 'edit'"
+            placeholder="@ / www / api"
+          />
         </NFormItem>
         <NFormItem label="加速域名预览" :show-feedback="false">
           <NInput :value="accelerationDomainPreview" readonly />
         </NFormItem>
+      </div>
+
+      <div v-if="mode === 'edit'" class="rounded-2xl border border-amber-200 bg-amber-50/80 px-4 py-3 text-xs text-amber-800">
+        编辑模式下不允许直接修改子域名前缀。若需要更换加速子域，请新建一条记录后再删除旧记录。
       </div>
 
       <div class="grid gap-4 md:grid-cols-2">

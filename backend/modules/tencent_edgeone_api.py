@@ -482,9 +482,6 @@ class TencentEdgeOneApi:
             https_port = 443
         info["HttpOriginPort"] = http_port
         info["HttpsOriginPort"] = https_port
-        origin_protocol = str(config.get("originProtocol") or "FOLLOW").strip().upper()
-        if origin_protocol:
-            info["OriginProtocol"] = origin_protocol
         return info
 
     @staticmethod

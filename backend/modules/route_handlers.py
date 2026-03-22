@@ -2869,29 +2869,124 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             "updatedAt": row["updatedAt"],
         }
 
-    def _get_accel_row(dns_credential_id: int, zone_name: str) -> Any:
-        with conn() as c:
-            return c.execute(
-                """
-                SELECT *
-                FROM domain_accelerations
-                WHERE userId = ? AND dnsCredentialId = ? AND zoneName = ?
-                ORDER BY createdAt DESC, id DESC
-                LIMIT 1
-                """,
-                (uid, dns_credential_id, zone_name),
-            ).fetchone()
+    def _normalize_acceleration_domain(zone_name: str, source: Any) -> str:
+        zone = norm_domain(zone_name)
+        if not zone or not isinstance(source, dict):
+            return ""
+        explicit = norm_domain(source.get("accelerationDomain"))
+        if explicit:
+            return explicit
+        sub_domain = str(source.get("subDomain") or "").strip().lower().rstrip(".")
+        if not sub_domain:
+            return ""
+        if sub_domain == "@":
+            return zone
+        if sub_domain.endswith(f".{zone}"):
+            return sub_domain
+        return f"{sub_domain}.{zone}"
 
-    def _delete_accel_row(dns_credential_id: int, zone_name: str) -> bool:
+    def _list_accel_rows(
+        dns_credential_id: int | None = None,
+        zone_name: str | None = None,
+        *,
+        acceleration_domain: str | None = None,
+        plugin_provider: str | None = None,
+        plugin_credential_id: int | None = None,
+        remote_site_id: str | None = None,
+    ) -> List[Any]:
+        sql = "SELECT * FROM domain_accelerations WHERE userId = ?"
+        params: List[Any] = [uid]
+        if dns_credential_id:
+            sql += " AND dnsCredentialId = ?"
+            params.append(int(dns_credential_id))
+        if zone_name:
+            sql += " AND zoneName = ?"
+            params.append(str(zone_name))
+        if acceleration_domain:
+            sql += " AND accelerationDomain = ?"
+            params.append(str(acceleration_domain))
+        if plugin_provider:
+            sql += " AND pluginProvider = ?"
+            params.append(str(plugin_provider))
+        if plugin_credential_id:
+            sql += " AND pluginCredentialId = ?"
+            params.append(int(plugin_credential_id))
+        if remote_site_id:
+            sql += " AND remoteSiteId = ?"
+            params.append(str(remote_site_id))
+        sql += " ORDER BY updatedAt DESC, id DESC"
+        with conn() as c:
+            return c.execute(sql, params).fetchall()
+
+    def _get_accel_row(
+        dns_credential_id: int,
+        zone_name: str,
+        *,
+        acceleration_domain: str = "",
+        plugin_provider: str | None = None,
+        plugin_credential_id: int | None = None,
+        remote_site_id: str = "",
+        allow_fallback_single: bool = True,
+    ) -> Any:
+        exact_rows = _list_accel_rows(
+            dns_credential_id,
+            zone_name,
+            acceleration_domain=acceleration_domain or None,
+            plugin_provider=plugin_provider,
+            plugin_credential_id=plugin_credential_id,
+            remote_site_id=remote_site_id or None,
+        )
+        if exact_rows:
+            return exact_rows[0]
+        if acceleration_domain or not allow_fallback_single:
+            return None
+        fallback_rows = _list_accel_rows(
+            dns_credential_id,
+            zone_name,
+            plugin_provider=plugin_provider,
+            plugin_credential_id=plugin_credential_id,
+            remote_site_id=remote_site_id or None,
+        )
+        return fallback_rows[0] if len(fallback_rows) == 1 else None
+
+    def _delete_accel_row(
+        dns_credential_id: int,
+        zone_name: str,
+        *,
+        acceleration_domain: str = "",
+        plugin_provider: str | None = None,
+        plugin_credential_id: int | None = None,
+        remote_site_id: str = "",
+    ) -> bool:
+        target_row = _get_accel_row(
+            dns_credential_id,
+            zone_name,
+            acceleration_domain=acceleration_domain,
+            plugin_provider=plugin_provider,
+            plugin_credential_id=plugin_credential_id,
+            remote_site_id=remote_site_id,
+        )
+        if not target_row:
+            return False
         with conn() as c:
             result = c.execute(
-                "DELETE FROM domain_accelerations WHERE userId = ? AND dnsCredentialId = ? AND zoneName = ?",
-                (uid, dns_credential_id, zone_name),
+                "DELETE FROM domain_accelerations WHERE userId = ? AND id = ?",
+                (uid, int(target_row["id"])),
             )
             c.commit()
             return int(result.rowcount or 0) > 0
 
-    def _upsert_accel_row(dns_credential_id: int, zone_name: str, plugin_credential_id: int, state: Dict[str, Any], plugin_provider: str, last_error: str = "") -> Any:
+    def _upsert_accel_row(
+        dns_credential_id: int,
+        zone_name: str,
+        plugin_credential_id: int,
+        state: Dict[str, Any],
+        plugin_provider: str,
+        last_error: str = "",
+        *,
+        existing_row_id: int | None = None,
+    ) -> Any:
+        acceleration_domain = norm_domain(state.get("accelerationDomain")) or norm_domain(zone_name)
         with conn() as c:
             c.execute(
                 """
@@ -2903,7 +2998,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                   httpOriginPort, httpsOriginPort, ipv6Status,
                   verifyRecordName, verifyRecordType, verifyRecordValue, lastError, lastSyncedAt, updatedAt
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(userId, dnsCredentialId, zoneName, pluginProvider)
+                ON CONFLICT(userId, dnsCredentialId, zoneName, pluginProvider, accelerationDomain)
                 DO UPDATE SET
                   pluginCredentialId = excluded.pluginCredentialId,
                   remoteSiteId = excluded.remoteSiteId,
@@ -2942,7 +3037,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                     plugin_provider,
                     plugin_credential_id,
                     str(state.get("remoteSiteId") or ""),
-                    str(state.get("accelerationDomain") or ""),
+                    acceleration_domain,
                     str(state.get("subDomain") or "@"),
                     str(state.get("siteStatus") or ""),
                     str(state.get("domainStatus") or ""),
@@ -2974,11 +3069,16 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                 """
                 SELECT *
                 FROM domain_accelerations
-                WHERE userId = ? AND dnsCredentialId = ? AND zoneName = ? AND pluginProvider = ?
+                WHERE userId = ? AND dnsCredentialId = ? AND zoneName = ? AND pluginProvider = ? AND accelerationDomain = ?
                 LIMIT 1
                 """,
-                (uid, dns_credential_id, zone_name, plugin_provider),
+                (uid, dns_credential_id, zone_name, plugin_provider, acceleration_domain),
             ).fetchone()
+            if existing_row_id and row and int(row["id"]) != int(existing_row_id):
+                c.execute(
+                    "DELETE FROM domain_accelerations WHERE userId = ? AND id = ?",
+                    (uid, int(existing_row_id)),
+                )
             c.commit()
         return row
 
@@ -3048,6 +3148,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             state,
             plugin_provider,
             "",
+            existing_row_id=int(row["id"]),
         )
 
     def _resolve_site_target(source: Any) -> Dict[str, Any]:
@@ -3056,7 +3157,18 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
         dns_credential_id = self._parse_credential_id(payload.get("dnsCredentialId"))
         plugin_credential_id = self._parse_credential_id(payload.get("pluginCredentialId"))
         remote_site_id = str(payload.get("remoteSiteId") or "").strip()
-        row = _get_accel_row(dns_credential_id, zone_name) if dns_credential_id and zone_name else None
+        target_acceleration_domain = _normalize_acceleration_domain(zone_name, payload)
+        row = (
+            _get_accel_row(
+                dns_credential_id,
+                zone_name,
+                acceleration_domain=target_acceleration_domain,
+                plugin_credential_id=plugin_credential_id,
+                remote_site_id=remote_site_id,
+            )
+            if dns_credential_id and zone_name
+            else None
+        )
         if row:
             zone_name = zone_name or str(row["zoneName"] or "")
             plugin_credential_id = plugin_credential_id or int(row["pluginCredentialId"])
@@ -3075,6 +3187,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             "previous": _serialize_row(row) if row else None,
             "zone_name": zone_name,
             "dns_credential_id": int(row["dnsCredentialId"]) if row else dns_credential_id,
+            "acceleration_domain": target_acceleration_domain or str((row["accelerationDomain"] if row else "") or ""),
             "plugin_cred_row": plugin_cred_row,
             "plugin_provider": plugin_provider,
             "plugin": plugin,
@@ -3093,6 +3206,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             state,
             str(target.get("plugin_provider") or ""),
             last_error,
+            existing_row_id=int(target["row"]["id"]) if target.get("row") else None,
         )
         return _serialize_row(row)
 
@@ -3233,6 +3347,10 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
         if self.command == "GET" and sub == "/configs":
             dns_credential_id = self._parse_credential_id(first_or_none(q, "dnsCredentialId"))
             zone_name = norm_domain(first_or_none(q, "zoneName"))
+            acceleration_domain = _normalize_acceleration_domain(zone_name, {
+                "accelerationDomain": first_or_none(q, "accelerationDomain"),
+                "subDomain": first_or_none(q, "subDomain"),
+            })
             refresh = self._parse_bool(first_or_none(q, "refresh"))
             sql = "SELECT * FROM domain_accelerations WHERE userId = ?"
             params: List[Any] = [uid]
@@ -3242,11 +3360,14 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             if zone_name:
                 sql += " AND zoneName = ?"
                 params.append(zone_name)
+            if acceleration_domain:
+                sql += " AND accelerationDomain = ?"
+                params.append(acceleration_domain)
             sql += " ORDER BY updatedAt DESC, id DESC"
             with conn() as c:
                 rows = c.execute(sql, params).fetchall()
-            if refresh and zone_name and dns_credential_id and rows:
-                rows = [_refresh_row(rows[0])]
+            if refresh and rows:
+                rows = [_refresh_row(row) for row in rows]
             self._ok({"items": [_serialize_row(row) for row in rows if row]}, "获取加速配置成功")
             return
 
@@ -3284,9 +3405,16 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                 self._err("缺少参数: zoneName, dnsCredentialId, pluginCredentialId", 400)
                 return
 
-            old_row = _get_accel_row(dns_credential_id, zone_name)
-            plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
             accel_config = _accel_config_from_source(body)
+            target_acceleration_domain = _normalize_acceleration_domain(zone_name, body)
+            old_row = _get_accel_row(
+                dns_credential_id,
+                zone_name,
+                acceleration_domain=target_acceleration_domain,
+                plugin_credential_id=plugin_credential_id,
+                allow_fallback_single=not target_acceleration_domain,
+            )
+            plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
             if not accel_config and old_row:
                 accel_config = _accel_config_from_source(_serialize_row(old_row) or {})
             state = plugin.ensure_site(zone_name, accel_config or None)
@@ -3311,6 +3439,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                 state,
                 plugin_provider,
                 dns_errors[0]["error"] if dns_errors else "",
+                existing_row_id=int(old_row["id"]) if old_row else None,
             )
             payload = {
                 "config": _serialize_row(row),
@@ -3335,7 +3464,14 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             if not zone_name or not dns_credential_id:
                 self._err("缺少参数: zoneName, dnsCredentialId", 400)
                 return
-            existing_row = _get_accel_row(dns_credential_id, zone_name)
+            target_acceleration_domain = _normalize_acceleration_domain(zone_name, body)
+            existing_row = _get_accel_row(
+                dns_credential_id,
+                zone_name,
+                acceleration_domain=target_acceleration_domain,
+                plugin_credential_id=plugin_credential_id,
+                allow_fallback_single=not target_acceleration_domain,
+            )
             if existing_row:
                 plugin_credential_id = int(existing_row["pluginCredentialId"])
             if not plugin_credential_id:
@@ -3356,6 +3492,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                 state,
                 plugin_provider,
                 "",
+                existing_row_id=int(existing_row["id"]) if existing_row else None,
             )
             serialized = _serialize_row(row)
             _write_accel_log(
@@ -3379,9 +3516,17 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                 self._err("缺少参数: zoneName, dnsCredentialId, pluginCredentialId", 400)
                 return
 
-            old_row = _get_accel_row(dns_credential_id, zone_name)
-            plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
             accel_config = _accel_config_from_source(body)
+            target_acceleration_domain = _normalize_acceleration_domain(zone_name, body)
+            old_row = _get_accel_row(
+                dns_credential_id,
+                zone_name,
+                acceleration_domain=target_acceleration_domain,
+                plugin_credential_id=plugin_credential_id,
+                remote_site_id=remote_site_id,
+                allow_fallback_single=not target_acceleration_domain,
+            )
+            plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
             if not accel_config and old_row:
                 accel_config = _accel_config_from_source(_serialize_row(old_row) or {})
             state = plugin.get_site(zone_name, remote_site_id, accel_config or None) if remote_site_id else plugin.discover_site(zone_name)
@@ -3409,6 +3554,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                 state,
                 plugin_provider,
                 dns_errors[0]["error"] if dns_errors else "",
+                existing_row_id=int(old_row["id"]) if old_row else None,
             )
             payload = {
                 "config": _serialize_row(row),
@@ -3437,7 +3583,15 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                 self._err("缺少参数: zoneName, dnsCredentialId", 400)
                 return
 
-            row = _get_accel_row(dns_credential_id, zone_name)
+            target_acceleration_domain = _normalize_acceleration_domain(zone_name, body)
+            row = _get_accel_row(
+                dns_credential_id,
+                zone_name,
+                acceleration_domain=target_acceleration_domain,
+                plugin_credential_id=plugin_credential_id,
+                remote_site_id=remote_site_id,
+                allow_fallback_single=not target_acceleration_domain,
+            )
             if row:
                 plugin_credential_id = int(row["pluginCredentialId"])
                 remote_site_id = remote_site_id or str(row["remoteSiteId"] or "")
@@ -3466,6 +3620,7 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                     state,
                     plugin_provider,
                     dns_errors[0]["error"] if dns_errors else "",
+                    existing_row_id=int(row["id"]) if row else None,
                 )
                 serialized = _serialize_row(updated)
             payload = {
@@ -3526,6 +3681,8 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                     "zoneName": site.get("zoneName"),
                     "pluginCredentialId": item.get("pluginCredentialId"),
                     "remoteSiteId": site.get("remoteSiteId"),
+                    "accelerationDomain": site.get("accelerationDomain"),
+                    "subDomain": site.get("subDomain"),
                 }
                 try:
                     target = _resolve_site_target(target_body)
@@ -3570,7 +3727,13 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             target["plugin"].delete_site(target["zone_name"], target["remote_site_id"], target["row_config"] or None)
             local_deleted = False
             if target["row"] and delete_local and target.get("dns_credential_id"):
-                local_deleted = _delete_accel_row(int(target["dns_credential_id"]), target["zone_name"])
+                local_deleted = _delete_accel_row(
+                    int(target["dns_credential_id"]),
+                    target["zone_name"],
+                    acceleration_domain=str(target.get("acceleration_domain") or ""),
+                    plugin_credential_id=int(target["plugin_cred_row"]["id"]),
+                    remote_site_id=str(target.get("remote_site_id") or ""),
+                )
             _write_accel_log(
                 "DELETE",
                 "SUCCESS",
@@ -3584,7 +3747,13 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
         if self.command == "POST" and sub == "/disable":
             target = _resolve_site_target(body)
             if target["row"] and target.get("dns_credential_id"):
-                _delete_accel_row(int(target["dns_credential_id"]), target["zone_name"])
+                _delete_accel_row(
+                    int(target["dns_credential_id"]),
+                    target["zone_name"],
+                    acceleration_domain=str(target.get("acceleration_domain") or ""),
+                    plugin_credential_id=int(target["plugin_cred_row"]["id"]),
+                    remote_site_id=str(target.get("remote_site_id") or ""),
+                )
             _write_accel_log("DELETE", "SUCCESS", target["zone_name"], old_value=target["previous"], new_value={"deleted": True, "remoteDeleted": False})
             self._ok({"deleted": True}, "已移除本地缓存配置")
             return

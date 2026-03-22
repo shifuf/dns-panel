@@ -87,6 +87,7 @@ export interface AccelerationSiteTarget {
   dnsCredentialId?: number;
   pluginCredentialId?: number;
   remoteSiteId?: string;
+  accelerationDomain?: string;
 }
 
 export interface AccelerationSiteResult {

@@ -186,8 +186,8 @@ MIGRATIONS: list[str] = [
         lastError TEXT DEFAULT '',
         lastSyncedAt TEXT,
       createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(userId, dnsCredentialId, zoneName, pluginProvider)
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(userId, dnsCredentialId, zoneName, pluginProvider, accelerationDomain)
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_domain_accelerations_user_zone ON domain_accelerations(userId, zoneName)",

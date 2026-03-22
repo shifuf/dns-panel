@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
 import { NButton, NEmpty, NInput, NSelect, NSpin, NTag, useMessage } from 'naive-ui';
 import { RefreshCw, Plus, Globe, ShieldCheck } from 'lucide-vue-next';
@@ -63,6 +63,7 @@ type AccelerationSiteDialogPayload = AccelerationConfigInput & {
 };
 
 const router = useRouter();
+const route = useRoute();
 const queryClient = useQueryClient();
 const message = useMessage();
 
@@ -184,13 +185,9 @@ const accelerationCredentialOptions = computed(() =>
   })),
 );
 
-const availableCreateDomains = computed(() => {
-  const managedKeys = new Set(localRows.value.map((row) => getLocalKey(row)));
-  return dnsDomains.value.filter((domain) => {
-    const key = `${Number(domain.credentialId || 0)}::${normalizeText(domain.name)}`;
-    return Number(domain.credentialId || 0) > 0 && !managedKeys.has(key);
-  });
-});
+const availableCreateDomains = computed(() =>
+  dnsDomains.value.filter((domain) => Number(domain.credentialId || 0) > 0),
+);
 
 function refreshAccelerationViews() {
   queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
@@ -231,12 +228,26 @@ async function refreshCurrentPageData() {
 }
 
 function getRemoteKey(item: DiscoveredAccelerationSite): string {
-  return `${item.pluginCredentialId}::${normalizeText(item.site.remoteSiteId || item.site.zoneName)}`;
+  return [
+    item.pluginCredentialId,
+    normalizeText(item.site.accelerationDomain || item.site.zoneName),
+    normalizeText(item.site.remoteSiteId || item.site.zoneName),
+  ].join('::');
 }
 
 function getLocalKey(config: DomainAccelerationConfig): string {
-  return `${config.dnsCredentialId}::${normalizeText(config.zoneName)}`;
+  return [
+    config.dnsCredentialId,
+    config.pluginCredentialId,
+    normalizeText(config.accelerationDomain || config.zoneName),
+  ].join('::');
 }
+
+const scopedZoneName = computed(() => normalizeText(route.query.zoneName));
+const scopedDnsCredentialId = computed(() => {
+  const value = Number(route.query.dnsCredentialId || 0);
+  return value > 0 ? value : null;
+});
 
 function getRowStatus(item: {
   verified?: boolean;
@@ -295,6 +306,8 @@ const localRows = computed<LocalAccelerationRow[]>(() =>
 
 const filteredLocalRows = computed(() =>
   localRows.value.filter((row) => {
+    if (scopedZoneName.value && normalizeText(row.zoneName) !== scopedZoneName.value) return false;
+    if (scopedDnsCredentialId.value && row.dnsCredentialId !== scopedDnsCredentialId.value) return false;
     const keyword = normalizeText(localKeyword.value);
     if (keyword && !row.searchText.includes(keyword)) return false;
     if (localStatusFilter.value !== 'all' && row.status !== localStatusFilter.value) return false;
@@ -309,7 +322,9 @@ const remoteRows = computed<RemoteAccelerationRow[]>(() =>
     const zoneName = String(item.site.zoneName || '').trim();
     const key = getRemoteKey(item);
     const localConfig = localRows.value.find((config) =>
-      normalizeText(config.zoneName) === normalizeText(zoneName),
+      config.pluginCredentialId === item.pluginCredentialId
+      && normalizeText(config.zoneName) === normalizeText(zoneName)
+      && normalizeText(config.accelerationDomain || config.zoneName) === normalizeText(item.site.accelerationDomain || item.site.zoneName),
     ) || null;
     const matchingDomains = dnsDomains.value.filter((domain) =>
       normalizeText(domain.name) === normalizeText(zoneName),
@@ -359,6 +374,8 @@ const remoteRows = computed<RemoteAccelerationRow[]>(() =>
 
 const filteredRemoteRows = computed(() =>
   remoteRows.value.filter((row) => {
+    if (scopedZoneName.value && normalizeText(row.zoneName) !== scopedZoneName.value) return false;
+    if (scopedDnsCredentialId.value && row.selectedDnsCredentialId !== scopedDnsCredentialId.value && row.localConfig?.dnsCredentialId !== scopedDnsCredentialId.value) return false;
     const keyword = normalizeText(remoteKeyword.value);
     if (keyword && !row.searchText.includes(keyword)) return false;
     if (remoteStatusFilter.value !== 'all') {
@@ -507,6 +524,7 @@ const syncConfigMutation = useMutation({
   mutationFn: async (config: DomainAccelerationConfig) => syncAcceleration({
     zoneName: config.zoneName,
     dnsCredentialId: config.dnsCredentialId,
+    accelerationDomain: config.accelerationDomain,
   }),
   onSuccess: async () => {
     message.success('加速状态已同步');
@@ -519,6 +537,7 @@ const verifyConfigMutation = useMutation({
   mutationFn: async (config: DomainAccelerationConfig) => verifyAcceleration({
     zoneName: config.zoneName,
     dnsCredentialId: config.dnsCredentialId,
+    accelerationDomain: config.accelerationDomain,
   }),
   onSuccess: async () => {
     message.success('已提交验证');
@@ -531,6 +550,7 @@ const disableConfigMutation = useMutation({
   mutationFn: async (config: DomainAccelerationConfig) => disableAcceleration({
     zoneName: config.zoneName,
     dnsCredentialId: config.dnsCredentialId,
+    accelerationDomain: config.accelerationDomain,
   }),
   onSuccess: async () => {
     message.success('已移除本地配置');
@@ -540,7 +560,7 @@ const disableConfigMutation = useMutation({
 });
 
 const setSiteStatusMutation = useMutation({
-  mutationFn: async (payload: { zoneName: string; dnsCredentialId?: number; pluginCredentialId?: number; remoteSiteId?: string; enabled: boolean }) =>
+  mutationFn: async (payload: { zoneName: string; dnsCredentialId?: number; pluginCredentialId?: number; remoteSiteId?: string; accelerationDomain?: string; enabled: boolean }) =>
     setAccelerationSiteStatus(payload),
   onSuccess: async () => {
     message.success('加速站点状态已更新');
@@ -550,7 +570,7 @@ const setSiteStatusMutation = useMutation({
 });
 
 const deleteRemoteMutation = useMutation({
-  mutationFn: async (payload: { zoneName: string; dnsCredentialId?: number; pluginCredentialId?: number; remoteSiteId?: string; deleteLocalConfig?: boolean }) =>
+  mutationFn: async (payload: { zoneName: string; dnsCredentialId?: number; pluginCredentialId?: number; remoteSiteId?: string; accelerationDomain?: string; deleteLocalConfig?: boolean }) =>
     deleteRemoteAcceleration(payload),
   onSuccess: async () => {
     message.success('远端加速站点已删除');
@@ -575,7 +595,7 @@ const syncAllMutation = useMutation({
 });
 
 const createVerifyRecordMutation = useMutation({
-  mutationFn: async (payload: { zoneName: string; dnsCredentialId: number; pluginCredentialId?: number; remoteSiteId?: string }) =>
+  mutationFn: async (payload: { zoneName: string; dnsCredentialId: number; pluginCredentialId?: number; remoteSiteId?: string; accelerationDomain?: string }) =>
     createAccelerationVerifyRecord(payload),
   onSuccess: async (res) => {
     const added = res.data?.dnsRecordsAdded?.length || 0;
@@ -626,7 +646,10 @@ function openCreateAccelerationDialog() {
   accelerationDialogMode.value = 'create';
   accelerationDialogLockDomain.value = false;
   accelerationDialogLockPluginCredential.value = false;
-  const firstDomain = availableCreateDomains.value[0] || dnsDomains.value[0] || null;
+  const firstDomain = availableCreateDomains.value.find((domain) =>
+    (!scopedZoneName.value || normalizeText(domain.name) === scopedZoneName.value)
+    && (!scopedDnsCredentialId.value || Number(domain.credentialId || 0) === scopedDnsCredentialId.value),
+  ) || availableCreateDomains.value[0] || dnsDomains.value[0] || null;
   accelerationDialogValue.value = {
     zoneName: firstDomain?.name || '',
     dnsCredentialId: Number(firstDomain?.credentialId || 0) || null,
@@ -696,6 +719,7 @@ async function batchSyncFilteredLocal() {
     execute: (row) => syncAcceleration({
       zoneName: row.zoneName,
       dnsCredentialId: row.dnsCredentialId,
+      accelerationDomain: row.accelerationDomain,
     }),
   });
 }
@@ -709,6 +733,7 @@ async function batchVerifyFilteredLocal() {
     execute: (row) => verifyAcceleration({
       zoneName: row.zoneName,
       dnsCredentialId: row.dnsCredentialId,
+      accelerationDomain: row.accelerationDomain,
     }),
   });
 }
@@ -724,6 +749,7 @@ async function batchCreateVerifyRecordsForLocal() {
       dnsCredentialId: row.dnsCredentialId,
       pluginCredentialId: row.pluginCredentialId,
       remoteSiteId: row.remoteSiteId,
+      accelerationDomain: row.accelerationDomain,
     }),
   });
 }
@@ -738,6 +764,7 @@ async function batchSetFilteredLocalStatus(enabled: boolean) {
       zoneName: row.zoneName,
       dnsCredentialId: row.dnsCredentialId,
       remoteSiteId: row.remoteSiteId,
+      accelerationDomain: row.accelerationDomain,
       enabled,
     }),
   });
@@ -776,6 +803,7 @@ async function batchCreateVerifyRecordsForRemote() {
       dnsCredentialId: Number(row.localConfig?.dnsCredentialId || row.selectedDnsCredentialId),
       pluginCredentialId: row.item.pluginCredentialId,
       remoteSiteId: row.item.site.remoteSiteId,
+      accelerationDomain: row.item.site.accelerationDomain,
     }),
   });
 }
@@ -791,6 +819,7 @@ async function batchSetFilteredRemoteStatus(enabled: boolean) {
       dnsCredentialId: row.localConfig?.dnsCredentialId,
       pluginCredentialId: row.item.pluginCredentialId,
       remoteSiteId: row.item.site.remoteSiteId,
+      accelerationDomain: row.item.site.accelerationDomain,
       enabled,
     }),
   });
@@ -815,6 +844,7 @@ async function batchDeleteFilteredRemote() {
       dnsCredentialId: row.localConfig?.dnsCredentialId,
       pluginCredentialId: row.item.pluginCredentialId,
       remoteSiteId: row.item.site.remoteSiteId,
+      accelerationDomain: row.item.site.accelerationDomain,
       deleteLocalConfig: true,
     }),
   });
@@ -856,7 +886,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
             加速
             <span class="gradient-text"> 管理</span>
           </h1>
-          <p class="page-subtitle">集中查看 EdgeOne 已接管列表、远端已有站点、验证接入状态、异常信息以及批量运维动作</p>
+          <p class="page-subtitle">按加速账户集中管理 EdgeOne 加速域名、远端记录、验证状态和批量运维动作</p>
         </div>
         <div class="flex flex-wrap gap-2">
           <NButton
@@ -891,7 +921,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
         <article class="bento-card p-5">
           <p class="text-xs uppercase tracking-widest text-slate-500">已接管</p>
           <p class="mt-3 text-4xl text-slate-800">{{ localManagedCount }}</p>
-          <p class="mt-2 text-xs text-slate-500">已纳入本地管理的加速站点</p>
+          <p class="mt-2 text-xs text-slate-500">已纳管的加速域名记录</p>
         </article>
         <article class="bento-card p-5">
           <p class="text-xs uppercase tracking-widest text-slate-500">已生效</p>
@@ -908,6 +938,10 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
           <p class="mt-3 text-4xl text-amber-600">{{ remoteOnlyCount }}</p>
           <p class="mt-2 text-xs text-slate-500">仅存在于 EdgeOne 远端、尚未接管的站点</p>
         </article>
+      </div>
+
+      <div v-if="scopedZoneName" class="mt-5 rounded-2xl border border-sky-200 bg-sky-50/90 p-4 text-sm text-sky-800">
+        当前仅显示域名 `{{ scopedZoneName }}` 的加速记录。
       </div>
 
       <div
@@ -928,8 +962,8 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
       <div class="flex flex-col gap-4">
         <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
           <div>
-            <p class="bento-section-title">本地加速配置</p>
-            <p class="bento-section-meta">已接管并持久化到面板中的 EdgeOne 站点，支持批量同步、验证、补验证记录和停启用</p>
+            <p class="bento-section-title">加速域名列表</p>
+            <p class="bento-section-meta">已纳管到面板中的 EdgeOne 加速域名，支持新增、编辑、验证、同步、停启用和删除</p>
           </div>
           <p class="text-xs text-slate-500">显示 {{ filteredLocalRows.length }} / {{ localRows.length }} 项</p>
         </div>
@@ -975,8 +1009,8 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
       <div v-if="pageLoading" class="flex justify-center py-16">
         <NSpin size="large" />
       </div>
-      <NEmpty v-else-if="localRows.length === 0" description="暂无本地加速配置" class="py-12" />
-      <NEmpty v-else-if="filteredLocalRows.length === 0" description="没有匹配当前筛选条件的本地加速配置" class="py-12" />
+      <NEmpty v-else-if="localRows.length === 0" description="暂无已纳管的加速域名" class="py-12" />
+      <NEmpty v-else-if="filteredLocalRows.length === 0" description="没有匹配当前筛选条件的加速域名" class="py-12" />
       <div v-else class="mt-4 space-y-3">
         <div v-for="config in filteredLocalRows" :key="config.key" class="panel-muted p-4">
           <div class="flex flex-wrap items-start justify-between gap-3">
@@ -1037,7 +1071,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
                   size="small"
                   secondary
                   :loading="createVerifyRecordMutation.isPending.value"
-                  @click="createVerifyRecordMutation.mutate({ zoneName: config.zoneName, dnsCredentialId: config.dnsCredentialId, pluginCredentialId: config.pluginCredentialId, remoteSiteId: config.remoteSiteId })"
+                  @click="createVerifyRecordMutation.mutate({ zoneName: config.zoneName, dnsCredentialId: config.dnsCredentialId, pluginCredentialId: config.pluginCredentialId, remoteSiteId: config.remoteSiteId, accelerationDomain: config.accelerationDomain })"
                 >
                   自动添加记录
                 </NButton>
@@ -1086,7 +1120,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
               size="small"
               secondary
               :loading="setSiteStatusMutation.isPending.value"
-              @click="setSiteStatusMutation.mutate({ zoneName: config.zoneName, dnsCredentialId: config.dnsCredentialId, remoteSiteId: config.remoteSiteId, enabled: Boolean(config.paused) })"
+              @click="setSiteStatusMutation.mutate({ zoneName: config.zoneName, dnsCredentialId: config.dnsCredentialId, remoteSiteId: config.remoteSiteId, accelerationDomain: config.accelerationDomain, enabled: Boolean(config.paused) })"
             >
               {{ config.paused ? '恢复站点' : '暂停站点' }}
             </NButton>
@@ -1095,7 +1129,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
               tertiary
               type="error"
               :loading="deleteRemoteMutation.isPending.value"
-              @click="deleteRemoteMutation.mutate({ zoneName: config.zoneName, dnsCredentialId: config.dnsCredentialId, remoteSiteId: config.remoteSiteId, deleteLocalConfig: true })"
+              @click="deleteRemoteMutation.mutate({ zoneName: config.zoneName, dnsCredentialId: config.dnsCredentialId, remoteSiteId: config.remoteSiteId, accelerationDomain: config.accelerationDomain, deleteLocalConfig: true })"
             >
               删除远端
             </NButton>
@@ -1111,8 +1145,8 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
       <div class="flex flex-col gap-4">
         <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
           <div>
-            <p class="bento-section-title">远端已有站点</p>
-            <p class="bento-section-meta">EdgeOne 中已经存在但可能尚未接管到面板的站点，支持批量接管、补验证记录、停启用和删除</p>
+            <p class="bento-section-title">账号远端记录</p>
+            <p class="bento-section-meta">加速账户中已存在、但可能尚未接管到面板的远端记录，支持批量接管、补验证记录、停启用和删除</p>
           </div>
           <p class="text-xs text-slate-500">显示 {{ filteredRemoteRows.length }} / {{ remoteRows.length }} 项</p>
         </div>
@@ -1222,7 +1256,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
                   secondary
                   :disabled="!(row.localConfig?.dnsCredentialId || row.selectedDnsCredentialId)"
                   :loading="createVerifyRecordMutation.isPending.value"
-                  @click="createVerifyRecordMutation.mutate({ zoneName: row.zoneName, dnsCredentialId: Number(row.localConfig?.dnsCredentialId || row.selectedDnsCredentialId), pluginCredentialId: row.item.pluginCredentialId, remoteSiteId: row.item.site.remoteSiteId })"
+                  @click="createVerifyRecordMutation.mutate({ zoneName: row.zoneName, dnsCredentialId: Number(row.localConfig?.dnsCredentialId || row.selectedDnsCredentialId), pluginCredentialId: row.item.pluginCredentialId, remoteSiteId: row.item.site.remoteSiteId, accelerationDomain: row.item.site.accelerationDomain })"
                 >
                   自动添加记录
                 </NButton>
@@ -1296,7 +1330,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
               size="small"
               secondary
               :loading="setSiteStatusMutation.isPending.value"
-              @click="setSiteStatusMutation.mutate({ zoneName: row.zoneName, dnsCredentialId: row.localConfig?.dnsCredentialId, pluginCredentialId: row.item.pluginCredentialId, remoteSiteId: row.item.site.remoteSiteId, enabled: Boolean(row.item.site.paused) })"
+              @click="setSiteStatusMutation.mutate({ zoneName: row.zoneName, dnsCredentialId: row.localConfig?.dnsCredentialId, pluginCredentialId: row.item.pluginCredentialId, remoteSiteId: row.item.site.remoteSiteId, accelerationDomain: row.item.site.accelerationDomain, enabled: Boolean(row.item.site.paused) })"
             >
               {{ row.item.site.paused ? '恢复站点' : '暂停站点' }}
             </NButton>
@@ -1305,7 +1339,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
               tertiary
               type="error"
               :loading="deleteRemoteMutation.isPending.value"
-              @click="deleteRemoteMutation.mutate({ zoneName: row.zoneName, dnsCredentialId: row.localConfig?.dnsCredentialId, pluginCredentialId: row.item.pluginCredentialId, remoteSiteId: row.item.site.remoteSiteId, deleteLocalConfig: true })"
+              @click="deleteRemoteMutation.mutate({ zoneName: row.zoneName, dnsCredentialId: row.localConfig?.dnsCredentialId, pluginCredentialId: row.item.pluginCredentialId, remoteSiteId: row.item.site.remoteSiteId, accelerationDomain: row.item.site.accelerationDomain, deleteLocalConfig: true })"
             >
               删除远端
             </NButton>

@@ -2,8 +2,8 @@
 import { ref, computed, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
-import { NAlert, NButton, NSelect, NSpin, NTag, useDialog, useMessage } from 'naive-ui';
-import { Plus, RefreshCw, Globe, ListTree, Activity, Check, Settings, Zap } from 'lucide-vue-next';
+import { NAlert, NButton, NSpin, NTag, useMessage } from 'naive-ui';
+import { Plus, RefreshCw, Globe } from 'lucide-vue-next';
 import {
   getDNSRecords,
   getDNSLines,
@@ -23,12 +23,6 @@ import {
   discoverAccelerationSites,
   enableAcceleration,
   updateAccelerationConfig,
-  verifyAcceleration,
-  syncAcceleration,
-  checkAccelerationCname,
-  disableAcceleration,
-  setAccelerationSiteStatus,
-  deleteRemoteAcceleration,
   type AccelerationConfigInput,
   type DomainAccelerationConfig,
   type DiscoveredAccelerationSite,
@@ -37,29 +31,24 @@ import type { RecordsResponseCapabilities } from '@/services/dns';
 import { useProviderStore } from '@/stores/provider';
 import { useBreadcrumbStore } from '@/stores/breadcrumb';
 import { useCredentialResolver } from '@/composables/useCredentialResolver';
-import { useResponsive } from '@/composables/useResponsive';
 import type { DNSRecord } from '@/types';
 import type { DnsCredential, DnsLine } from '@/types/dns';
 import { normalizeProviderType } from '@/utils/provider';
 import DNSRecordTable from '@/components/DNSRecordTable/DNSRecordTable.vue';
 import QuickAddForm from '@/components/QuickAddForm/QuickAddForm.vue';
 import AddAccelerationCredentialDialog from '@/components/Dashboard/AddAccelerationCredentialDialog.vue';
-import AccelerationConfigDialog from '@/components/Acceleration/AccelerationConfigDialog.vue';
 
 const route = useRoute();
 const router = useRouter();
 const message = useMessage();
-const dialog = useDialog();
 const queryClient = useQueryClient();
 const providerStore = useProviderStore();
 const breadcrumbStore = useBreadcrumbStore();
 const { credentialId } = useCredentialResolver();
-const { isMobile } = useResponsive();
 
 const zoneId = computed(() => route.params.zoneId as string);
 const showAddDialog = ref(false);
 const showAddAccelerationCredential = ref(false);
-const showAccelerationConfig = ref(false);
 const selectedAccelerationCredentialId = ref<number | null>(null);
 
 const capabilities = computed<RecordsResponseCapabilities>(() => {
@@ -278,13 +267,6 @@ function getAccelerationStatusMeta(
   };
 }
 
-function getAccelerationToneClass(type: 'success' | 'warning' | 'error' | 'default') {
-  if (type === 'success') return 'bg-emerald-100 text-emerald-700';
-  if (type === 'error') return 'bg-rose-100 text-rose-700';
-  if (type === 'warning') return 'bg-amber-100 text-amber-700';
-  return 'bg-slate-100 text-slate-600';
-}
-
 function getAccelerationComparableDomain(
   site: Partial<DomainAccelerationConfig | DiscoveredAccelerationSite['site']> | null | undefined,
 ) {
@@ -347,59 +329,12 @@ const effectiveAccelerationView = computed(() => {
   return null;
 });
 
-const accelerationStatusToneClass = computed(() => getAccelerationToneClass(accelerationStatusDisplay.value.type));
-
-const accelerationRemoteMeta = computed(() =>
-  effectiveAccelerationView.value
-    ? getAccelerationStatusMeta(effectiveAccelerationView.value.site, {
-      remote: effectiveAccelerationView.value.source === 'remote',
-      lastError: effectiveAccelerationView.value.source === 'cache' ? accelerationConfig.value?.lastError : undefined,
-    })
-    : null,
-);
-
-const accelerationRemoteToneClass = computed(() =>
-  getAccelerationToneClass(accelerationRemoteMeta.value?.type || 'default'),
-);
-
-const accelerationSiteSummary = computed(() => {
-  const site = effectiveAccelerationView.value?.site;
-  if (!site) return '-';
-  return site.siteStatus || site.domainStatus || site.verifyStatus || '-';
-});
-
-const accelerationFeatureSummary = computed(() => {
-  const site = effectiveAccelerationView.value?.site;
-  if (!site) return '等待远端状态';
-  return `IPv6 ${site.ipv6Status || 'follow'} · ${site.accessType || 'partial'} 接入`;
-});
-
-const accelerationManageActionLabel = computed(() => {
-  if (accelerationConfig.value) return '编辑远端配置';
-  if (selectedDiscoveredSite.value) return '同步远端站点';
-  return '手动配置接入';
-});
-
-const accelerationManageActionPending = computed(() =>
-  !accelerationConfig.value && !!selectedDiscoveredSite.value && enableAccelerationMutation.isPending.value,
-);
-
-const accelerationRefreshPending = computed(() =>
-  accelerationConfig.value ? syncAccelerationMutation.isPending.value : discoveringAcceleration,
-);
-
 const accelerationDomainLabel = computed(() =>
   effectiveAccelerationView.value?.site.accelerationDomain
   || effectiveAccelerationView.value?.site.zoneName
   || zoneName.value
   || '-',
 );
-
-const accelerationHostRecordLabel = computed(() => {
-  const subDomain = String(effectiveAccelerationView.value?.site.subDomain || '').trim();
-  if (!subDomain || subDomain === '@') return '@';
-  return subDomain;
-});
 
 const accelerationOriginSummary = computed(() => {
   const site = effectiveAccelerationView.value?.site;
@@ -409,8 +344,6 @@ const accelerationOriginSummary = computed(() => {
   const httpsPort = site.httpsOriginPort || 443;
   return `${protocol} · HTTP ${httpPort} / HTTPS ${httpsPort}`;
 });
-
-const accelerationSourceTitle = computed(() => '加速账户');
 
 const accelerationSourceDetail = computed(() => {
   const current = effectiveAccelerationView.value;
@@ -429,23 +362,6 @@ const accelerationCnameHint = computed(() => {
     ? '当前 CNAME 已可用于解析接入，可继续观察实际生效情况'
     : '请前往 DNS 服务商添加以下 CNAME 记录，等待解析生效';
 });
-
-const accelerationVerifyHint = computed(() => {
-  const site = effectiveAccelerationView.value?.site;
-  if (!site?.verifyRecordName) return '';
-  return site.verified
-    ? '域名归属验证已通过，保留该记录可避免后续再次校验'
-    : '若未自动写入成功，可手动补录以下验证记录后重新触发验证';
-});
-
-const currentAccelerationTarget = computed(() => ({
-  zoneName: zoneName.value,
-  dnsCredentialId: accelerationConfig.value?.dnsCredentialId || (typeof credentialId.value === 'number' ? credentialId.value : undefined),
-  pluginCredentialId: selectedDiscoveredSite.value?.pluginCredentialId || accelerationConfig.value?.pluginCredentialId || selectedAccelerationCredentialId.value || undefined,
-  remoteSiteId: effectiveAccelerationView.value?.site.remoteSiteId || accelerationConfig.value?.remoteSiteId || undefined,
-  accelerationDomain: effectiveAccelerationView.value?.site.accelerationDomain || accelerationConfig.value?.accelerationDomain || undefined,
-  subDomain: effectiveAccelerationView.value?.site.subDomain || accelerationConfig.value?.subDomain || undefined,
-}));
 
 const canEnableAccelerationWhenAddingRecord = computed(() =>
   accelerationCredentials.value.length > 0 && typeof credentialId.value === 'number' && !!zoneName.value,
@@ -540,233 +456,6 @@ function buildAccelerationConfigFromRecord(params: any): AccelerationConfigInput
     ipv6Status: 'follow',
   };
 }
-
-function openAccelerationConfig() {
-  showAccelerationConfig.value = true;
-}
-
-function confirmTakeOverAccelerationSite() {
-  const site = selectedDiscoveredSite.value;
-  if (!site) return;
-  const targetDomain = site.site.accelerationDomain || site.site.zoneName || zoneName.value;
-  dialog.info({
-    title: '确认同步远端站点',
-    content: `将继续管理 ${targetDomain} 的远端加速站点，并同步展示最新状态。是否继续？`,
-    positiveText: '确认同步',
-    negativeText: '取消',
-    onPositiveClick: () => syncAccelerationMutation.mutate(),
-  });
-}
-
-function confirmAccelerationSiteStatus(enabled: boolean) {
-  const current = effectiveAccelerationView.value;
-  if (!current) return;
-  const targetDomain = current.site.accelerationDomain || current.site.zoneName || zoneName.value;
-  const actionText = enabled ? '恢复' : '暂停';
-  dialog.warning({
-    title: `确认${actionText}站点`,
-    content: `${actionText} ${targetDomain} 后会立即同步到 EdgeOne 远端站点状态，是否继续？`,
-    positiveText: `确认${actionText}`,
-    negativeText: '取消',
-    onPositiveClick: () => accelerationSiteStatusMutation.mutate(enabled),
-  });
-}
-
-function confirmDeleteAccelerationSite() {
-  const current = effectiveAccelerationView.value;
-  if (!current) return;
-  const targetDomain = current.site.accelerationDomain || current.site.zoneName || zoneName.value;
-  dialog.error({
-    title: '确认删除远端站点',
-    content: `删除 ${targetDomain} 后不可恢复，并会清理当前面板中的缓存映射。`,
-    positiveText: '确认删除',
-    negativeText: '取消',
-    onPositiveClick: () => deleteRemoteAccelerationMutation.mutate(),
-  });
-}
-
-function confirmDisableAccelerationConfig() {
-  if (!effectiveAccelerationView.value) return;
-  const targetDomain = effectiveAccelerationView.value.site.accelerationDomain || effectiveAccelerationView.value.site.zoneName || zoneName.value;
-  dialog.warning({
-    title: '确认清理缓存映射',
-    content: `清理后将不再保留 ${targetDomain} 的本地缓存信息，但不会删除远端站点。是否继续？`,
-    positiveText: '确认清理',
-    negativeText: '取消',
-    onPositiveClick: () => disableAccelerationMutation.mutate(),
-  });
-}
-
-function copyText(text: string | undefined) {
-  if (!text) return;
-  navigator.clipboard.writeText(text).then(
-    () => message.success('已复制'),
-    () => message.error('复制失败'),
-  );
-}
-
-const enableAccelerationMutation = useMutation({
-  mutationFn: async (config?: AccelerationConfigInput) => {
-    const pluginCredentialId = selectedAccelerationCredentialId.value;
-    if (!zoneName.value || typeof credentialId.value !== 'number' || !pluginCredentialId) {
-      throw new Error('缺少域名、DNS 凭证或 EdgeOne 凭证');
-    }
-    return enableAcceleration({
-      zoneName: zoneName.value,
-      zoneId: zoneId.value,
-      dnsCredentialId: credentialId.value,
-      pluginCredentialId,
-      autoDnsRecord: true,
-      ...(config || {}),
-    });
-  },
-  onSuccess: async (res) => {
-    const added = res.data?.dnsRecordsAdded || [];
-    const skipped = res.data?.dnsRecordsSkipped || [];
-    const errors = res.data?.dnsErrors || [];
-    let text = '已提交加速接入';
-    if (added.length) text += `，已自动创建 ${added.length} 条验证记录`;
-    if (skipped.length) text += `，${skipped.length} 条验证记录已存在`;
-    if (errors.length) text += `，${errors.length} 条记录创建失败`;
-    if (res.data?.config?.verified) text += '，验证已完成';
-    message.success(text);
-    showAccelerationConfig.value = false;
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const updateAccelerationConfigMutation = useMutation({
-  mutationFn: async (config: AccelerationConfigInput) => {
-    if (!zoneName.value || typeof credentialId.value !== 'number') {
-      throw new Error('缺少域名或 DNS 凭证');
-    }
-    const pluginCredentialId = currentAccelerationTarget.value.pluginCredentialId;
-    if (!pluginCredentialId) {
-      throw new Error('缺少加速账户');
-    }
-    return updateAccelerationConfig({
-      zoneName: zoneName.value,
-      dnsCredentialId: credentialId.value,
-      pluginCredentialId,
-      ...config,
-    });
-  },
-  onSuccess: async () => {
-    message.success('加速配置已更新');
-    showAccelerationConfig.value = false;
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const checkAccelerationCnameMutation = useMutation({
-  mutationFn: async () => {
-    if (!zoneName.value) {
-      throw new Error('缺少域名');
-    }
-    return checkAccelerationCname(currentAccelerationTarget.value);
-  },
-  onSuccess: async (res) => {
-    message.success(res.data?.effective ? 'CNAME 已生效' : 'CNAME 尚未生效，状态已刷新');
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const accelerationSiteStatusMutation = useMutation({
-  mutationFn: async (enabled: boolean) => {
-    if (!zoneName.value || !effectiveAccelerationView.value) {
-      throw new Error('缺少可操作的加速站点');
-    }
-    return setAccelerationSiteStatus({
-      ...currentAccelerationTarget.value,
-      enabled,
-    });
-  },
-  onSuccess: async () => {
-    message.success('加速站点状态已更新');
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-    queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const deleteRemoteAccelerationMutation = useMutation({
-  mutationFn: async () => {
-    if (!zoneName.value || !effectiveAccelerationView.value) {
-      throw new Error('缺少可删除的加速站点');
-    }
-    return deleteRemoteAcceleration({
-      ...currentAccelerationTarget.value,
-      deleteLocalConfig: true,
-    });
-  },
-  onSuccess: async () => {
-    message.success('远端加速站点已删除');
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-    queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const verifyAccelerationMutation = useMutation({
-  mutationFn: async () => {
-    if (!zoneName.value) {
-      throw new Error('缺少域名');
-    }
-    return verifyAcceleration(currentAccelerationTarget.value);
-  },
-  onSuccess: async (res) => {
-    message.success(res.data?.config?.verified || res.data?.site?.verified ? '加速验证成功' : '已提交加速验证');
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const syncAccelerationMutation = useMutation({
-  mutationFn: async () => {
-    if (!zoneName.value) {
-      throw new Error('缺少域名');
-    }
-    return syncAcceleration(currentAccelerationTarget.value);
-  },
-  onSuccess: async () => {
-    message.success('加速状态已同步');
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const disableAccelerationMutation = useMutation({
-  mutationFn: async () => {
-    if (!zoneName.value) {
-      throw new Error('缺少域名');
-    }
-    return disableAcceleration(currentAccelerationTarget.value);
-  },
-  onSuccess: async () => {
-    message.success('已清理本地缓存映射');
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-  },
-  onError: (err: any) => message.error(String(err)),
-});
 
 // Mutations
 const createMutation = useMutation({
@@ -1052,18 +741,22 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
     </section>
 
     <section class="bento-card col-span-12">
-      <div class="mb-4 flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+      <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <p class="bento-section-title">加速管理</p>
-          <p class="bento-section-meta">接入 EdgeOne 后可自动生成域名归属验证记录，并支持手动验证与状态同步</p>
+          <p class="bento-section-meta">域名加速的新增、编辑、删除、验证和远端同步，统一在侧边栏“加速管理”页面处理。</p>
         </div>
-        <div class="flex flex-wrap items-center gap-2">
-          <NTag size="small" :bordered="false" :type="accelerationStatusDisplay.type">
-            {{ accelerationStatusDisplay.label }}
-          </NTag>
-          <NTag v-if="effectiveAccelerationView?.site?.remoteSiteId" size="small" :bordered="false">
-            Site {{ effectiveAccelerationView.site.remoteSiteId }}
-          </NTag>
+        <div class="flex flex-wrap gap-2">
+          <NButton
+            size="small"
+            type="primary"
+            @click="router.push({ path: '/accelerations', query: credentialId ? { zoneName, dnsCredentialId: String(credentialId) } : { zoneName } })"
+          >
+            打开加速管理
+          </NButton>
+          <NButton size="small" secondary @click="showAddAccelerationCredential = true">
+            添加加速账户
+          </NButton>
         </div>
       </div>
 
@@ -1071,416 +764,43 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
         <NSpin size="large" />
       </div>
 
-      <div v-else class="space-y-4">
-        <NAlert v-if="accelerationConfig?.lastError" type="warning" :bordered="false">
-          {{ accelerationConfig.lastError }}
-        </NAlert>
-
-        <NAlert
-          v-if="!accelerationConfig && selectedDiscoveredSite"
-          type="info"
-          :bordered="false"
-        >
-          检测到 EdgeOne 中已存在当前域名站点，当前展示账户：{{ selectedDiscoveredSite.pluginCredentialName }}。可直接同步远端状态并继续管理。
-        </NAlert>
-
-        <div v-if="!accelerationCredentials.length" class="rounded-2xl border border-dashed border-panel-border bg-panel-surface p-5">
-          <p class="text-sm font-semibold text-slate-700">暂无可用的加速账户</p>
-          <p class="mt-1 text-sm text-slate-500">先添加一个 EdgeOne 账户，再为当前域名接入加速。</p>
-          <div class="mt-4">
-            <NButton size="small" type="primary" @click="showAddAccelerationCredential = true">
-              添加加速账户
-            </NButton>
+      <div v-else class="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <article class="rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm">
+          <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">当前状态</p>
+          <div class="mt-3 flex items-center gap-2">
+            <NTag size="small" :bordered="false" :type="accelerationStatusDisplay.type">
+              {{ accelerationStatusDisplay.label }}
+            </NTag>
+            <NTag v-if="effectiveAccelerationView?.site?.remoteSiteId" size="small" :bordered="false">
+              Site {{ effectiveAccelerationView.site.remoteSiteId }}
+            </NTag>
           </div>
-        </div>
+          <p class="mt-3 break-all text-sm font-semibold text-slate-900">{{ accelerationDomainLabel }}</p>
+          <p class="mt-2 text-xs leading-6 text-slate-500">{{ accelerationStatusDisplay.detail || '当前还没有加速接入状态' }}</p>
+        </article>
 
-        <template v-else>
-          <div class="grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.95fr)]">
-            <div class="rounded-[28px] border border-slate-200/80 bg-gradient-to-br from-white via-slate-50 to-sky-50/80 p-5 shadow-sm">
-              <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                <div class="space-y-3">
-                  <div class="flex flex-wrap items-center gap-2">
-                    <span class="inline-flex items-center rounded-full bg-sky-100 px-3 py-1 text-xs font-semibold text-sky-700">
-                      EdgeOne 加速
-                    </span>
-                    <span class="inline-flex items-center rounded-full bg-slate-900 px-3 py-1 text-xs font-semibold text-white">
-                      {{ accelerationDomainLabel }}
-                    </span>
-                    <span class="inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold" :class="accelerationStatusToneClass">
-                      {{ accelerationStatusDisplay.label }}
-                    </span>
-                  </div>
-                  <div>
-                    <p class="text-sm font-semibold text-slate-800">接入域名</p>
-                    <p class="mt-2 break-all font-mono text-[1.05rem] font-semibold text-slate-900">{{ accelerationDomainLabel }}</p>
-                    <p class="mt-2 max-w-2xl text-sm leading-6 text-slate-500">
-                      {{ accelerationStatusDisplay.detail || '当前还没有加速接入状态' }}
-                    </p>
-                  </div>
-                </div>
+        <article class="rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm">
+          <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">加速账户</p>
+          <p class="mt-3 text-sm font-semibold text-slate-900">{{ accelerationSourceDetail }}</p>
+          <p class="mt-2 text-xs text-slate-500">可在侧边栏页面切换账户、创建新记录和接管远端记录。</p>
+        </article>
 
-                <div class="w-full max-w-[320px] rounded-3xl border border-white/70 bg-white/90 p-4 shadow-sm backdrop-blur md:w-auto">
-                  <label class="mb-2 block text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">加速账户</label>
-                  <NSelect
-                    v-model:value="selectedAccelerationCredentialId"
-                    size="small"
-                    :options="accelerationCredentials.map((item) => ({ label: item.name, value: item.id }))"
-                    placeholder="选择 EdgeOne 账户"
-                  />
-                  <div class="mt-3 grid grid-cols-2 gap-3 text-xs text-slate-500">
-                    <div class="rounded-2xl bg-slate-50 px-3 py-2">
-                      <p>接入模式</p>
-                      <p class="mt-1 font-semibold text-slate-700">{{ effectiveAccelerationView?.site.accessType || 'partial' }}</p>
-                    </div>
-                    <div class="rounded-2xl bg-slate-50 px-3 py-2">
-                      <p>IPv6</p>
-                      <p class="mt-1 font-semibold text-slate-700">{{ effectiveAccelerationView?.site.ipv6Status || 'follow' }}</p>
-                    </div>
-                  </div>
-                </div>
-              </div>
+        <article class="rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm">
+          <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">回源摘要</p>
+          <p class="mt-3 break-all text-sm font-semibold text-slate-900">{{ effectiveAccelerationView?.site.originValue || '-' }}</p>
+          <p class="mt-2 text-xs text-slate-500">{{ accelerationOriginSummary }}</p>
+        </article>
 
-              <div class="mt-5 overflow-hidden rounded-[24px] border border-slate-200 bg-white/95 shadow-sm">
-                <div class="border-b border-slate-200 px-5 py-4">
-                  <div class="flex flex-wrap items-start justify-between gap-3">
-                    <div>
-                      <p class="text-sm font-semibold text-slate-800">域名配置 · 接入管理</p>
-                      <p class="mt-1 text-sm leading-6 text-slate-500">延续远端站点状态展示，可直接同步、验证、暂停和删除。</p>
-                    </div>
-                    <span class="inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold" :class="accelerationRemoteToneClass">
-                      {{ accelerationRemoteMeta?.label || accelerationStatusDisplay.label }}
-                    </span>
-                  </div>
-                </div>
-
-                <div class="px-5 py-4">
-                  <div class="grid gap-4 border-b border-slate-100 pb-4 xl:grid-cols-[minmax(0,1.2fr)_120px_minmax(0,1fr)_140px]">
-                    <div>
-                      <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">加速域名 / CNAME</p>
-                      <p class="mt-3 break-all font-mono text-sm font-semibold text-slate-900">{{ accelerationDomainLabel }}</p>
-                      <button
-                        class="mt-2 min-h-[44px] break-all text-left font-mono text-xs text-slate-500 transition-colors duration-200 hover:text-sky-700"
-                        @click="copyText(effectiveAccelerationView?.site.cnameTarget)"
-                      >
-                        {{ effectiveAccelerationView?.site.cnameTarget || '等待下发 CNAME' }}
-                      </button>
-                      <div class="mt-3">
-                        <span class="inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold" :class="accelerationRemoteToneClass">
-                          {{ accelerationRemoteMeta?.label || accelerationStatusDisplay.label }}
-                        </span>
-                      </div>
-                    </div>
-                    <div>
-                      <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">源站类型</p>
-                      <p class="mt-3 text-sm font-semibold text-slate-900">{{ effectiveAccelerationView?.site.originType || 'IP_DOMAIN' }}</p>
-                    </div>
-                    <div>
-                      <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">源站配置</p>
-                      <p class="mt-3 break-all text-sm font-semibold text-slate-900">{{ effectiveAccelerationView?.site.originValue || '-' }}</p>
-                      <p class="mt-2 text-xs leading-6 text-slate-500">{{ accelerationOriginSummary }}</p>
-                    </div>
-                    <div>
-                      <p class="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">拓展服务</p>
-                      <p class="mt-3 text-sm font-semibold text-slate-900">{{ accelerationFeatureSummary }}</p>
-                      <p class="mt-2 text-xs text-slate-500">套餐：{{ effectiveAccelerationView?.site.planId || '默认' }}</p>
-                    </div>
-                  </div>
-
-                  <div class="grid gap-3 border-b border-slate-100 py-4 sm:grid-cols-2 xl:grid-cols-4">
-                    <article class="rounded-3xl bg-slate-50 px-4 py-4">
-                      <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">站点状态</p>
-                      <p class="mt-3 text-base font-semibold text-slate-900">{{ accelerationSiteSummary }}</p>
-                      <p class="mt-1 text-xs text-slate-500">域名状态：{{ effectiveAccelerationView?.site.domainStatus || '-' }}</p>
-                    </article>
-                    <article class="rounded-3xl bg-slate-50 px-4 py-4">
-                      <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">加速账户</p>
-                      <p class="mt-3 text-sm font-semibold text-slate-900">{{ accelerationSourceDetail }}</p>
-                      <p class="mt-1 text-xs text-slate-500">Site {{ effectiveAccelerationView?.site.remoteSiteId || '-' }}</p>
-                    </article>
-                    <article class="rounded-3xl bg-slate-50 px-4 py-4">
-                      <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Host Header</p>
-                      <p class="mt-3 break-all text-sm font-semibold text-slate-900">{{ effectiveAccelerationView?.site.hostHeader || accelerationDomainLabel }}</p>
-                      <p class="mt-1 text-xs text-slate-500">接入区域：{{ effectiveAccelerationView?.site.area || 'global' }}</p>
-                    </article>
-                    <article class="rounded-3xl bg-slate-50 px-4 py-4">
-                      <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">验证状态</p>
-                      <p class="mt-3 text-sm font-semibold text-slate-900">{{ effectiveAccelerationView?.site.cnameStatus || effectiveAccelerationView?.site.identificationStatus || effectiveAccelerationView?.site.verifyStatus || '-' }}</p>
-                      <p class="mt-1 text-xs text-slate-500">点击上方 CNAME 可直接复制</p>
-                    </article>
-                  </div>
-
-                  <div class="flex flex-wrap gap-2 pt-4">
-                    <NButton
-                      v-if="!accelerationConfig && !selectedDiscoveredSite"
-                      size="small"
-                      type="primary"
-                      @click="openAccelerationConfig"
-                    >
-                      {{ accelerationManageActionLabel }}
-                    </NButton>
-                    <NButton
-                      v-if="!accelerationConfig && selectedDiscoveredSite"
-                      size="small"
-                      type="primary"
-                      :loading="accelerationManageActionPending"
-                      @click="confirmTakeOverAccelerationSite"
-                    >
-                      {{ accelerationManageActionLabel }}
-                    </NButton>
-                    <NButton
-                      v-if="!accelerationConfig && selectedDiscoveredSite"
-                      size="small"
-                      secondary
-                      @click="openAccelerationConfig"
-                    >
-                      按当前配置同步
-                    </NButton>
-                    <template v-if="accelerationConfig">
-                      <NButton
-                        size="small"
-                        type="primary"
-                        @click="openAccelerationConfig"
-                      >
-                        {{ accelerationManageActionLabel }}
-                      </NButton>
-                      <NButton
-                        size="small"
-                        secondary
-                        :loading="syncAccelerationMutation.isPending.value"
-                        @click="syncAccelerationMutation.mutate()"
-                      >
-                        刷新状态
-                      </NButton>
-                      <NButton
-                        size="small"
-                        secondary
-                        :loading="checkAccelerationCnameMutation.isPending.value"
-                        @click="checkAccelerationCnameMutation.mutate()"
-                      >
-                        检测生效
-                      </NButton>
-                      <NButton
-                        v-if="!accelerationConfig.verified"
-                        size="small"
-                        type="primary"
-                        :loading="verifyAccelerationMutation.isPending.value"
-                        @click="verifyAccelerationMutation.mutate()"
-                      >
-                        手动验证
-                      </NButton>
-                      <NButton
-                        size="small"
-                        secondary
-                        :loading="accelerationSiteStatusMutation.isPending.value"
-                        @click="confirmAccelerationSiteStatus(Boolean(accelerationConfig?.paused))"
-                      >
-                        {{ accelerationConfig?.paused ? '恢复站点' : '暂停站点' }}
-                      </NButton>
-                      <NButton
-                        size="small"
-                        tertiary
-                        type="error"
-                        :loading="deleteRemoteAccelerationMutation.isPending.value"
-                        @click="confirmDeleteAccelerationSite"
-                      >
-                        删除远端
-                      </NButton>
-                      <NButton
-                        size="small"
-                        tertiary
-                        :loading="disableAccelerationMutation.isPending.value"
-                        @click="confirmDisableAccelerationConfig"
-                      >
-                        清理缓存
-                      </NButton>
-                    </template>
-                    <template v-else-if="selectedDiscoveredSite">
-                      <NButton
-                        size="small"
-                        secondary
-                        :loading="accelerationRefreshPending"
-                        @click="refetchDiscoveredAcceleration()"
-                      >
-                        刷新状态
-                      </NButton>
-                      <NButton
-                        size="small"
-                        secondary
-                        :loading="accelerationSiteStatusMutation.isPending.value"
-                        @click="confirmAccelerationSiteStatus(Boolean(selectedDiscoveredSite.site.paused))"
-                      >
-                        {{ selectedDiscoveredSite.site.paused ? '恢复站点' : '暂停站点' }}
-                      </NButton>
-                      <NButton
-                        size="small"
-                        tertiary
-                        type="error"
-                        :loading="deleteRemoteAccelerationMutation.isPending.value"
-                        @click="confirmDeleteAccelerationSite"
-                      >
-                        删除远端
-                      </NButton>
-                    </template>
-                    <NButton size="small" secondary @click="showAddAccelerationCredential = true">
-                      新增加速账户
-                    </NButton>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div class="space-y-4">
-              <div v-if="effectiveAccelerationView" class="rounded-[28px] border border-slate-200 bg-slate-50/80 p-5 shadow-sm">
-                <div class="flex items-start justify-between gap-3">
-                  <div>
-                    <p class="text-sm font-semibold text-slate-800">最后一步 · 添加 CNAME 记录</p>
-                    <p class="mt-1 text-sm leading-6 text-slate-500">{{ accelerationCnameHint }}</p>
-                  </div>
-                  <span class="inline-flex items-center rounded-full bg-slate-900 px-3 py-1 text-xs font-semibold text-white">
-                    CNAME 接入
-                  </span>
-                </div>
-
-                <div class="mt-4 space-y-3">
-                  <div class="rounded-3xl border border-slate-200 bg-white px-4 py-4">
-                    <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">主机记录</p>
-                    <button
-                      class="mt-2 min-h-[44px] break-all text-left font-mono text-sm font-semibold text-slate-900 transition-colors duration-200 hover:text-sky-700"
-                      @click="copyText(accelerationHostRecordLabel)"
-                    >
-                      {{ accelerationHostRecordLabel }}
-                    </button>
-                  </div>
-                  <div class="rounded-3xl border border-slate-200 bg-white px-4 py-4">
-                    <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">记录类型</p>
-                    <button
-                      class="mt-2 min-h-[44px] text-left font-mono text-sm font-semibold text-slate-900 transition-colors duration-200 hover:text-sky-700"
-                      @click="copyText('CNAME')"
-                    >
-                      CNAME
-                    </button>
-                  </div>
-                  <div class="rounded-3xl border border-slate-200 bg-white px-4 py-4">
-                    <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">记录值</p>
-                    <button
-                      class="mt-2 min-h-[44px] break-all text-left font-mono text-sm font-semibold text-slate-900 transition-colors duration-200 hover:text-sky-700"
-                      @click="copyText(effectiveAccelerationView.site.cnameTarget)"
-                    >
-                      {{ effectiveAccelerationView.site.cnameTarget || '等待下发' }}
-                    </button>
-                  </div>
-                </div>
-
-                <div class="mt-4 rounded-2xl border border-sky-100 bg-sky-50/80 px-4 py-3 text-xs leading-6 text-sky-800">
-                  解析生效时间取决于 DNS 服务商 TTL，通常需要数分钟到数小时。若你已开启 HTTPS，证书状态会随接入进度继续更新。
-                </div>
-              </div>
-
-              <div v-if="effectiveAccelerationView" class="rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm">
-                <p class="text-sm font-semibold text-slate-800">加速链路摘要</p>
-                <div class="mt-4 grid gap-3 sm:grid-cols-2">
-                  <div class="rounded-3xl bg-slate-50 px-4 py-4">
-                    <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">加速域名</p>
-                    <p class="mt-2 break-all font-mono text-sm font-semibold text-slate-900">{{ accelerationDomainLabel }}</p>
-                  </div>
-                  <div class="rounded-3xl bg-slate-50 px-4 py-4">
-                    <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Host Header</p>
-                    <p class="mt-2 break-all text-sm font-semibold text-slate-900">{{ effectiveAccelerationView.site.hostHeader || accelerationDomainLabel }}</p>
-                  </div>
-                  <div class="rounded-3xl bg-slate-50 px-4 py-4">
-                    <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">接入区域</p>
-                    <p class="mt-2 text-sm font-semibold text-slate-900">{{ effectiveAccelerationView.site.area || 'global' }}</p>
-                  </div>
-                  <div class="rounded-3xl bg-slate-50 px-4 py-4">
-                    <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">验证状态</p>
-                    <p class="mt-2 text-sm font-semibold text-slate-900">{{ effectiveAccelerationView.site.cnameStatus || effectiveAccelerationView.site.identificationStatus || effectiveAccelerationView.site.verifyStatus || '-' }}</p>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div v-if="effectiveAccelerationView?.site?.verifyRecordName" class="rounded-[28px] border border-amber-200 bg-amber-50/60 p-5 shadow-sm">
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p class="text-sm font-semibold text-amber-900">域名归属验证记录</p>
-                <p class="mt-1 text-sm leading-6 text-amber-800">{{ accelerationVerifyHint }}</p>
-              </div>
-              <NButton
-                v-if="accelerationConfig && !accelerationConfig.verified"
-                size="small"
-                type="primary"
-                :loading="verifyAccelerationMutation.isPending.value"
-                @click="verifyAccelerationMutation.mutate()"
-              >
-                重新验证
-              </NButton>
-            </div>
-            <div class="mt-4 grid gap-3 md:grid-cols-3">
-              <div class="rounded-2xl bg-white/80 p-4">
-                <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">类型</p>
-                <button class="mt-2 min-h-[44px] text-left font-mono text-sm font-semibold text-slate-900 transition-colors duration-200 hover:text-amber-700" @click="copyText(effectiveAccelerationView.site.verifyRecordType)">
-                  {{ effectiveAccelerationView.site.verifyRecordType || 'TXT' }}
-                </button>
-              </div>
-              <div class="rounded-2xl bg-white/80 p-4">
-                <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">主机记录</p>
-                <button class="mt-2 min-h-[44px] break-all text-left font-mono text-sm font-semibold text-slate-900 transition-colors duration-200 hover:text-amber-700" @click="copyText(effectiveAccelerationView.site.verifyRecordName)">
-                  {{ effectiveAccelerationView.site.verifyRecordName }}
-                </button>
-              </div>
-              <div class="rounded-2xl bg-white/80 p-4">
-                <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">记录值</p>
-                <button class="mt-2 min-h-[44px] break-all text-left font-mono text-sm font-semibold text-slate-900 transition-colors duration-200 hover:text-amber-700" @click="copyText(effectiveAccelerationView.site.verifyRecordValue)">
-                  {{ effectiveAccelerationView.site.verifyRecordValue }}
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <div v-if="discoveredAccelerationSites.length > 1 && !accelerationConfig" class="rounded-[28px] border border-slate-200 bg-panel-surface p-5 shadow-sm">
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p class="text-sm font-semibold text-slate-800">可用远端站点</p>
-                <p class="mt-1 text-sm leading-6 text-slate-500">如果同一域名在多个 EdgeOne 账户下已存在，这里会展示所有候选站点，可直接切换账户查看与管理。</p>
-              </div>
-              <span class="inline-flex items-center rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
-                {{ discoveredAccelerationSites.length }} 个候选
-              </span>
-            </div>
-            <div class="mt-4 grid gap-3">
-              <div
-                v-for="item in discoveredAccelerationSites"
-                :key="`${item.pluginCredentialId}-${item.site.remoteSiteId}`"
-                class="rounded-3xl border border-slate-200 bg-white/80 p-4 shadow-sm"
-              >
-                <div class="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <div class="flex flex-wrap items-center gap-2">
-                      <p class="text-sm font-semibold text-slate-800">{{ item.pluginCredentialName }}</p>
-                      <span class="inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold"
-                        :class="getAccelerationStatusMeta(item.site, { remote: true }).type === 'success'
-                          ? 'bg-emerald-100 text-emerald-700'
-                          : getAccelerationStatusMeta(item.site, { remote: true }).type === 'warning'
-                            ? 'bg-amber-100 text-amber-700'
-                            : getAccelerationStatusMeta(item.site, { remote: true }).type === 'error'
-                              ? 'bg-rose-100 text-rose-700'
-                              : 'bg-slate-100 text-slate-600'"
-                      >
-                        {{ getAccelerationStatusMeta(item.site, { remote: true }).label }}
-                      </span>
-                    </div>
-                    <p class="mt-1 text-xs text-slate-500">Site {{ item.site.remoteSiteId || '-' }} · {{ item.site.accelerationDomain || item.site.zoneName || '-' }}</p>
-                  </div>
-                  <NButton size="small" secondary @click="selectedAccelerationCredentialId = item.pluginCredentialId">
-                    选择此账户
-                  </NButton>
-                </div>
-              </div>
-            </div>
-          </div>
-        </template>
+        <article class="rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm">
+          <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">验证 / CNAME</p>
+          <p class="mt-3 break-all text-sm font-semibold text-slate-900">{{ effectiveAccelerationView?.site.cnameTarget || '等待下发' }}</p>
+          <p class="mt-2 text-xs text-slate-500">{{ accelerationCnameHint }}</p>
+        </article>
       </div>
+
+      <NAlert v-if="accelerationConfig?.lastError" class="mt-4" type="warning" :bordered="false">
+        {{ accelerationConfig.lastError }}
+      </NAlert>
     </section>
 
     <section class="bento-card col-span-12">
@@ -1522,14 +842,6 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
     <AddAccelerationCredentialDialog
       v-model:show="showAddAccelerationCredential"
       @created="() => { refetchAccelerationCredentials(); refetchDiscoveredAcceleration(); }"
-    />
-    <AccelerationConfigDialog
-      :show="showAccelerationConfig"
-      :zone-name="zoneName"
-      :loading="enableAccelerationMutation.isPending.value || updateAccelerationConfigMutation.isPending.value"
-      :value="(accelerationConfig || effectiveAccelerationView?.site) ?? null"
-      @update:show="showAccelerationConfig = $event"
-      @submit="(payload) => accelerationConfig ? updateAccelerationConfigMutation.mutate(payload) : enableAccelerationMutation.mutate(payload)"
     />
   </div>
 </template>

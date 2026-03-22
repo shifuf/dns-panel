@@ -686,6 +686,116 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
 def init_db() -> None:
     run_db_migrations(DB)
     with conn() as c:
+        if table_exists("domain_accelerations"):
+            row = c.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'domain_accelerations' LIMIT 1"
+            ).fetchone()
+            accel_sql = str(row["sql"] or "") if row else ""
+            normalized_accel_sql = re.sub(r"\s+", "", accel_sql).lower()
+            old_unique = "unique(userid,dnscredentialid,zonename,pluginprovider)"
+            new_unique = "unique(userid,dnscredentialid,zonename,pluginprovider,accelerationdomain)"
+            if old_unique in normalized_accel_sql and new_unique not in normalized_accel_sql:
+                c.execute(
+                    """
+                    CREATE TABLE domain_accelerations_v2 (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        userId INTEGER NOT NULL,
+                        dnsCredentialId INTEGER NOT NULL,
+                        zoneName TEXT NOT NULL,
+                        pluginProvider TEXT NOT NULL,
+                        pluginCredentialId INTEGER NOT NULL,
+                        remoteSiteId TEXT DEFAULT '',
+                        accelerationDomain TEXT DEFAULT '',
+                        subDomain TEXT DEFAULT '@',
+                        siteStatus TEXT DEFAULT '',
+                        domainStatus TEXT DEFAULT '',
+                        verifyStatus TEXT DEFAULT '',
+                        identificationStatus TEXT DEFAULT '',
+                        verified INTEGER NOT NULL DEFAULT 0,
+                        paused INTEGER NOT NULL DEFAULT 0,
+                        accessType TEXT DEFAULT 'partial',
+                        area TEXT DEFAULT 'global',
+                        planId TEXT DEFAULT '',
+                        cnameTarget TEXT DEFAULT '',
+                        cnameStatus TEXT DEFAULT '',
+                        originType TEXT DEFAULT '',
+                        originValue TEXT DEFAULT '',
+                        backupOriginValue TEXT DEFAULT '',
+                        hostHeader TEXT DEFAULT '',
+                        originProtocol TEXT DEFAULT 'FOLLOW',
+                        httpOriginPort INTEGER DEFAULT 80,
+                        httpsOriginPort INTEGER DEFAULT 443,
+                        ipv6Status TEXT DEFAULT 'follow',
+                        verifyRecordName TEXT DEFAULT '',
+                        verifyRecordType TEXT DEFAULT '',
+                        verifyRecordValue TEXT DEFAULT '',
+                        lastError TEXT DEFAULT '',
+                        lastSyncedAt TEXT,
+                        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(userId, dnsCredentialId, zoneName, pluginProvider, accelerationDomain)
+                    )
+                    """
+                )
+                c.execute(
+                    """
+                    INSERT INTO domain_accelerations_v2 (
+                        id, userId, dnsCredentialId, zoneName, pluginProvider, pluginCredentialId,
+                        remoteSiteId, accelerationDomain, subDomain, siteStatus, domainStatus, verifyStatus, identificationStatus,
+                        verified, paused, accessType, area, planId, cnameTarget, cnameStatus,
+                        originType, originValue, backupOriginValue, hostHeader, originProtocol,
+                        httpOriginPort, httpsOriginPort, ipv6Status,
+                        verifyRecordName, verifyRecordType, verifyRecordValue, lastError, lastSyncedAt, createdAt, updatedAt
+                    )
+                    SELECT
+                        id,
+                        userId,
+                        dnsCredentialId,
+                        zoneName,
+                        pluginProvider,
+                        pluginCredentialId,
+                        remoteSiteId,
+                        CASE
+                            WHEN accelerationDomain IS NULL OR TRIM(accelerationDomain) = '' THEN zoneName
+                            ELSE accelerationDomain
+                        END AS accelerationDomain,
+                        CASE
+                            WHEN subDomain IS NULL OR TRIM(subDomain) = '' THEN '@'
+                            ELSE subDomain
+                        END AS subDomain,
+                        siteStatus,
+                        domainStatus,
+                        verifyStatus,
+                        identificationStatus,
+                        verified,
+                        paused,
+                        accessType,
+                        area,
+                        planId,
+                        cnameTarget,
+                        cnameStatus,
+                        originType,
+                        originValue,
+                        backupOriginValue,
+                        hostHeader,
+                        originProtocol,
+                        httpOriginPort,
+                        httpsOriginPort,
+                        ipv6Status,
+                        verifyRecordName,
+                        verifyRecordType,
+                        verifyRecordValue,
+                        lastError,
+                        lastSyncedAt,
+                        createdAt,
+                        updatedAt
+                    FROM domain_accelerations
+                    """
+                )
+                c.execute("DROP TABLE domain_accelerations")
+                c.execute("ALTER TABLE domain_accelerations_v2 RENAME TO domain_accelerations")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_domain_accelerations_user_zone ON domain_accelerations(userId, zoneName)")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_domain_accelerations_dns_cred ON domain_accelerations(dnsCredentialId)")
         if table_exists("users"):
             cols = {str(row["name"]) for row in c.execute("PRAGMA table_info(users)").fetchall()}
             if "role" not in cols:
@@ -770,7 +880,7 @@ def init_db() -> None:
                 lastSyncedAt TEXT,
               createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
               updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-              UNIQUE(userId, dnsCredentialId, zoneName, pluginProvider)
+              UNIQUE(userId, dnsCredentialId, zoneName, pluginProvider, accelerationDomain)
             )
             """
         )
