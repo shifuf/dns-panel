@@ -355,18 +355,36 @@ class TencentEdgeOneApi:
         return {"siteId": zid, "requestId": resp.get("RequestId")}
 
     def _request_acceleration_domain_with_port_fallback(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            return self._tc3_request(action, payload)
-        except TencentEdgeOneApiError as exc:
-            message = str(exc)
-            if "OriginInfo.HttpOriginPort" not in message and "OriginInfo.HttpsOriginPort" not in message:
+        retry_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+        stripped_ipv6_status = False
+        stripped_origin_ports = False
+
+        while True:
+            try:
+                return self._tc3_request(action, retry_payload)
+            except TencentEdgeOneApiError as exc:
+                message = str(exc)
+                if (
+                    not stripped_ipv6_status
+                    and "Ipv6Status" in message
+                    and ("UnknownParameter" in message or "not recognized" in message)
+                ):
+                    retry_payload.pop("Ipv6Status", None)
+                    stripped_ipv6_status = True
+                    continue
+
+                if (
+                    not stripped_origin_ports
+                    and ("OriginInfo.HttpOriginPort" in message or "OriginInfo.HttpsOriginPort" in message)
+                ):
+                    origin_info = retry_payload.get("OriginInfo")
+                    if isinstance(origin_info, dict):
+                        origin_info.pop("HttpOriginPort", None)
+                        origin_info.pop("HttpsOriginPort", None)
+                    stripped_origin_ports = True
+                    continue
+
                 raise
-            retry_payload = json.loads(json.dumps(payload, ensure_ascii=False))
-            origin_info = retry_payload.get("OriginInfo")
-            if isinstance(origin_info, dict):
-                origin_info.pop("HttpOriginPort", None)
-                origin_info.pop("HttpsOriginPort", None)
-            return self._tc3_request(action, retry_payload)
 
     @staticmethod
     def _safe_port(value: Any, default: int) -> int:

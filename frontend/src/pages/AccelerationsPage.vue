@@ -3,23 +3,18 @@ import { computed, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
 import { NButton, NEmpty, NInput, NSelect, NSpin, NTag, useMessage } from 'naive-ui';
-import { RefreshCw, Plus, Globe, ShieldCheck } from 'lucide-vue-next';
+import { RefreshCw, Plus, Globe } from 'lucide-vue-next';
 import {
   listAccelerationConfigs,
-  listRemoteAccelerationSites,
   enableAcceleration,
-  importRemoteAcceleration,
   createAccelerationVerifyRecord,
   syncAcceleration,
   verifyAcceleration,
   updateAccelerationConfig,
-  disableAcceleration,
   setAccelerationSiteStatus,
   deleteRemoteAcceleration,
-  syncAllAccelerations,
   type AccelerationConfigInput,
   type DomainAccelerationConfig,
-  type DiscoveredAccelerationSite,
 } from '@/services/accelerations';
 import { getDnsCredentials, getProviders } from '@/services/dnsCredentials';
 import { getDomains } from '@/services/domains';
@@ -31,8 +26,6 @@ import AccelerationSiteDialog from '@/components/Acceleration/AccelerationSiteDi
 
 type RowStatus = 'verified' | 'pending' | 'paused' | 'error';
 type LocalStatusFilter = 'all' | RowStatus;
-type RemoteStatusFilter = 'all' | 'verified' | 'pending' | 'paused';
-type RemoteOwnershipFilter = 'all' | 'managed' | 'unmanaged';
 
 type LocalAccelerationRow = DomainAccelerationConfig & {
   key: string;
@@ -40,19 +33,6 @@ type LocalAccelerationRow = DomainAccelerationConfig & {
   pluginCredentialName: string;
   status: RowStatus;
   hasError: boolean;
-  searchText: string;
-};
-
-type RemoteAccelerationRow = {
-  key: string;
-  zoneName: string;
-  item: DiscoveredAccelerationSite;
-  localConfig: LocalAccelerationRow | null;
-  matchingDomains: Domain[];
-  selectedDnsCredentialId: number | null;
-  dnsOptions: Array<{ label: string; value: number }>;
-  dnsCredentialName: string;
-  ownershipStatus: 'managed' | 'unmanaged';
   searchText: string;
 };
 
@@ -77,15 +57,10 @@ const accelerationDialogValue = ref<(Partial<DomainAccelerationConfig> & {
 }) | null>(null);
 const accelerationDialogLockDomain = ref(false);
 const accelerationDialogLockPluginCredential = ref(false);
-const remoteImportTargets = ref<Record<string, number | null>>({});
 const localKeyword = ref('');
 const localStatusFilter = ref<LocalStatusFilter>('all');
 const localDnsCredentialFilter = ref<number | null>(null);
 const localPluginCredentialFilter = ref<number | null>(null);
-const remoteKeyword = ref('');
-const remoteStatusFilter = ref<RemoteStatusFilter>('all');
-const remoteOwnershipFilter = ref<RemoteOwnershipFilter>('all');
-const remotePluginCredentialFilter = ref<number | null>(null);
 const isBatchRunning = ref(false);
 const batchFeedback = ref<{ tone: 'warning' | 'error'; title: string; items: string[] } | null>(null);
 
@@ -97,17 +72,10 @@ const { data: accelerationConfigsData, isLoading: loadingConfigs, refetch: refet
   },
 });
 
-const { data: remoteAccelerationSitesData, isLoading: loadingRemote, refetch: refetchRemoteAccelerationSites } = useQuery({
-  queryKey: ['remote-acceleration-sites-page'],
-  queryFn: async () => {
-    const res = await listRemoteAccelerationSites();
-    return res.data?.items || [];
-  },
-});
-
 const {
   data: dnsContextData,
   isLoading: loadingDnsContext,
+  refetch: refetchDnsContext,
 } = useQuery({
   queryKey: ['acceleration-page-dns-context'],
   queryFn: async () => {
@@ -157,7 +125,6 @@ const {
 });
 
 const accelerationConfigs = computed<DomainAccelerationConfig[]>(() => accelerationConfigsData.value || []);
-const remoteAccelerationSites = computed<DiscoveredAccelerationSite[]>(() => remoteAccelerationSitesData.value || []);
 const allCredentials = computed<DnsCredential[]>(() => dnsContextData.value?.allCredentials || []);
 const dnsDomains = computed<Domain[]>(() => dnsContextData.value?.domains || []);
 const dnsCredentials = computed<DnsCredential[]>(() => dnsContextData.value?.dnsCredentials || []);
@@ -222,17 +189,9 @@ function copyText(text: string | undefined) {
 async function refreshCurrentPageData() {
   await Promise.all([
     refetchAccelerationConfigs(),
-    refetchRemoteAccelerationSites(),
+    refetchDnsContext(),
   ]);
   refreshAccelerationViews();
-}
-
-function getRemoteKey(item: DiscoveredAccelerationSite): string {
-  return [
-    item.pluginCredentialId,
-    normalizeText(item.site.accelerationDomain || item.site.zoneName),
-    normalizeText(item.site.remoteSiteId || item.site.zoneName),
-  ].join('::');
 }
 
 function getLocalKey(config: DomainAccelerationConfig): string {
@@ -317,120 +276,6 @@ const filteredLocalRows = computed(() =>
   }),
 );
 
-const remoteRows = computed<RemoteAccelerationRow[]>(() =>
-  remoteAccelerationSites.value.map((item) => {
-    const zoneName = String(item.site.zoneName || '').trim();
-    const key = getRemoteKey(item);
-    const localConfig = localRows.value.find((config) =>
-      config.pluginCredentialId === item.pluginCredentialId
-      && normalizeText(config.zoneName) === normalizeText(zoneName)
-      && normalizeText(config.accelerationDomain || config.zoneName) === normalizeText(item.site.accelerationDomain || item.site.zoneName),
-    ) || null;
-    const matchingDomains = dnsDomains.value.filter((domain) =>
-      normalizeText(domain.name) === normalizeText(zoneName),
-    );
-    const selectedDnsCredentialId = remoteImportTargets.value[key]
-      ?? localConfig?.dnsCredentialId
-      ?? matchingDomains[0]?.credentialId
-      ?? null;
-    return {
-      key,
-      zoneName,
-      item,
-      localConfig,
-      matchingDomains,
-      selectedDnsCredentialId,
-      dnsOptions: matchingDomains
-        .filter((domain) => typeof domain.credentialId === 'number')
-        .map((domain) => ({
-          label: `${domain.name} / ${domain.credentialName || getProviderDisplayName(domain.provider || '') || 'DNS 账户'}`,
-          value: domain.credentialId as number,
-        })),
-      dnsCredentialName: selectedDnsCredentialId
-        ? (credentialNameMap.value.get(selectedDnsCredentialId) || `DNS 凭证 #${selectedDnsCredentialId}`)
-        : '未选择 DNS 账户',
-      ownershipStatus: localConfig ? 'managed' : 'unmanaged',
-      searchText: [
-        zoneName,
-        item.site.accelerationDomain,
-        item.site.remoteSiteId,
-        item.site.siteStatus,
-        item.site.domainStatus,
-        item.site.verifyStatus,
-        item.site.identificationStatus,
-        item.site.cnameStatus,
-        item.site.cnameTarget,
-        item.site.originValue,
-        item.site.hostHeader,
-        item.site.accessType,
-        item.site.area,
-        item.site.planId,
-        item.pluginCredentialName,
-        localConfig?.dnsCredentialName,
-      ].join(' ').toLowerCase(),
-    };
-  }),
-);
-
-const filteredRemoteRows = computed(() =>
-  remoteRows.value.filter((row) => {
-    if (scopedZoneName.value && normalizeText(row.zoneName) !== scopedZoneName.value) return false;
-    if (scopedDnsCredentialId.value && row.selectedDnsCredentialId !== scopedDnsCredentialId.value && row.localConfig?.dnsCredentialId !== scopedDnsCredentialId.value) return false;
-    const keyword = normalizeText(remoteKeyword.value);
-    if (keyword && !row.searchText.includes(keyword)) return false;
-    if (remoteStatusFilter.value !== 'all') {
-      const status = row.item.site.paused ? 'paused' : (row.item.site.verified ? 'verified' : 'pending');
-      if (status !== remoteStatusFilter.value) return false;
-    }
-    if (remoteOwnershipFilter.value !== 'all' && row.ownershipStatus !== remoteOwnershipFilter.value) return false;
-    if (remotePluginCredentialFilter.value && row.item.pluginCredentialId !== remotePluginCredentialFilter.value) return false;
-    return true;
-  }),
-);
-
-watch(remoteRows, (rows) => {
-  if (!rows.length) return;
-  const next = { ...remoteImportTargets.value };
-  let changed = false;
-  for (const row of rows) {
-    if (next[row.key] !== undefined) continue;
-    next[row.key] = row.selectedDnsCredentialId;
-    changed = true;
-  }
-  if (changed) {
-    remoteImportTargets.value = next;
-  }
-}, { immediate: true });
-
-const importRemoteMutation = useMutation({
-  mutationFn: async (rowKey: string) => {
-    const row = remoteRows.value.find((item) => item.key === rowKey);
-    if (!row) throw new Error('远端站点不存在');
-    if (!row.selectedDnsCredentialId) throw new Error('请选择要绑定的 DNS 账户');
-    return importRemoteAcceleration({
-      zoneName: row.zoneName,
-      dnsCredentialId: row.selectedDnsCredentialId,
-      pluginCredentialId: row.item.pluginCredentialId,
-      remoteSiteId: row.item.site.remoteSiteId,
-      accelerationDomain: row.item.site.accelerationDomain,
-      subDomain: row.item.site.subDomain,
-      autoDnsRecord: true,
-    });
-  },
-  onSuccess: async (res) => {
-    const added = res.data?.dnsRecordsAdded?.length || 0;
-    const skipped = res.data?.dnsRecordsSkipped?.length || 0;
-    const failed = res.data?.dnsErrors?.length || 0;
-    let text = '远端站点已接管';
-    if (added) text += `，新增 ${added} 条验证记录`;
-    if (skipped) text += `，${skipped} 条验证记录已存在`;
-    if (failed) text += `，${failed} 条验证记录写入失败`;
-    message.success(text);
-    await refreshCurrentPageData();
-  },
-  onError: (err: any) => message.error(getErrorMessage(err)),
-});
-
 const saveAccelerationMutation = useMutation({
   mutationFn: async (payload: AccelerationSiteDialogPayload) => {
     if (accelerationDialogMode.value === 'edit') {
@@ -502,24 +347,6 @@ async function runBatch<T>(options: {
   await refreshCurrentPageData();
 }
 
-async function syncExistingRemoteSites() {
-  await runBatch({
-    items: remoteRows.value.filter((row) => !row.localConfig && row.selectedDnsCredentialId),
-    emptyMessage: '没有可同步的远端站点，或尚未匹配到可用的 DNS 账户',
-    actionLabel: '远端站点同步',
-    describe: (row) => row.zoneName,
-    execute: (row) => importRemoteAcceleration({
-      zoneName: row.zoneName,
-      dnsCredentialId: Number(row.selectedDnsCredentialId),
-      pluginCredentialId: row.item.pluginCredentialId,
-      remoteSiteId: row.item.site.remoteSiteId,
-      accelerationDomain: row.item.site.accelerationDomain,
-      subDomain: row.item.site.subDomain,
-      autoDnsRecord: true,
-    }),
-  });
-}
-
 const syncConfigMutation = useMutation({
   mutationFn: async (config: DomainAccelerationConfig) => syncAcceleration({
     zoneName: config.zoneName,
@@ -546,19 +373,6 @@ const verifyConfigMutation = useMutation({
   onError: (err: any) => message.error(getErrorMessage(err)),
 });
 
-const disableConfigMutation = useMutation({
-  mutationFn: async (config: DomainAccelerationConfig) => disableAcceleration({
-    zoneName: config.zoneName,
-    dnsCredentialId: config.dnsCredentialId,
-    accelerationDomain: config.accelerationDomain,
-  }),
-  onSuccess: async () => {
-    message.success('已移除本地配置');
-    await refreshCurrentPageData();
-  },
-  onError: (err: any) => message.error(getErrorMessage(err)),
-});
-
 const setSiteStatusMutation = useMutation({
   mutationFn: async (payload: { zoneName: string; dnsCredentialId?: number; pluginCredentialId?: number; remoteSiteId?: string; accelerationDomain?: string; enabled: boolean }) =>
     setAccelerationSiteStatus(payload),
@@ -574,21 +388,6 @@ const deleteRemoteMutation = useMutation({
     deleteRemoteAcceleration(payload),
   onSuccess: async () => {
     message.success('远端加速站点已删除');
-    await refreshCurrentPageData();
-  },
-  onError: (err: any) => message.error(getErrorMessage(err)),
-});
-
-const syncAllMutation = useMutation({
-  mutationFn: () => syncAllAccelerations(),
-  onSuccess: async (res) => {
-    const synced = Number(res.data?.synced || 0);
-    const failed = Number(res.data?.failed || 0);
-    if (failed > 0) {
-      message.warning(`同步完成：成功 ${synced}，失败 ${failed}`);
-    } else {
-      message.success(`已同步 ${synced} 个加速配置`);
-    }
     await refreshCurrentPageData();
   },
   onError: (err: any) => message.error(getErrorMessage(err)),
@@ -611,13 +410,6 @@ const createVerifyRecordMutation = useMutation({
   onError: (err: any) => message.error(getErrorMessage(err)),
 });
 
-function setRemoteImportTarget(rowKey: string, credentialId: number | null) {
-  remoteImportTargets.value = {
-    ...remoteImportTargets.value,
-    [rowKey]: credentialId,
-  };
-}
-
 function setLocalStatusFilter(value: string | null) {
   localStatusFilter.value = (value || 'all') as LocalStatusFilter;
 }
@@ -628,18 +420,6 @@ function setLocalDnsCredentialFilter(value: string | number | null) {
 
 function setLocalPluginCredentialFilter(value: string | number | null) {
   localPluginCredentialFilter.value = value == null ? null : Number(value);
-}
-
-function setRemoteStatusFilter(value: string | null) {
-  remoteStatusFilter.value = (value || 'all') as RemoteStatusFilter;
-}
-
-function setRemoteOwnershipFilter(value: string | null) {
-  remoteOwnershipFilter.value = (value || 'all') as RemoteOwnershipFilter;
-}
-
-function setRemotePluginCredentialFilter(value: string | number | null) {
-  remotePluginCredentialFilter.value = value == null ? null : Number(value);
 }
 
 function openCreateAccelerationDialog() {
@@ -669,28 +449,6 @@ function openEditAccelerationDialog(config: LocalAccelerationRow) {
   accelerationDialogLockDomain.value = true;
   accelerationDialogLockPluginCredential.value = true;
   accelerationDialogValue.value = { ...config };
-  showAccelerationSiteDialog.value = true;
-}
-
-function openRemoteConfigDialog(row: RemoteAccelerationRow) {
-  accelerationDialogMode.value = 'create';
-  accelerationDialogLockDomain.value = false;
-  accelerationDialogLockPluginCredential.value = false;
-  accelerationDialogValue.value = {
-    zoneName: row.zoneName,
-    dnsCredentialId: row.selectedDnsCredentialId,
-    pluginCredentialId: row.item.pluginCredentialId,
-    accelerationDomain: row.item.site.accelerationDomain,
-    subDomain: row.item.site.subDomain || '@',
-    originType: row.item.site.originType || 'IP_DOMAIN',
-    originValue: row.item.site.originValue || '',
-    backupOriginValue: row.item.site.backupOriginValue || '',
-    hostHeader: row.item.site.hostHeader || '',
-    originProtocol: row.item.site.originProtocol || 'FOLLOW',
-    httpOriginPort: row.item.site.httpOriginPort || 80,
-    httpsOriginPort: row.item.site.httpsOriginPort || 443,
-    ipv6Status: row.item.site.ipv6Status || 'follow',
-  };
   showAccelerationSiteDialog.value = true;
 }
 
@@ -770,91 +528,11 @@ async function batchSetFilteredLocalStatus(enabled: boolean) {
   });
 }
 
-async function batchImportFilteredRemote() {
-  await runBatch({
-    items: filteredRemoteRows.value.filter((row) => !row.localConfig && row.selectedDnsCredentialId),
-    emptyMessage: '当前筛选结果中没有可接管的远端站点',
-    actionLabel: '批量接管站点',
-    describe: (row) => row.zoneName,
-    execute: (row) => importRemoteAcceleration({
-      zoneName: row.zoneName,
-      dnsCredentialId: Number(row.selectedDnsCredentialId),
-      pluginCredentialId: row.item.pluginCredentialId,
-      remoteSiteId: row.item.site.remoteSiteId,
-      accelerationDomain: row.item.site.accelerationDomain,
-      subDomain: row.item.site.subDomain,
-      autoDnsRecord: true,
-    }),
-  });
-}
-
-async function batchCreateVerifyRecordsForRemote() {
-  await runBatch({
-    items: filteredRemoteRows.value.filter((row) =>
-      !row.item.site.verified
-      && row.item.site.verifyRecordName
-      && Boolean(row.localConfig?.dnsCredentialId || row.selectedDnsCredentialId),
-    ),
-    emptyMessage: '当前筛选结果中没有需要补验证记录的远端站点',
-    actionLabel: '远端批量补验证记录',
-    describe: (row) => row.zoneName,
-    execute: (row) => createAccelerationVerifyRecord({
-      zoneName: row.zoneName,
-      dnsCredentialId: Number(row.localConfig?.dnsCredentialId || row.selectedDnsCredentialId),
-      pluginCredentialId: row.item.pluginCredentialId,
-      remoteSiteId: row.item.site.remoteSiteId,
-      accelerationDomain: row.item.site.accelerationDomain,
-    }),
-  });
-}
-
-async function batchSetFilteredRemoteStatus(enabled: boolean) {
-  await runBatch({
-    items: filteredRemoteRows.value.filter((row) => enabled ? row.item.site.paused : !row.item.site.paused),
-    emptyMessage: enabled ? '当前筛选结果中没有可恢复的远端站点' : '当前筛选结果中没有可暂停的远端站点',
-    actionLabel: enabled ? '远端批量恢复站点' : '远端批量暂停站点',
-    describe: (row) => row.zoneName,
-    execute: (row) => setAccelerationSiteStatus({
-      zoneName: row.zoneName,
-      dnsCredentialId: row.localConfig?.dnsCredentialId,
-      pluginCredentialId: row.item.pluginCredentialId,
-      remoteSiteId: row.item.site.remoteSiteId,
-      accelerationDomain: row.item.site.accelerationDomain,
-      enabled,
-    }),
-  });
-}
-
-async function batchDeleteFilteredRemote() {
-  const targets = filteredRemoteRows.value;
-  if (!targets.length) {
-    message.warning('当前筛选结果中没有可删除的远端站点');
-    return;
-  }
-  if (!window.confirm(`确认删除当前筛选结果中的 ${targets.length} 个远端加速站点吗？`)) {
-    return;
-  }
-  await runBatch({
-    items: targets,
-    emptyMessage: '当前筛选结果中没有可删除的远端站点',
-    actionLabel: '远端批量删除',
-    describe: (row) => row.zoneName,
-    execute: (row) => deleteRemoteAcceleration({
-      zoneName: row.zoneName,
-      dnsCredentialId: row.localConfig?.dnsCredentialId,
-      pluginCredentialId: row.item.pluginCredentialId,
-      remoteSiteId: row.item.site.remoteSiteId,
-      accelerationDomain: row.item.site.accelerationDomain,
-      deleteLocalConfig: true,
-    }),
-  });
-}
-
 const localManagedCount = computed(() => localRows.value.length);
 const localVerifiedCount = computed(() => localRows.value.filter((item) => item.verified).length);
 const localErrorCount = computed(() => localRows.value.filter((item) => item.hasError).length);
-const remoteOnlyCount = computed(() => remoteRows.value.filter((item) => !item.localConfig).length);
-const pageLoading = computed(() => loadingConfigs.value || loadingRemote.value || loadingDnsContext.value);
+const localPendingCount = computed(() => localRows.value.filter((item) => !item.verified && !item.paused).length);
+const pageLoading = computed(() => loadingConfigs.value || loadingDnsContext.value);
 
 function getEffectiveLabel(item: { verified?: boolean; paused?: boolean; lastError?: string }): string {
   const status = getRowStatus(item);
@@ -886,7 +564,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
             加速
             <span class="gradient-text"> 管理</span>
           </h1>
-          <p class="page-subtitle">按加速账户集中管理 EdgeOne 加速域名、远端记录、验证状态和批量运维动作</p>
+          <p class="page-subtitle">集中管理 EdgeOne 加速域名，直接完成新增、编辑、验证、同步、停启用和删除。</p>
         </div>
         <div class="flex flex-wrap gap-2">
           <NButton
@@ -902,13 +580,9 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
             <template #icon><RefreshCw :size="14" /></template>
             刷新列表
           </NButton>
-          <NButton size="small" secondary :loading="importRemoteMutation.isPending.value || isBatchRunning" @click="syncExistingRemoteSites">
+          <NButton size="small" secondary :loading="isBatchRunning" @click="batchSyncFilteredLocal">
             <template #icon><Globe :size="14" /></template>
-            同步远端已有
-          </NButton>
-          <NButton size="small" secondary :loading="syncAllMutation.isPending.value || isBatchRunning" @click="syncAllMutation.mutate()">
-            <template #icon><ShieldCheck :size="14" /></template>
-            同步全部
+            同步列表
           </NButton>
           <NButton size="small" type="primary" @click="showAddAccelerationCredential = true">
             <template #icon><Plus :size="14" /></template>
@@ -934,9 +608,9 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
           <p class="mt-2 text-xs text-slate-500">最近同步或验证返回异常的站点</p>
         </article>
         <article class="bento-card p-5">
-          <p class="text-xs uppercase tracking-widest text-slate-500">待接管</p>
-          <p class="mt-3 text-4xl text-amber-600">{{ remoteOnlyCount }}</p>
-          <p class="mt-2 text-xs text-slate-500">仅存在于 EdgeOne 远端、尚未接管的站点</p>
+          <p class="text-xs uppercase tracking-widest text-slate-500">待验证</p>
+          <p class="mt-3 text-4xl text-amber-600">{{ localPendingCount }}</p>
+          <p class="mt-2 text-xs text-slate-500">等待验证或补录验证记录的站点</p>
         </article>
       </div>
 
@@ -963,7 +637,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
         <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <p class="bento-section-title">加速域名列表</p>
-            <p class="bento-section-meta">已纳管到面板中的 EdgeOne 加速域名，支持新增、编辑、验证、同步、停启用和删除</p>
+            <p class="bento-section-meta">EdgeOne 加速域名列表，支持新增、编辑、验证、同步、停启用和删除。</p>
           </div>
           <p class="text-xs text-slate-500">显示 {{ filteredLocalRows.length }} / {{ localRows.length }} 项</p>
         </div>
@@ -1111,7 +785,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
               编辑配置
             </NButton>
             <NButton size="small" secondary :loading="syncConfigMutation.isPending.value" @click="syncConfigMutation.mutate(config)">
-              刷新状态
+              同步
             </NButton>
             <NButton v-if="!config.verified" size="small" secondary :loading="verifyConfigMutation.isPending.value" @click="verifyConfigMutation.mutate(config)">
               手动验证
@@ -1131,217 +805,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
               :loading="deleteRemoteMutation.isPending.value"
               @click="deleteRemoteMutation.mutate({ zoneName: config.zoneName, dnsCredentialId: config.dnsCredentialId, remoteSiteId: config.remoteSiteId, accelerationDomain: config.accelerationDomain, deleteLocalConfig: true })"
             >
-              删除远端
-            </NButton>
-            <NButton size="small" tertiary :loading="disableConfigMutation.isPending.value" @click="disableConfigMutation.mutate(config)">
-              仅移除本地
-            </NButton>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <section class="bento-card col-span-12">
-      <div class="flex flex-col gap-4">
-        <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <p class="bento-section-title">账号远端记录</p>
-            <p class="bento-section-meta">加速账户中已存在、但可能尚未接管到面板的远端记录，支持批量接管、补验证记录、停启用和删除</p>
-          </div>
-          <p class="text-xs text-slate-500">显示 {{ filteredRemoteRows.length }} / {{ remoteRows.length }} 项</p>
-        </div>
-
-        <div class="grid gap-3 xl:grid-cols-4">
-          <NInput v-model:value="remoteKeyword" clearable placeholder="搜索域名 / Site ID / 账户名 / DNS 账户" />
-          <NSelect
-            :value="remoteStatusFilter"
-            :options="[
-              { label: '全部状态', value: 'all' },
-              { label: '已生效', value: 'verified' },
-              { label: '待验证', value: 'pending' },
-              { label: '已暂停', value: 'paused' },
-            ]"
-            @update:value="setRemoteStatusFilter"
-          />
-          <NSelect
-            :value="remoteOwnershipFilter"
-            :options="[
-              { label: '全部接管状态', value: 'all' },
-              { label: '已接管', value: 'managed' },
-              { label: '待接管', value: 'unmanaged' },
-            ]"
-            @update:value="setRemoteOwnershipFilter"
-          />
-          <NSelect
-            clearable
-            :value="remotePluginCredentialFilter"
-            :options="accelerationCredentialOptions"
-            placeholder="筛选加速账户"
-            @update:value="setRemotePluginCredentialFilter"
-          />
-        </div>
-
-        <div class="flex flex-wrap gap-2">
-          <NButton size="small" secondary :loading="isBatchRunning" @click="batchImportFilteredRemote">批量接管</NButton>
-          <NButton size="small" secondary :loading="isBatchRunning" @click="batchCreateVerifyRecordsForRemote">批量补验证记录</NButton>
-          <NButton size="small" secondary :loading="isBatchRunning" @click="batchSetFilteredRemoteStatus(false)">批量暂停</NButton>
-          <NButton size="small" secondary :loading="isBatchRunning" @click="batchSetFilteredRemoteStatus(true)">批量恢复</NButton>
-          <NButton size="small" tertiary type="error" :loading="isBatchRunning" @click="batchDeleteFilteredRemote">批量删除远端</NButton>
-        </div>
-      </div>
-
-      <div v-if="pageLoading" class="flex justify-center py-16">
-        <NSpin size="large" />
-      </div>
-      <NEmpty v-else-if="remoteRows.length === 0" description="暂无远端站点" class="py-12" />
-      <NEmpty v-else-if="filteredRemoteRows.length === 0" description="没有匹配当前筛选条件的远端站点" class="py-12" />
-      <div v-else class="mt-4 space-y-3">
-        <div v-for="row in filteredRemoteRows" :key="row.key" class="panel-muted p-4">
-          <div class="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <p class="text-sm font-semibold text-slate-700">{{ getPrimaryAccelerationDomain(row.item.site) }}</p>
-              <p class="mt-1 text-xs text-slate-500">
-                根域名 {{ row.zoneName }} · {{ row.item.pluginCredentialName }} · Site {{ row.item.site.remoteSiteId || '-' }}
-              </p>
-            </div>
-            <div class="flex flex-wrap gap-2">
-              <NTag size="small" :bordered="false" :type="getEffectiveType(row.item.site)">
-                {{ getEffectiveLabel(row.item.site) }}
-              </NTag>
-              <NTag size="small" :bordered="false" :type="row.item.site.verified ? 'success' : (row.item.site.paused ? 'warning' : 'default')">
-                {{ row.item.site.paused ? '已暂停' : (row.item.site.verified ? '已验证' : '待验证') }}
-              </NTag>
-              <NTag v-if="row.localConfig" size="small" :bordered="false" type="success">已接管</NTag>
-              <NTag v-else size="small" :bordered="false" type="warning">待接管</NTag>
-              <NTag size="small" :bordered="false">{{ row.item.site.domainStatus || row.item.site.siteStatus || 'unknown' }}</NTag>
-            </div>
-          </div>
-
-          <div class="mt-3 grid gap-3 md:grid-cols-4">
-            <div>
-              <p class="text-xs text-slate-500">本地状态</p>
-              <p class="mt-1 text-sm text-slate-700">{{ row.localConfig ? row.localConfig.dnsCredentialName : '未接管' }}</p>
-              <p class="mt-1 text-xs text-slate-500">CNAME / 验证：{{ row.item.site.cnameStatus || row.item.site.identificationStatus || row.item.site.verifyStatus || '-' }}</p>
-            </div>
-            <div>
-              <p class="text-xs text-slate-500">候选 DNS 账户</p>
-              <p class="mt-1 text-sm text-slate-700">{{ row.dnsCredentialName }}</p>
-            </div>
-            <div>
-              <p class="text-xs text-slate-500">回源配置</p>
-              <p class="mt-1 break-all text-sm text-slate-700">{{ row.item.site.originValue || '-' }}</p>
-              <p class="mt-1 text-xs text-slate-500">{{ row.item.site.originProtocol || 'FOLLOW' }} · HTTP {{ row.item.site.httpOriginPort || 80 }} / HTTPS {{ row.item.site.httpsOriginPort || 443 }}</p>
-            </div>
-            <div>
-              <p class="text-xs text-slate-500">CNAME / 套餐</p>
-              <p class="mt-1 break-all text-sm text-slate-700">{{ row.item.site.cnameTarget || '-' }}</p>
-              <p class="mt-1 text-xs text-slate-500">{{ row.item.site.area || 'global' }} / {{ row.item.site.planId || '默认' }} · IPv6 {{ row.item.site.ipv6Status || 'follow' }}</p>
-            </div>
-          </div>
-
-          <div v-if="row.localConfig?.lastError" class="mt-3 rounded-xl border border-rose-200 bg-rose-50/90 p-3">
-            <p class="text-sm font-semibold text-rose-700">本地最近错误</p>
-            <p class="mt-1 break-all text-xs text-rose-700">{{ row.localConfig.lastError }}</p>
-          </div>
-
-          <div v-if="!row.item.site.verified && row.item.site.verifyRecordName" class="mt-3 rounded-xl border border-amber-200 bg-amber-50/80 p-3">
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p class="text-sm font-semibold text-amber-800">当前未生效</p>
-                <p class="mt-1 text-xs text-amber-700">需要补全验证记录后再验证。你可以自动写入，也可以复制记录手动添加。</p>
-              </div>
-              <div class="flex flex-wrap gap-2">
-                <NButton
-                  size="small"
-                  secondary
-                  :disabled="!(row.localConfig?.dnsCredentialId || row.selectedDnsCredentialId)"
-                  :loading="createVerifyRecordMutation.isPending.value"
-                  @click="createVerifyRecordMutation.mutate({ zoneName: row.zoneName, dnsCredentialId: Number(row.localConfig?.dnsCredentialId || row.selectedDnsCredentialId), pluginCredentialId: row.item.pluginCredentialId, remoteSiteId: row.item.site.remoteSiteId, accelerationDomain: row.item.site.accelerationDomain })"
-                >
-                  自动添加记录
-                </NButton>
-                <NButton
-                  v-if="row.localConfig"
-                  size="small"
-                  secondary
-                  :loading="verifyConfigMutation.isPending.value"
-                  @click="verifyConfigMutation.mutate(row.localConfig)"
-                >
-                  手动验证
-                </NButton>
-              </div>
-            </div>
-
-            <div class="mt-3 grid gap-3 md:grid-cols-3">
-              <button class="rounded-lg bg-white/80 p-3 text-left" @click="copyText(row.item.site.verifyRecordType || 'TXT')">
-                <p class="text-xs text-slate-500">记录类型</p>
-                <p class="mt-1 text-sm font-medium text-slate-700">{{ row.item.site.verifyRecordType || 'TXT' }}</p>
-              </button>
-              <button class="rounded-lg bg-white/80 p-3 text-left" @click="copyText(row.item.site.verifyRecordName)">
-                <p class="text-xs text-slate-500">主机记录</p>
-                <p class="mt-1 break-all text-sm font-medium text-slate-700">{{ row.item.site.verifyRecordName }}</p>
-              </button>
-              <button class="rounded-lg bg-white/80 p-3 text-left" @click="copyText(row.item.site.verifyRecordValue)">
-                <p class="text-xs text-slate-500">记录值</p>
-                <p class="mt-1 break-all text-sm font-medium text-slate-700">{{ row.item.site.verifyRecordValue || '-' }}</p>
-              </button>
-            </div>
-          </div>
-
-          <div v-if="!row.localConfig" class="mt-3">
-            <NSelect
-              :value="row.selectedDnsCredentialId"
-              size="small"
-              :options="row.dnsOptions"
-              placeholder="选择要绑定的 DNS 账户"
-              @update:value="(value) => setRemoteImportTarget(row.key, value == null ? null : Number(value))"
-            />
-          </div>
-
-          <div class="mt-3 flex flex-wrap gap-2">
-            <NButton
-              v-if="row.localConfig"
-              size="small"
-              secondary
-              @click="goToDomain({ zoneName: row.zoneName, dnsCredentialId: row.localConfig.dnsCredentialId })"
-            >
-              打开域名
-            </NButton>
-            <NButton
-              v-if="!row.localConfig"
-              size="small"
-              type="primary"
-              :disabled="!row.selectedDnsCredentialId"
-              :loading="importRemoteMutation.isPending.value"
-              @click="importRemoteMutation.mutate(row.key)"
-            >
-              接管站点
-            </NButton>
-            <NButton
-              v-if="!row.localConfig"
-              size="small"
-              secondary
-              :disabled="!row.selectedDnsCredentialId"
-              @click="openRemoteConfigDialog(row)"
-            >
-              按配置接管
-            </NButton>
-            <NButton
-              size="small"
-              secondary
-              :loading="setSiteStatusMutation.isPending.value"
-              @click="setSiteStatusMutation.mutate({ zoneName: row.zoneName, dnsCredentialId: row.localConfig?.dnsCredentialId, pluginCredentialId: row.item.pluginCredentialId, remoteSiteId: row.item.site.remoteSiteId, accelerationDomain: row.item.site.accelerationDomain, enabled: Boolean(row.item.site.paused) })"
-            >
-              {{ row.item.site.paused ? '恢复站点' : '暂停站点' }}
-            </NButton>
-            <NButton
-              size="small"
-              tertiary
-              type="error"
-              :loading="deleteRemoteMutation.isPending.value"
-              @click="deleteRemoteMutation.mutate({ zoneName: row.zoneName, dnsCredentialId: row.localConfig?.dnsCredentialId, pluginCredentialId: row.item.pluginCredentialId, remoteSiteId: row.item.site.remoteSiteId, accelerationDomain: row.item.site.accelerationDomain, deleteLocalConfig: true })"
-            >
-              删除远端
+              删除
             </NButton>
           </div>
         </div>

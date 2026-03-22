@@ -31,12 +31,13 @@ import type { RecordsResponseCapabilities } from '@/services/dns';
 import { useProviderStore } from '@/stores/provider';
 import { useBreadcrumbStore } from '@/stores/breadcrumb';
 import { useCredentialResolver } from '@/composables/useCredentialResolver';
-import type { DNSRecord } from '@/types';
+import type { DNSRecord, Domain } from '@/types';
 import type { DnsCredential, DnsLine } from '@/types/dns';
 import { normalizeProviderType } from '@/utils/provider';
 import DNSRecordTable from '@/components/DNSRecordTable/DNSRecordTable.vue';
 import QuickAddForm from '@/components/QuickAddForm/QuickAddForm.vue';
 import AddAccelerationCredentialDialog from '@/components/Dashboard/AddAccelerationCredentialDialog.vue';
+import AccelerationSiteDialog from '@/components/Acceleration/AccelerationSiteDialog.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -49,7 +50,22 @@ const { credentialId } = useCredentialResolver();
 const zoneId = computed(() => route.params.zoneId as string);
 const showAddDialog = ref(false);
 const showAddAccelerationCredential = ref(false);
+const showAccelerationSiteDialog = ref(false);
+const accelerationDialogMode = ref<'create' | 'edit'>('create');
+const accelerationDialogLockDomain = ref(true);
+const accelerationDialogLockPluginCredential = ref(false);
+const accelerationDialogValue = ref<(Partial<DomainAccelerationConfig> & {
+  zoneName?: string;
+  dnsCredentialId?: number | null;
+  pluginCredentialId?: number | null;
+}) | null>(null);
 const selectedAccelerationCredentialId = ref<number | null>(null);
+
+type AccelerationSiteDialogPayload = AccelerationConfigInput & {
+  zoneName: string;
+  dnsCredentialId: number;
+  pluginCredentialId: number;
+};
 
 const capabilities = computed<RecordsResponseCapabilities>(() => {
   const apiCaps = recordsData.value?.capabilities;
@@ -135,6 +151,17 @@ const { data: accelerationCredentialData, refetch: refetchAccelerationCredential
 });
 
 const accelerationCredentials = computed(() => accelerationCredentialData.value || []);
+const currentAccelerationDomains = computed<Domain[]>(() => {
+  if (!zoneName.value || typeof credentialId.value !== 'number') return [];
+  return [{
+    id: String(domainData.value?.id || zoneId.value),
+    name: zoneName.value,
+    status: String(domainData.value?.status || ''),
+    credentialId: credentialId.value,
+    credentialName: providerStore.credentials.find((item) => item.id === credentialId.value)?.name,
+    provider: providerStore.credentials.find((item) => item.id === credentialId.value)?.provider,
+  }];
+});
 
 watch(accelerationCredentials, (list) => {
   if (!list.length) {
@@ -362,6 +389,87 @@ const accelerationCnameHint = computed(() => {
     ? '当前 CNAME 已可用于解析接入，可继续观察实际生效情况'
     : '请前往 DNS 服务商添加以下 CNAME 记录，等待解析生效';
 });
+
+const saveAccelerationMutation = useMutation({
+  mutationFn: async (payload: AccelerationSiteDialogPayload) => {
+    if (accelerationDialogMode.value === 'edit') {
+      return updateAccelerationConfig(payload);
+    }
+    return enableAcceleration({
+      ...payload,
+      zoneId: zoneId.value,
+      autoDnsRecord: true,
+    });
+  },
+  onSuccess: async (res) => {
+    if (accelerationDialogMode.value === 'edit') {
+      message.success('加速配置已更新');
+    } else {
+      const added = res.data?.dnsRecordsAdded?.length || 0;
+      const skipped = res.data?.dnsRecordsSkipped?.length || 0;
+      const failed = res.data?.dnsErrors?.length || 0;
+      let text = '加速域名已创建';
+      if (added) text += `，新增 ${added} 条验证记录`;
+      if (skipped) text += `，${skipped} 条验证记录已存在`;
+      if (failed) text += `，${failed} 条验证记录写入失败`;
+      message.success(text);
+    }
+    showAccelerationSiteDialog.value = false;
+    accelerationDialogValue.value = null;
+    await refetchAccelerationConfig();
+    await refetchDiscoveredAcceleration();
+    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
+    queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+function openCreateAccelerationDialog() {
+  if (typeof credentialId.value !== 'number' || !zoneName.value) {
+    message.warning('当前域名信息尚未加载完成');
+    return;
+  }
+  accelerationDialogMode.value = 'create';
+  accelerationDialogLockDomain.value = true;
+  accelerationDialogLockPluginCredential.value = false;
+  const remoteSite = selectedDiscoveredSite.value?.site;
+  accelerationDialogValue.value = {
+    zoneName: zoneName.value,
+    dnsCredentialId: credentialId.value,
+    pluginCredentialId: selectedAccelerationCredentialId.value || accelerationCredentials.value[0]?.id || null,
+    accelerationDomain: remoteSite?.accelerationDomain,
+    subDomain: remoteSite?.subDomain || '@',
+    originType: remoteSite?.originType || 'IP_DOMAIN',
+    originValue: remoteSite?.originValue || '',
+    backupOriginValue: remoteSite?.backupOriginValue || '',
+    hostHeader: remoteSite?.hostHeader || '',
+    originProtocol: remoteSite?.originProtocol || 'FOLLOW',
+    httpOriginPort: remoteSite?.httpOriginPort || 80,
+    httpsOriginPort: remoteSite?.httpsOriginPort || 443,
+    ipv6Status: remoteSite?.ipv6Status || 'follow',
+  };
+  showAccelerationSiteDialog.value = true;
+}
+
+function openEditAccelerationDialog() {
+  if (!accelerationConfig.value) {
+    openCreateAccelerationDialog();
+    return;
+  }
+  accelerationDialogMode.value = 'edit';
+  accelerationDialogLockDomain.value = true;
+  accelerationDialogLockPluginCredential.value = true;
+  accelerationDialogValue.value = { ...accelerationConfig.value };
+  showAccelerationSiteDialog.value = true;
+}
+
+function openAccelerationDialog() {
+  if (accelerationConfig.value) {
+    openEditAccelerationDialog();
+    return;
+  }
+  openCreateAccelerationDialog();
+}
 
 const canEnableAccelerationWhenAddingRecord = computed(() =>
   accelerationCredentials.value.length > 0 && typeof credentialId.value === 'number' && !!zoneName.value,
@@ -744,15 +852,23 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
       <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div>
           <p class="bento-section-title">加速管理</p>
-          <p class="bento-section-meta">域名加速的新增、编辑、删除、验证和远端同步，统一在侧边栏“加速管理”页面处理。</p>
+          <p class="bento-section-meta">可以直接在这里填写源站类型、源站地址、IPv6、端口和 Host Header，完成当前域名的加速配置。</p>
         </div>
         <div class="flex flex-wrap gap-2">
           <NButton
             size="small"
             type="primary"
+            :disabled="!accelerationCredentials.length || !currentAccelerationDomains.length"
+            @click="openAccelerationDialog"
+          >
+            {{ accelerationConfig ? '编辑加速域名' : '添加加速域名' }}
+          </NButton>
+          <NButton
+            size="small"
+            secondary
             @click="router.push({ path: '/accelerations', query: credentialId ? { zoneName, dnsCredentialId: String(credentialId) } : { zoneName } })"
           >
-            打开加速管理
+            打开加速列表
           </NButton>
           <NButton size="small" secondary @click="showAddAccelerationCredential = true">
             添加加速账户
@@ -782,7 +898,7 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
         <article class="rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm">
           <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">加速账户</p>
           <p class="mt-3 text-sm font-semibold text-slate-900">{{ accelerationSourceDetail }}</p>
-          <p class="mt-2 text-xs text-slate-500">可在侧边栏页面切换账户、创建新记录和接管远端记录。</p>
+          <p class="mt-2 text-xs text-slate-500">可直接在当前页面编辑，也可以进入加速列表集中管理。</p>
         </article>
 
         <article class="rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm">
@@ -800,6 +916,9 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
 
       <NAlert v-if="accelerationConfig?.lastError" class="mt-4" type="warning" :bordered="false">
         {{ accelerationConfig.lastError }}
+      </NAlert>
+      <NAlert v-else-if="!accelerationCredentials.length" class="mt-4" type="info" :bordered="false">
+        还没有可用的加速账户，请先添加 EdgeOne 账户后再创建加速域名。
       </NAlert>
     </section>
 
@@ -838,6 +957,18 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
       :show-acceleration-toggle="canEnableAccelerationWhenAddingRecord"
       :acceleration-toggle-label="addRecordAccelerationLabel"
       @submit="handleAddSubmit"
+    />
+    <AccelerationSiteDialog
+      :show="showAccelerationSiteDialog"
+      :loading="saveAccelerationMutation.isPending.value"
+      :mode="accelerationDialogMode"
+      :domains="currentAccelerationDomains"
+      :acceleration-credentials="accelerationCredentials"
+      :value="accelerationDialogValue"
+      :lock-domain="accelerationDialogLockDomain"
+      :lock-plugin-credential="accelerationDialogLockPluginCredential"
+      @update:show="showAccelerationSiteDialog = $event"
+      @submit="saveAccelerationMutation.mutate"
     />
     <AddAccelerationCredentialDialog
       v-model:show="showAddAccelerationCredential"
