@@ -22,6 +22,7 @@ import {
   listAccelerationConfigs,
   discoverAccelerationSites,
   enableAcceleration,
+  createAccelerationVerifyRecord,
   updateAccelerationConfig,
   type AccelerationConfigInput,
   type DomainAccelerationConfig,
@@ -38,6 +39,7 @@ import DNSRecordTable from '@/components/DNSRecordTable/DNSRecordTable.vue';
 import QuickAddForm from '@/components/QuickAddForm/QuickAddForm.vue';
 import AddAccelerationCredentialDialog from '@/components/Dashboard/AddAccelerationCredentialDialog.vue';
 import AccelerationSiteDialog from '@/components/Acceleration/AccelerationSiteDialog.vue';
+import AccelerationResultDialog from '@/components/Acceleration/AccelerationResultDialog.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -51,6 +53,7 @@ const zoneId = computed(() => route.params.zoneId as string);
 const showAddDialog = ref(false);
 const showAddAccelerationCredential = ref(false);
 const showAccelerationSiteDialog = ref(false);
+const showAccelerationResultDialog = ref(false);
 const accelerationDialogMode = ref<'create' | 'edit'>('create');
 const accelerationDialogLockDomain = ref(true);
 const accelerationDialogLockPluginCredential = ref(false);
@@ -59,12 +62,30 @@ const accelerationDialogValue = ref<(Partial<DomainAccelerationConfig> & {
   dnsCredentialId?: number | null;
   pluginCredentialId?: number | null;
 }) | null>(null);
+const accelerationResultState = ref<{
+  title?: string;
+  dnsCredentialId?: number | null;
+  pluginCredentialId?: number | null;
+  remoteSiteId?: string;
+  accelerationDomain?: string;
+  config?: DomainAccelerationConfig | null;
+  site?: DiscoveredAccelerationSite['site'] | null;
+  dnsRecordsAdded?: Array<{ zoneName: string; type: string; name: string; value: string }>;
+  dnsRecordsSkipped?: Array<{ zoneName: string; type: string; name: string; value: string }>;
+  dnsErrors?: Array<{ error: string; name?: string }>;
+} | null>(null);
+const pendingAccelerationRecordAction = ref<null | {
+  kind: 'create' | 'update';
+  recordId?: string;
+  params: any;
+}>(null);
 const selectedAccelerationCredentialId = ref<number | null>(null);
 
 type AccelerationSiteDialogPayload = AccelerationConfigInput & {
   zoneName: string;
   dnsCredentialId: number;
   pluginCredentialId: number;
+  autoDnsRecord?: boolean;
 };
 
 const capabilities = computed<RecordsResponseCapabilities>(() => {
@@ -398,7 +419,7 @@ const saveAccelerationMutation = useMutation({
     return enableAcceleration({
       ...payload,
       zoneId: zoneId.value,
-      autoDnsRecord: true,
+      autoDnsRecord: payload.autoDnsRecord !== false,
     });
   },
   onSuccess: async (res) => {
@@ -416,10 +437,51 @@ const saveAccelerationMutation = useMutation({
     }
     showAccelerationSiteDialog.value = false;
     accelerationDialogValue.value = null;
+    pendingAccelerationRecordAction.value = null;
+    accelerationResultState.value = {
+      title: accelerationDialogMode.value === 'edit' ? '加速配置已更新' : '加速域名已创建',
+      dnsCredentialId: typeof credentialId.value === 'number' ? credentialId.value : null,
+      pluginCredentialId: selectedAccelerationCredentialId.value,
+      remoteSiteId: String(res.data?.config?.remoteSiteId || res.data?.site?.remoteSiteId || ''),
+      accelerationDomain: String(res.data?.config?.accelerationDomain || res.data?.site?.accelerationDomain || ''),
+      config: res.data?.config || null,
+      site: (res.data?.site as DiscoveredAccelerationSite['site'] | null) || null,
+      dnsRecordsAdded: res.data?.dnsRecordsAdded || [],
+      dnsRecordsSkipped: res.data?.dnsRecordsSkipped || [],
+      dnsErrors: res.data?.dnsErrors || [],
+    };
+    showAccelerationResultDialog.value = true;
     await refetchAccelerationConfig();
     await refetchDiscoveredAcceleration();
     queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
     queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+const createVerifyRecordMutation = useMutation({
+  mutationFn: async (payload: { zoneName: string; dnsCredentialId: number; pluginCredentialId?: number; remoteSiteId?: string; accelerationDomain?: string }) =>
+    createAccelerationVerifyRecord(payload),
+  onSuccess: async (res) => {
+    const added = res.data?.dnsRecordsAdded?.length || 0;
+    const skipped = res.data?.dnsRecordsSkipped?.length || 0;
+    const failed = res.data?.dnsErrors?.length || 0;
+    let text = '验证记录处理完成';
+    if (added) text += `，新增 ${added} 条`;
+    if (skipped) text += `，${skipped} 条已存在`;
+    if (failed) text += `，${failed} 条失败`;
+    message.success(text);
+    accelerationResultState.value = {
+      ...(accelerationResultState.value || {}),
+      config: res.data?.config || accelerationResultState.value?.config || null,
+      site: (res.data?.site as DiscoveredAccelerationSite['site'] | null) || accelerationResultState.value?.site || null,
+      dnsRecordsAdded: res.data?.dnsRecordsAdded || [],
+      dnsRecordsSkipped: res.data?.dnsRecordsSkipped || [],
+      dnsErrors: res.data?.dnsErrors || [],
+    };
+    showAccelerationResultDialog.value = true;
+    await refetchAccelerationConfig();
+    await refetchDiscoveredAcceleration();
   },
   onError: (err: any) => message.error(String(err)),
 });
@@ -477,10 +539,10 @@ const canEnableAccelerationWhenAddingRecord = computed(() =>
 
 const addRecordAccelerationLabel = computed(() => {
   if (effectiveAccelerationView.value) {
-    return '保存后同步当前记录到远端加速站点';
+    return '保存后填写并更新当前记录的加速配置';
   }
   const selected = accelerationCredentials.value.find((item) => item.id === selectedAccelerationCredentialId.value);
-  return selected ? `创建后自动接入加速（${selected.name}）` : '创建后自动接入加速';
+  return selected ? `保存后填写加速配置（${selected.name}）` : '保存后填写加速配置';
 });
 
 const recordAccelerationStateResolver = computed(() => {
@@ -565,10 +627,38 @@ function buildAccelerationConfigFromRecord(params: any): AccelerationConfigInput
   };
 }
 
+function openAccelerationDialogForRecordAction(action: { kind: 'create' | 'update'; recordId?: string; params: any }) {
+  if (typeof credentialId.value !== 'number' || !zoneName.value) {
+    message.warning('当前域名信息尚未加载完成');
+    return;
+  }
+  pendingAccelerationRecordAction.value = action;
+  accelerationDialogMode.value = accelerationConfig.value ? 'edit' : 'create';
+  accelerationDialogLockDomain.value = true;
+  accelerationDialogLockPluginCredential.value = Boolean(accelerationConfig.value?.pluginCredentialId);
+  const recordConfig = buildAccelerationConfigFromRecord(action.params);
+  accelerationDialogValue.value = {
+    ...accelerationConfig.value,
+    ...recordConfig,
+    zoneName: zoneName.value,
+    dnsCredentialId: credentialId.value,
+    pluginCredentialId: accelerationConfig.value?.pluginCredentialId || selectedAccelerationCredentialId.value || accelerationCredentials.value[0]?.id || null,
+    originType: accelerationConfig.value?.originType || recordConfig.originType || 'IP_DOMAIN',
+    originValue: accelerationConfig.value?.originValue || recordConfig.originValue || '',
+    backupOriginValue: accelerationConfig.value?.backupOriginValue || '',
+    hostHeader: accelerationConfig.value?.hostHeader || '',
+    originProtocol: accelerationConfig.value?.originProtocol || recordConfig.originProtocol || 'FOLLOW',
+    httpOriginPort: accelerationConfig.value?.httpOriginPort || recordConfig.httpOriginPort || 80,
+    httpsOriginPort: accelerationConfig.value?.httpsOriginPort || recordConfig.httpsOriginPort || 443,
+    ipv6Status: accelerationConfig.value?.ipv6Status || recordConfig.ipv6Status || 'follow',
+  };
+  showAccelerationSiteDialog.value = true;
+}
+
 // Mutations
 const createMutation = useMutation({
-  mutationFn: async (params: Parameters<typeof createDNSRecord>[1] & { enableAcceleration?: boolean }) => {
-    const { enableAcceleration: enableAfterCreate, ...recordParams } = params;
+  mutationFn: async (params: Parameters<typeof createDNSRecord>[1] & { enableAcceleration?: boolean; accelerationConfig?: AccelerationConfigInput; autoDnsRecord?: boolean }) => {
+    const { enableAcceleration: enableAfterCreate, accelerationConfig: accelerationConfigInput, autoDnsRecord, ...recordParams } = params;
     const recordResult = await createDNSRecord(zoneId.value, recordParams, credentialId.value);
     let accelerationResult: Awaited<ReturnType<typeof enableAcceleration | typeof updateAccelerationConfig>> | null = null;
     if (
@@ -580,7 +670,7 @@ const createMutation = useMutation({
         zoneName: zoneName.value,
         dnsCredentialId: credentialId.value,
         pluginCredentialId: accelerationConfig.value?.pluginCredentialId || selectedAccelerationCredentialId.value || undefined,
-        ...buildAccelerationConfigFromRecord(recordParams),
+        ...(accelerationConfigInput || buildAccelerationConfigFromRecord(recordParams)),
       };
       if (accelerationConfig.value?.pluginCredentialId) {
         accelerationResult = await updateAccelerationConfig(payload);
@@ -589,7 +679,7 @@ const createMutation = useMutation({
           ...payload,
           zoneId: zoneId.value,
           pluginCredentialId: selectedAccelerationCredentialId.value,
-          autoDnsRecord: true,
+          autoDnsRecord: autoDnsRecord !== false,
         });
       }
     }
@@ -608,6 +698,24 @@ const createMutation = useMutation({
     }
     message.success(text);
     showAddDialog.value = false;
+    pendingAccelerationRecordAction.value = null;
+    showAccelerationSiteDialog.value = false;
+    accelerationDialogValue.value = null;
+    if (result.accelerationResult) {
+      accelerationResultState.value = {
+        title: 'DNS 记录和加速配置已提交',
+        dnsCredentialId: typeof credentialId.value === 'number' ? credentialId.value : null,
+        pluginCredentialId: selectedAccelerationCredentialId.value,
+        remoteSiteId: String(result.accelerationResult.data?.config?.remoteSiteId || result.accelerationResult.data?.site?.remoteSiteId || ''),
+        accelerationDomain: String(result.accelerationResult.data?.config?.accelerationDomain || result.accelerationResult.data?.site?.accelerationDomain || ''),
+        config: result.accelerationResult.data?.config || null,
+        site: (result.accelerationResult.data?.site as DiscoveredAccelerationSite['site'] | null) || null,
+        dnsRecordsAdded: result.accelerationResult.data?.dnsRecordsAdded || [],
+        dnsRecordsSkipped: result.accelerationResult.data?.dnsRecordsSkipped || [],
+        dnsErrors: result.accelerationResult.data?.dnsErrors || [],
+      };
+      showAccelerationResultDialog.value = true;
+    }
     await refetchRecords();
     await refetchAccelerationConfig();
     await refetchDiscoveredAcceleration();
@@ -618,8 +726,8 @@ const createMutation = useMutation({
 });
 
 const updateMutation = useMutation({
-  mutationFn: async (vars: { recordId: string; params: Parameters<typeof updateDNSRecord>[2] & { enableAcceleration?: boolean } }) => {
-    const { enableAcceleration: enableAfterUpdate, ...recordParams } = vars.params;
+  mutationFn: async (vars: { recordId: string; params: Parameters<typeof updateDNSRecord>[2] & { enableAcceleration?: boolean; accelerationConfig?: AccelerationConfigInput; autoDnsRecord?: boolean } }) => {
+    const { enableAcceleration: enableAfterUpdate, accelerationConfig: accelerationConfigInput, autoDnsRecord, ...recordParams } = vars.params;
     const recordResult = await updateDNSRecord(zoneId.value, vars.recordId, recordParams, credentialId.value);
     let accelerationResult: Awaited<ReturnType<typeof enableAcceleration | typeof updateAccelerationConfig>> | null = null;
     if (
@@ -631,7 +739,7 @@ const updateMutation = useMutation({
         zoneName: zoneName.value,
         dnsCredentialId: credentialId.value,
         pluginCredentialId: accelerationConfig.value?.pluginCredentialId || selectedAccelerationCredentialId.value || undefined,
-        ...buildAccelerationConfigFromRecord(recordParams),
+        ...(accelerationConfigInput || buildAccelerationConfigFromRecord(recordParams)),
       };
       if (accelerationConfig.value?.pluginCredentialId) {
         accelerationResult = await updateAccelerationConfig(payload);
@@ -640,7 +748,7 @@ const updateMutation = useMutation({
           ...payload,
           zoneId: zoneId.value,
           pluginCredentialId: selectedAccelerationCredentialId.value,
-          autoDnsRecord: true,
+          autoDnsRecord: autoDnsRecord !== false,
         });
       }
     }
@@ -658,6 +766,24 @@ const updateMutation = useMutation({
       if (failed) text += `（${failed} 条验证记录写入失败）`;
     }
     message.success(text);
+    pendingAccelerationRecordAction.value = null;
+    showAccelerationSiteDialog.value = false;
+    accelerationDialogValue.value = null;
+    if (result.accelerationResult) {
+      accelerationResultState.value = {
+        title: 'DNS 记录和加速配置已更新',
+        dnsCredentialId: typeof credentialId.value === 'number' ? credentialId.value : null,
+        pluginCredentialId: selectedAccelerationCredentialId.value,
+        remoteSiteId: String(result.accelerationResult.data?.config?.remoteSiteId || result.accelerationResult.data?.site?.remoteSiteId || ''),
+        accelerationDomain: String(result.accelerationResult.data?.config?.accelerationDomain || result.accelerationResult.data?.site?.accelerationDomain || ''),
+        config: result.accelerationResult.data?.config || null,
+        site: (result.accelerationResult.data?.site as DiscoveredAccelerationSite['site'] | null) || null,
+        dnsRecordsAdded: result.accelerationResult.data?.dnsRecordsAdded || [],
+        dnsRecordsSkipped: result.accelerationResult.data?.dnsRecordsSkipped || [],
+        dnsErrors: result.accelerationResult.data?.dnsErrors || [],
+      };
+      showAccelerationResultDialog.value = true;
+    }
     await refetchRecords();
     await refetchAccelerationConfig();
     await refetchDiscoveredAcceleration();
@@ -691,10 +817,18 @@ async function handleRefresh() {
 }
 
 function handleAddSubmit(params: any) {
+  if (params?.enableAcceleration) {
+    openAccelerationDialogForRecordAction({ kind: 'create', params });
+    return;
+  }
   createMutation.mutate(params);
 }
 
 function handleUpdate(recordId: string, params: any) {
+  if (params?.enableAcceleration) {
+    openAccelerationDialogForRecordAction({ kind: 'update', recordId, params });
+    return;
+  }
   updateMutation.mutate({ recordId, params });
 }
 
@@ -737,6 +871,39 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
     await refetchRecords();
   } catch (err: any) {
     message.error(String(err));
+  }
+}
+
+function handleAccelerationDialogSubmit(payload: AccelerationSiteDialogPayload) {
+  const pendingAction = pendingAccelerationRecordAction.value;
+  if (!pendingAction) {
+    saveAccelerationMutation.mutate(payload);
+    return;
+  }
+  if (pendingAction.kind === 'create') {
+    createMutation.mutate({
+      ...pendingAction.params,
+      enableAcceleration: true,
+      accelerationConfig: payload,
+      autoDnsRecord: payload.autoDnsRecord,
+    });
+    return;
+  }
+  updateMutation.mutate({
+    recordId: String(pendingAction.recordId || ''),
+    params: {
+      ...pendingAction.params,
+      enableAcceleration: true,
+      accelerationConfig: payload,
+      autoDnsRecord: payload.autoDnsRecord,
+    },
+  });
+}
+
+function handleAccelerationDialogVisibleChange(value: boolean) {
+  showAccelerationSiteDialog.value = value;
+  if (!value) {
+    pendingAccelerationRecordAction.value = null;
   }
 }
 </script>
@@ -960,15 +1127,22 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
     />
     <AccelerationSiteDialog
       :show="showAccelerationSiteDialog"
-      :loading="saveAccelerationMutation.isPending.value"
+      :loading="saveAccelerationMutation.isPending.value || createMutation.isPending.value || updateMutation.isPending.value"
       :mode="accelerationDialogMode"
       :domains="currentAccelerationDomains"
       :acceleration-credentials="accelerationCredentials"
       :value="accelerationDialogValue"
       :lock-domain="accelerationDialogLockDomain"
       :lock-plugin-credential="accelerationDialogLockPluginCredential"
-      @update:show="showAccelerationSiteDialog = $event"
-      @submit="saveAccelerationMutation.mutate"
+      @update:show="handleAccelerationDialogVisibleChange"
+      @submit="handleAccelerationDialogSubmit"
+    />
+    <AccelerationResultDialog
+      :show="showAccelerationResultDialog"
+      :loading="createVerifyRecordMutation.isPending.value"
+      :result="accelerationResultState"
+      @update:show="showAccelerationResultDialog = $event"
+      @create-verify-record="createVerifyRecordMutation.mutate"
     />
     <AddAccelerationCredentialDialog
       v-model:show="showAddAccelerationCredential"

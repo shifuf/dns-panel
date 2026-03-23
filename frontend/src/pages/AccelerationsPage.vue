@@ -23,6 +23,7 @@ import type { DnsCredential } from '@/types/dns';
 import type { Domain } from '@/types';
 import AddAccelerationCredentialDialog from '@/components/Dashboard/AddAccelerationCredentialDialog.vue';
 import AccelerationSiteDialog from '@/components/Acceleration/AccelerationSiteDialog.vue';
+import AccelerationResultDialog from '@/components/Acceleration/AccelerationResultDialog.vue';
 
 type RowStatus = 'verified' | 'pending' | 'paused' | 'error';
 type LocalStatusFilter = 'all' | RowStatus;
@@ -40,6 +41,7 @@ type AccelerationSiteDialogPayload = AccelerationConfigInput & {
   zoneName: string;
   dnsCredentialId: number;
   pluginCredentialId: number;
+  autoDnsRecord?: boolean;
 };
 
 const router = useRouter();
@@ -49,12 +51,25 @@ const message = useMessage();
 
 const showAddAccelerationCredential = ref(false);
 const showAccelerationSiteDialog = ref(false);
+const showAccelerationResultDialog = ref(false);
 const accelerationDialogMode = ref<'create' | 'edit'>('create');
 const accelerationDialogValue = ref<(Partial<DomainAccelerationConfig> & {
   zoneName?: string;
   dnsCredentialId?: number | null;
   pluginCredentialId?: number | null;
 }) | null>(null);
+const accelerationResultState = ref<{
+  title?: string;
+  dnsCredentialId?: number | null;
+  pluginCredentialId?: number | null;
+  remoteSiteId?: string;
+  accelerationDomain?: string;
+  config?: DomainAccelerationConfig | null;
+  site?: null;
+  dnsRecordsAdded?: Array<{ zoneName: string; type: string; name: string; value: string }>;
+  dnsRecordsSkipped?: Array<{ zoneName: string; type: string; name: string; value: string }>;
+  dnsErrors?: Array<{ error: string; name?: string }>;
+} | null>(null);
 const accelerationDialogLockDomain = ref(false);
 const accelerationDialogLockPluginCredential = ref(false);
 const localKeyword = ref('');
@@ -283,7 +298,7 @@ const saveAccelerationMutation = useMutation({
     }
     return enableAcceleration({
       ...payload,
-      autoDnsRecord: true,
+      autoDnsRecord: payload.autoDnsRecord !== false,
     });
   },
   onSuccess: async (res) => {
@@ -300,6 +315,19 @@ const saveAccelerationMutation = useMutation({
       message.success(text);
     }
     showAccelerationSiteDialog.value = false;
+    accelerationResultState.value = {
+      title: accelerationDialogMode.value === 'edit' ? '加速配置已更新' : '加速域名已创建',
+      dnsCredentialId: Number(res.data?.config?.dnsCredentialId || accelerationDialogValue.value?.dnsCredentialId || 0) || null,
+      pluginCredentialId: Number(res.data?.config?.pluginCredentialId || accelerationDialogValue.value?.pluginCredentialId || 0) || null,
+      remoteSiteId: String(res.data?.config?.remoteSiteId || ''),
+      accelerationDomain: String(res.data?.config?.accelerationDomain || accelerationDialogValue.value?.accelerationDomain || ''),
+      config: res.data?.config || null,
+      site: null,
+      dnsRecordsAdded: res.data?.dnsRecordsAdded || [],
+      dnsRecordsSkipped: res.data?.dnsRecordsSkipped || [],
+      dnsErrors: res.data?.dnsErrors || [],
+    };
+    showAccelerationResultDialog.value = true;
     accelerationDialogValue.value = null;
     await refreshCurrentPageData();
   },
@@ -405,6 +433,14 @@ const createVerifyRecordMutation = useMutation({
     if (skipped) text += `，${skipped} 条已存在`;
     if (failed) text += `，${failed} 条失败`;
     message.success(text);
+    accelerationResultState.value = {
+      ...(accelerationResultState.value || {}),
+      config: res.data?.config || accelerationResultState.value?.config || null,
+      dnsRecordsAdded: res.data?.dnsRecordsAdded || [],
+      dnsRecordsSkipped: res.data?.dnsRecordsSkipped || [],
+      dnsErrors: res.data?.dnsErrors || [],
+    };
+    showAccelerationResultDialog.value = true;
     await refreshCurrentPageData();
   },
   onError: (err: any) => message.error(getErrorMessage(err)),
@@ -637,7 +673,7 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
         <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <p class="bento-section-title">加速域名列表</p>
-            <p class="bento-section-meta">EdgeOne 加速域名列表，支持新增、编辑、验证、同步、停启用和删除。</p>
+            <p class="bento-section-meta">EdgeOne 加速域名列表，支持手动新增匹配面板域名的加速站点，并返回 CNAME 与验证指引。</p>
           </div>
           <p class="text-xs text-slate-500">显示 {{ filteredLocalRows.length }} / {{ localRows.length }} 项</p>
         </div>
@@ -827,6 +863,13 @@ function getEffectiveType(item: { verified?: boolean; paused?: boolean; lastErro
       :lock-plugin-credential="accelerationDialogLockPluginCredential"
       @update:show="showAccelerationSiteDialog = $event"
       @submit="saveAccelerationMutation.mutate"
+    />
+    <AccelerationResultDialog
+      :show="showAccelerationResultDialog"
+      :loading="createVerifyRecordMutation.isPending.value"
+      :result="accelerationResultState"
+      @update:show="showAccelerationResultDialog = $event"
+      @create-verify-record="createVerifyRecordMutation.mutate"
     />
   </div>
 </template>

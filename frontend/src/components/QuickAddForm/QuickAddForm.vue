@@ -155,8 +155,8 @@ function handleSubmit() {
         <NFormItem v-if="showAccelerationToggle" :show-feedback="false">
           <div class="flex w-full items-center justify-between rounded-2xl border border-panel-border bg-panel-surface px-3 py-2">
             <div>
-              <p class="text-sm font-medium text-slate-700">{{ accelerationToggleLabel || '创建后自动接入加速' }}</p>
-              <p class="text-xs text-slate-500">保存记录后自动创建或接管当前域名的加速配置</p>
+              <p class="text-sm font-medium text-slate-700">{{ accelerationToggleLabel || '保存后填写加速配置' }}</p>
+              <p class="text-xs text-slate-500">保存记录后会继续弹出完整加速配置，支持 IPv6、回源协议、端口与 Host Header</p>
             </div>
             <NSwitch v-model:value="form.enableAcceleration" />
           </div>

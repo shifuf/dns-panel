@@ -306,12 +306,12 @@ function renderAccelerationTag(record: DNSRecord) {
 function getAccelerationActionLabel(record: DNSRecord) {
   const state = getAccelerationState(record);
   if (state?.matched) return '已接入';
-  return '编辑时可选';
+  return '保存后填写配置';
 }
 
 function getAccelerationActionHint(record: DNSRecord) {
   const state = getAccelerationState(record);
-  return state?.detail || '保存记录后自动创建或接管当前域名的加速配置';
+  return state?.detail || '勾选后会继续弹出完整加速配置，支持 IPv6、回源协议、端口与 Host Header';
 }
 
 function isEditingAccelerationEnabled(record: DNSRecord) {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { NAlert, NButton, NFormItem, NInput, NModal, NSelect } from 'naive-ui';
+import { NAlert, NButton, NFormItem, NInput, NModal, NRadioButton, NRadioGroup, NSelect } from 'naive-ui';
 import type { Domain } from '@/types';
 import type { DnsCredential } from '@/types/dns';
 import type { AccelerationConfigInput, DomainAccelerationConfig } from '@/services/accelerations';
@@ -9,6 +9,7 @@ type SubmitPayload = AccelerationConfigInput & {
   zoneName: string;
   dnsCredentialId: number;
   pluginCredentialId: number;
+  autoDnsRecord?: boolean;
 };
 
 const props = defineProps<{
@@ -45,6 +46,7 @@ const form = ref<{
   httpOriginPort: number;
   httpsOriginPort: number;
   ipv6Status: string;
+  dnsSetupMode: 'auto' | 'manual';
 }>({
   domainKey: '',
   zoneName: '',
@@ -58,7 +60,8 @@ const form = ref<{
   originProtocol: 'FOLLOW',
   httpOriginPort: 80,
   httpsOriginPort: 443,
-  ipv6Status: 'follow',
+  ipv6Status: 'enable',
+  dnsSetupMode: 'auto',
 });
 const errorText = ref('');
 
@@ -113,7 +116,8 @@ function resetForm() {
     originProtocol: String(props.value?.originProtocol || 'FOLLOW').trim() || 'FOLLOW',
     httpOriginPort: Number(props.value?.httpOriginPort || 80) || 80,
     httpsOriginPort: Number(props.value?.httpsOriginPort || 443) || 443,
-    ipv6Status: String(props.value?.ipv6Status || 'follow').trim() || 'follow',
+    ipv6Status: String(props.value?.ipv6Status || 'follow').trim().toLowerCase() === 'close' ? 'close' : 'enable',
+    dnsSetupMode: 'auto',
   };
   errorText.value = '';
 }
@@ -160,7 +164,8 @@ function handleSubmit() {
     originProtocol: String(form.value.originProtocol || 'FOLLOW').trim() || 'FOLLOW',
     httpOriginPort: Number(form.value.httpOriginPort || 80) || 80,
     httpsOriginPort: Number(form.value.httpsOriginPort || 443) || 443,
-    ipv6Status: String(form.value.ipv6Status || 'follow').trim() || 'follow',
+    ipv6Status: String(form.value.ipv6Status || 'enable').trim() || 'enable',
+    autoDnsRecord: props.mode === 'edit' ? undefined : form.value.dnsSetupMode === 'auto',
   });
 }
 </script>
@@ -217,6 +222,11 @@ function handleSubmit() {
         编辑模式下不允许直接修改子域名前缀。若需要更换加速子域，请新建一条记录后再删除旧记录。
       </div>
 
+      <div class="rounded-2xl border border-slate-200 bg-slate-50/80 px-4 py-3">
+        <p class="text-sm font-semibold text-slate-800">回源设置</p>
+        <p class="mt-1 text-xs leading-6 text-slate-500">配置源站地址、回源协议、端口、Host Header 与 IPv6 访问支持，创建后会返回状态、CNAME 和验证信息供你继续处理。</p>
+      </div>
+
       <div class="grid gap-4 md:grid-cols-2">
         <NFormItem label="源站类型" :show-feedback="false">
           <NSelect
@@ -227,12 +237,12 @@ function handleSubmit() {
             ]"
           />
         </NFormItem>
-        <NFormItem label="IPv6" :show-feedback="false">
+        <NFormItem label="IPv6 支持" :show-feedback="false">
           <NSelect
             v-model:value="form.ipv6Status"
             :options="[
-              { label: '跟随系统', value: 'follow' },
-              { label: '关闭', value: 'close' },
+              { label: '开启 IPv6 访问', value: 'enable' },
+              { label: '关闭 IPv6 访问', value: 'close' },
             ]"
           />
         </NFormItem>
@@ -270,8 +280,21 @@ function handleSubmit() {
         <NInput v-model:value="form.hostHeader" placeholder="可选，不填则由 EdgeOne / 源站默认处理" />
       </NFormItem>
 
+      <div v-if="mode !== 'edit'" class="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+        <p class="text-sm font-semibold text-slate-800">验证记录处理</p>
+        <p class="mt-1 text-xs text-slate-500">创建完成后可以自动把验证记录写入当前 DNS，也可以先返回 CNAME 与验证记录，由你手动配置后再验证。</p>
+        <NFormItem class="mt-3 mb-0" :show-feedback="false">
+          <NRadioGroup v-model:value="form.dnsSetupMode" name="dns-setup-mode">
+            <div class="flex flex-wrap gap-2">
+              <NRadioButton value="auto">自动添加验证记录</NRadioButton>
+              <NRadioButton value="manual">我手动添加</NRadioButton>
+            </div>
+          </NRadioGroup>
+        </NFormItem>
+      </div>
+
       <div class="rounded-2xl border border-panel-border bg-panel-surface px-4 py-3 text-xs text-slate-500">
-        保存后会自动创建或更新当前域名的 EdgeOne 加速配置；如果尚未生效，系统会继续返回验证记录，供自动或手动补录。
+        保存后会创建或更新当前域名的 EdgeOne 加速配置，并返回加速状态、CNAME 记录和验证信息，方便继续完成接入。
       </div>
 
       <div class="flex justify-end gap-3">
