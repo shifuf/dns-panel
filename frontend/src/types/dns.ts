@@ -1,4 +1,4 @@
-export type ProviderType =
+export type BuiltinProviderType =
   | 'cloudflare'
   | 'aliyun'
   | 'dnspod'
@@ -13,7 +13,9 @@ export type ProviderType =
   | 'powerdns'
   | 'spaceship'
   | 'tencent_ssl'
-  | 'tencent_edgeone';
+  | 'edgeone';
+
+export type ProviderType = BuiltinProviderType | (string & {});
 
 export type ProviderCategory = 'dns' | 'ssl' | 'acceleration';
 

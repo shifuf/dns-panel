@@ -4,53 +4,56 @@ import {
   NDataTable,
   NTag,
   NButton,
-  NInput,
-  NSelect,
-  NSwitch,
   NEmpty,
   NPagination,
-  NModal,
   NCheckbox,
   NPopover,
+  NModal,
+  NAlert,
   useDialog,
 } from 'naive-ui';
-import { Edit2, Trash2, Check, X, Settings2, ArrowUp, ArrowDown } from 'lucide-vue-next';
+import { Edit2, Trash2, Settings2, ArrowUp, ArrowDown } from 'lucide-vue-next';
 import { useProviderStore } from '@/stores/provider';
 import { useResponsive } from '@/composables/useResponsive';
-import { formatTTL } from '@/utils/formatters';
-import { TTL_OPTIONS, TABLE_PAGE_SIZE } from '@/utils/constants';
+import { formatDateTime, formatTTL } from '@/utils/formatters';
 import type { DNSRecord } from '@/types';
 import type { DnsLine } from '@/types/dns';
 import type { RecordsResponseCapabilities } from '@/services/dns';
 
-type ColumnKey = 'type' | 'name' | 'content' | 'proxied' | 'line' | 'ttl' | 'enabled' | 'remark' | 'acceleration' | 'actions';
+type ColumnKey = 'name' | 'type' | 'line' | 'content' | 'weight' | 'priority' | 'ttl' | 'remark' | 'updatedAt' | 'actions';
 
-type RecordAccelerationState = {
-  matched: boolean;
-  label: string;
-  type: 'success' | 'warning' | 'error' | 'default';
-  detail?: string;
-};
-
-const COLUMN_ORDER_KEY = 'dns_records_column_order_v1';
-const HIDDEN_COLUMNS_KEY = 'dns_records_hidden_columns_v1';
+const COLUMN_ORDER_KEY = 'dns_records_column_order_v2';
+const HIDDEN_COLUMNS_KEY = 'dns_records_hidden_columns_v2';
 
 const props = defineProps<{
   records: DNSRecord[];
+  page?: number;
+  pageSize?: number;
+  total?: number;
+  totalPages?: number;
+  pageSizeOptions?: number[];
   lines?: DnsLine[];
   minTtl?: number;
   capabilities?: RecordsResponseCapabilities;
-  showAccelerationToggle?: boolean;
-  accelerationToggleLabel?: string;
-  resolveAccelerationState?: (record: DNSRecord) => RecordAccelerationState | null | undefined;
+  updateLoadingIds?: string[];
+  deleteLoadingIds?: string[];
+  statusLoadingIds?: string[];
+  accelerationLoadingIds?: string[];
+  batchStatusLoading?: 'enable' | 'disable' | null;
+  batchDeleteLoading?: boolean;
 }>();
 
 const emit = defineEmits<{
-  update: [recordId: string, params: any];
+  edit: [record: DNSRecord, options?: { focusAcceleration?: boolean }];
   delete: [recordId: string];
   'status-change': [recordId: string, enabled: boolean];
   'batch-delete': [recordIds: string[]];
   'batch-status-change': [recordIds: string[], enabled: boolean];
+  'page-change': [page: number];
+  'page-size-change': [pageSize: number];
+  'pause-acceleration': [record: DNSRecord];
+  'resume-acceleration': [record: DNSRecord];
+  'restore-origin': [record: DNSRecord];
 }>();
 
 const providerStore = useProviderStore();
@@ -67,31 +70,24 @@ const caps = computed(() => {
     supportsRemark: !!c?.supportsRemark,
   } as RecordsResponseCapabilities;
 });
-const isCloudflare = computed(() => providerStore.selectedProvider === 'cloudflare');
 
-const editingId = ref<string | null>(null);
-const mobileEditVisible = ref(false);
-const editForm = ref<any>({});
-
-const currentPage = ref(1);
-const pageSize = TABLE_PAGE_SIZE;
 const checkedRowKeys = ref<string[]>([]);
 const columnOrder = ref<ColumnKey[]>([]);
 const hiddenColumns = ref<ColumnKey[]>([]);
 
 const availableColumns = computed(() => {
   const list: Array<{ key: ColumnKey; label: string }> = [
-    { key: 'type', label: '类型' },
-    { key: 'name', label: '名称' },
-    { key: 'content', label: '内容' },
+    { key: 'name', label: '主机记录' },
+    { key: 'type', label: '记录类型' },
+    { key: 'line', label: '线路类型' },
+    { key: 'content', label: '记录值' },
+    { key: 'weight', label: '权重' },
+    { key: 'priority', label: '优先级' },
     { key: 'ttl', label: 'TTL' },
+    { key: 'remark', label: '备注' },
+    { key: 'updatedAt', label: '最后操作时间' },
+    { key: 'actions', label: '操作' },
   ];
-  if (isCloudflare.value) list.push({ key: 'proxied', label: '代理' });
-  if (caps.value?.supportsLine && (props.lines || []).length > 0) list.push({ key: 'line', label: '线路' });
-  if (caps.value?.supportsStatus) list.push({ key: 'enabled', label: '状态' });
-  if (caps.value?.supportsRemark) list.push({ key: 'remark', label: '备注' });
-  if (props.showAccelerationToggle) list.push({ key: 'acceleration', label: '加速' });
-  list.push({ key: 'actions', label: '操作' });
   return list;
 });
 
@@ -119,18 +115,14 @@ watch(availableColumns, () => {
   initColumnPrefs();
 }, { immediate: true });
 
-const visibleRecords = computed(() =>
-  props.records.filter((r) => !(r.type === 'NS' && r.name === r.zoneName))
-);
-
-const paginatedRecords = computed(() => {
-  const start = (currentPage.value - 1) * pageSize;
-  return visibleRecords.value.slice(start, start + pageSize);
-});
-
-watch(() => visibleRecords.value.length, () => {
-  const maxPage = Math.max(1, Math.ceil(visibleRecords.value.length / pageSize));
-  if (currentPage.value > maxPage) currentPage.value = 1;
+const visibleRecords = computed(() => props.records || []);
+const currentPage = computed(() => Math.max(1, Number(props.page || 1)));
+const currentPageSize = computed(() => Math.max(1, Number(props.pageSize || visibleRecords.value.length || 1)));
+const totalCount = computed(() => Math.max(0, Number(props.total ?? visibleRecords.value.length)));
+const totalPages = computed(() => Math.max(1, Number(props.totalPages || Math.ceil(totalCount.value / currentPageSize.value) || 1)));
+const resolvedPageSizeOptions = computed(() => {
+  const options = props.pageSizeOptions?.length ? props.pageSizeOptions : [10, 20, 50, 100, 200];
+  return [...new Set([...options, currentPageSize.value])].sort((a, b) => a - b);
 });
 
 watch(
@@ -160,38 +152,124 @@ const typeColor: Record<string, string> = {
   FORWARD_URL: '#D97706',
 };
 
-const lineOptions = computed(() => (props.lines || []).map((l) => ({ label: l.name, value: l.code })));
-const ttlOptions = computed(() =>
-  TTL_OPTIONS.filter((o) => o.value >= (props.minTtl || 1)).map((o) => ({ label: o.label, value: o.value }))
-);
+const updateLoadingSet = computed(() => new Set(props.updateLoadingIds || []));
+const deleteLoadingSet = computed(() => new Set(props.deleteLoadingIds || []));
+const statusLoadingSet = computed(() => new Set(props.statusLoadingIds || []));
+const accelerationLoadingSet = computed(() => new Set(props.accelerationLoadingIds || []));
 
-function startEdit(record: DNSRecord) {
-  editingId.value = record.id;
-  editForm.value = {
-    type: record.type,
-    name: record.name,
-    content: record.content,
-    ttl: record.ttl,
-    proxied: record.proxied,
-    priority: record.priority,
-    weight: record.weight,
-    line: record.line,
-    remark: record.remark,
-    enableAcceleration: Boolean(getAccelerationState(record)?.matched),
-  };
-  if (isMobile.value) mobileEditVisible.value = true;
+function normalizeHost(value?: string | null) {
+  return String(value || '').trim().replace(/\.+$/, '').toLowerCase();
 }
 
-function cancelEdit() {
-  editingId.value = null;
-  editForm.value = {};
-  mobileEditVisible.value = false;
+function formatLineDisplay(record: DNSRecord) {
+  const lineName = String(record.lineName || '').trim();
+  const lineCode = String(record.line || '').trim();
+  if (lineName.toLowerCase() === 'default' || lineCode.toLowerCase() === 'default') return '默认值';
+  return lineName || lineCode || '-';
 }
 
-function saveEdit() {
-  if (!editingId.value) return;
-  emit('update', editingId.value, editForm.value);
-  cancelEdit();
+function formatRecordUpdatedAt(value?: string | null) {
+  if (!value) return '-';
+  try {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return formatDateTime(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function isRecordUpdating(recordId: string) {
+  return updateLoadingSet.value.has(recordId);
+}
+
+function isRecordDeleting(recordId: string) {
+  return deleteLoadingSet.value.has(recordId);
+}
+
+function isRecordStatusLoading(recordId: string) {
+  return statusLoadingSet.value.has(recordId);
+}
+
+function isRecordAccelerationLoading(recordId: string) {
+  return accelerationLoadingSet.value.has(recordId);
+}
+
+function isRecordBusy(recordId: string) {
+  return isRecordUpdating(recordId)
+    || isRecordDeleting(recordId)
+    || isRecordStatusLoading(recordId)
+    || isRecordAccelerationLoading(recordId);
+}
+
+function canToggleAcceleration(record: DNSRecord) {
+  if (record.acceleration?.enabled) return true;
+  return ['A', 'AAAA', 'CNAME'].includes(record.type) && normalizeHost(record.name) !== normalizeHost(record.zoneName);
+}
+
+function isAccelerationActive(record: DNSRecord) {
+  return !!record.acceleration?.enabled;
+}
+
+function isAccelerationPaused(record: DNSRecord) {
+  return record.acceleration?.uiState === 'paused';
+}
+
+function accelerationButtonLabel(record: DNSRecord) {
+  if (!isAccelerationActive(record)) return '开启加速';
+  const ui = record.acceleration?.uiState;
+  if (ui === 'deploying') return '部署中';
+  if (ui === 'cname_pending') return '请添加CNAME';
+  if (isAccelerationPaused(record)) return '已暂停';
+  return '已加速';
+}
+
+function accelerationButtonType(record: DNSRecord): 'success' | 'warning' | 'error' | 'primary' | 'default' {
+  if (!isAccelerationActive(record)) return 'primary';
+  const ui = record.acceleration?.uiState;
+  if (ui === 'deploying') return 'warning';
+  if (ui === 'cname_pending' || ui === 'error') return 'error';
+  if (isAccelerationPaused(record)) return 'warning';
+  return 'success';
+}
+
+const accelerationActionRecord = ref<DNSRecord | null>(null);
+const showAccelerationActionModal = ref(false);
+
+function openAccelerationActionModal(record: DNSRecord) {
+  accelerationActionRecord.value = record;
+  showAccelerationActionModal.value = true;
+}
+
+function closeAccelerationActionModal() {
+  showAccelerationActionModal.value = false;
+  accelerationActionRecord.value = null;
+}
+
+function triggerAccelerationPauseOrResume() {
+  const record = accelerationActionRecord.value;
+  if (!record) return;
+  if (isAccelerationPaused(record)) {
+    emit('resume-acceleration', record);
+  } else {
+    emit('pause-acceleration', record);
+  }
+  closeAccelerationActionModal();
+}
+
+function triggerAccelerationRestoreOrigin() {
+  const record = accelerationActionRecord.value;
+  if (!record) return;
+  emit('restore-origin', record);
+  closeAccelerationActionModal();
+}
+
+function handleAccelerationButtonClick(record: DNSRecord) {
+  if (isAccelerationActive(record)) {
+    openAccelerationActionModal(record);
+  } else {
+    emit('edit', record, { focusAcceleration: true });
+  }
 }
 
 function confirmDelete(record: DNSRecord) {
@@ -253,6 +331,14 @@ function toggleMobileChecked(id: string, checked: boolean) {
   checkedRowKeys.value = checkedRowKeys.value.filter((x) => x !== id);
 }
 
+function handlePageChange(page: number) {
+  emit('page-change', Math.max(1, Number(page || 1)));
+}
+
+function handlePageSizeChange(pageSize: number) {
+  emit('page-size-change', Math.max(1, Number(pageSize || currentPageSize.value)));
+}
+
 function toggleColumn(key: ColumnKey, checked: boolean) {
   if (checked) {
     hiddenColumns.value = hiddenColumns.value.filter((x) => x !== key);
@@ -279,51 +365,12 @@ const orderedVisibleColumnKeys = computed(() => {
   return columnOrder.value.filter((key) => available.has(key) && !hiddenColumns.value.includes(key));
 });
 
-function getAccelerationState(record: DNSRecord) {
-  return props.resolveAccelerationState?.(record) || null;
-}
-
-function renderAccelerationTag(record: DNSRecord) {
-  const state = getAccelerationState(record);
-  if (!state) {
-    return h(NTag, {
-      size: 'small',
-      bordered: false,
-      type: 'default',
-    }, () => '未接入');
-  }
-  return h(
-    NTag,
-    {
-      size: 'small',
-      bordered: false,
-      type: state.type,
-    },
-    () => state.label,
-  );
-}
-
-function getAccelerationActionLabel(record: DNSRecord) {
-  const state = getAccelerationState(record);
-  if (state?.matched) return '已接入';
-  return '保存后填写配置';
-}
-
-function getAccelerationActionHint(record: DNSRecord) {
-  const state = getAccelerationState(record);
-  return state?.detail || '勾选后会继续弹出完整加速配置，支持 IPv6、回源协议、端口与 Host Header';
-}
-
-function isEditingAccelerationEnabled(record: DNSRecord) {
-  return Boolean(getAccelerationState(record)?.matched || editForm.value.enableAcceleration);
-}
-
 const columns = computed(() => {
   const defs: Record<ColumnKey, any> = {
     type: {
-      title: '类型',
+      title: '记录类型',
       key: 'type',
-      width: 80,
+      width: 96,
       render(row: DNSRecord) {
         const color = typeColor[row.type] || '#64748B';
         return h(
@@ -347,71 +394,54 @@ const columns = computed(() => {
       },
     },
     name: {
-      title: '名称',
+      title: '主机记录',
       key: 'name',
       minWidth: 160,
       ellipsis: { tooltip: true },
       render(row: DNSRecord) {
-        if (editingId.value === row.id) {
-          return h(NInput, {
-            value: editForm.value.name,
-            'onUpdate:value': (v: string) => (editForm.value.name = v),
-            size: 'small',
-          });
-        }
-        return h('span', { class: 'font-mono text-sm text-slate-700' }, row.name);
+        return h('div', { class: 'flex flex-wrap items-center gap-2' }, [
+          h('span', { class: 'font-mono text-sm text-slate-700' }, row.name),
+          isAccelerationActive(row)
+            ? h(
+                NTag,
+                { size: 'small', type: 'success', bordered: false },
+                () => '已加速'
+              )
+            : null,
+        ]);
       },
     },
     content: {
-      title: '内容',
+      title: '记录值',
       key: 'content',
       minWidth: 220,
       ellipsis: { tooltip: true },
       render(row: DNSRecord) {
-        if (editingId.value === row.id) {
-          return h(NInput, {
-            value: editForm.value.content,
-            'onUpdate:value': (v: string) => (editForm.value.content = v),
-            size: 'small',
-          });
-        }
         return h('span', { class: 'font-mono text-sm text-slate-500' }, row.content);
       },
     },
-    proxied: {
-      title: '代理',
-      key: 'proxied',
-      width: 90,
-      render(row: DNSRecord) {
-        if (editingId.value === row.id) {
-          return h(NSwitch, {
-            value: editForm.value.proxied,
-            'onUpdate:value': (v: boolean) => (editForm.value.proxied = v),
-            size: 'small',
-          });
-        }
-        return h(
-          NTag,
-          { size: 'small', type: row.proxied ? 'warning' : 'default', bordered: false },
-          () => (row.proxied ? '已代理' : '仅 DNS')
-        );
-      },
-    },
     line: {
-      title: '线路',
+      title: '线路类型',
       key: 'line',
       width: 130,
       render(row: DNSRecord) {
-        if (editingId.value === row.id) {
-          return h(NSelect, {
-            value: editForm.value.line,
-            'onUpdate:value': (v: string) => (editForm.value.line = v),
-            options: lineOptions.value,
-            size: 'small',
-            style: { minWidth: '100px' },
-          });
-        }
-        return h('span', { class: 'text-sm text-slate-500' }, row.lineName || row.line || '-');
+        return h('span', { class: 'text-sm text-slate-500' }, formatLineDisplay(row));
+      },
+    },
+    weight: {
+      title: '权重',
+      key: 'weight',
+      width: 88,
+      render(row: DNSRecord) {
+        return h('span', { class: 'text-sm text-slate-500' }, row.weight ?? '-');
+      },
+    },
+    priority: {
+      title: '优先级',
+      key: 'priority',
+      width: 88,
+      render(row: DNSRecord) {
+        return h('span', { class: 'text-sm text-slate-500' }, row.priority ?? '-');
       },
     },
     ttl: {
@@ -419,28 +449,7 @@ const columns = computed(() => {
       key: 'ttl',
       width: 100,
       render(row: DNSRecord) {
-        if (editingId.value === row.id) {
-          return h(NSelect, {
-            value: editForm.value.ttl,
-            'onUpdate:value': (v: number) => (editForm.value.ttl = v),
-            options: ttlOptions.value,
-            size: 'small',
-            style: { minWidth: '88px' },
-          });
-        }
         return h('span', { class: 'text-sm text-slate-500' }, formatTTL(row.ttl));
-      },
-    },
-    enabled: {
-      title: '状态',
-      key: 'enabled',
-      width: 90,
-      render(row: DNSRecord) {
-        return h(NSwitch, {
-          value: row.enabled !== false,
-          size: 'small',
-          'onUpdate:value': (v: boolean) => confirmStatusToggle(row, v),
-        });
       },
     },
     remark: {
@@ -449,73 +458,81 @@ const columns = computed(() => {
       width: 150,
       ellipsis: { tooltip: true },
       render(row: DNSRecord) {
-        if (editingId.value === row.id) {
-          return h(NInput, {
-            value: editForm.value.remark,
-            'onUpdate:value': (v: string) => (editForm.value.remark = v),
-            size: 'small',
-          });
-        }
         return h('span', { class: 'text-sm text-slate-500' }, row.remark || '-');
       },
     },
-    acceleration: {
-      title: '加速',
-      key: 'acceleration',
-      width: 140,
+    updatedAt: {
+      title: '最后操作时间',
+      key: 'updatedAt',
+      minWidth: 176,
       render(row: DNSRecord) {
-        if (!props.showAccelerationToggle) {
-          return h('span', { class: 'text-sm text-slate-400' }, '-');
-        }
-        if (editingId.value === row.id) {
-          return h('div', { class: 'flex flex-col items-start gap-1' }, [
-            h(NSwitch, {
-              value: isEditingAccelerationEnabled(row),
-              'onUpdate:value': (v: boolean) => (editForm.value.enableAcceleration = v),
-              size: 'small',
-            }),
-            h('span', { class: 'text-[11px] text-slate-400' }, getAccelerationActionHint(row)),
-          ]);
-        }
-        const state = getAccelerationState(row);
-        return h('div', { class: 'flex flex-col items-start gap-1' }, [
-          renderAccelerationTag(row),
-          h('span', { class: 'text-[11px] text-slate-400' }, state?.detail || getAccelerationActionLabel(row)),
-        ]);
+        return h('span', { class: 'text-sm text-slate-500' }, formatRecordUpdatedAt(row.updatedAt));
       },
     },
     actions: {
-      title: '',
+      title: '操作',
       key: 'actions',
-      width: 96,
+      width: 320,
       fixed: 'right' as const,
       render(row: DNSRecord) {
-        if (editingId.value === row.id) {
-          return h('div', { class: 'flex gap-4' }, [
+        const actions: any[] = [];
+        if (canToggleAcceleration(row)) {
+          actions.push(
             h(
               NButton,
-              { text: true, type: 'primary', size: 'small', onClick: saveEdit },
-              { icon: () => h(Check, { size: 14 }) }
-            ),
-            h(
-              NButton,
-              { text: true, size: 'small', onClick: cancelEdit },
-              { icon: () => h(X, { size: 14 }) }
-            ),
-          ]);
+              {
+                size: 'small',
+                round: true,
+                secondary: true,
+                type: accelerationButtonType(row),
+                loading: isRecordAccelerationLoading(row.id),
+                disabled: isRecordBusy(row.id) && !isRecordAccelerationLoading(row.id),
+                onClick: () => handleAccelerationButtonClick(row),
+              },
+              () => accelerationButtonLabel(row)
+            )
+          );
         }
-        return h('div', { class: 'flex gap-4' }, [
+        if (caps.value?.supportsStatus) {
+          actions.push(
+            h(
+              NButton,
+              {
+                size: 'small',
+                secondary: true,
+                type: row.enabled === false ? 'success' : 'warning',
+                loading: isRecordStatusLoading(row.id),
+                disabled: isRecordBusy(row.id) && !isRecordStatusLoading(row.id),
+                onClick: () => confirmStatusToggle(row, row.enabled === false),
+              },
+              () => (row.enabled === false ? '启用' : '禁用')
+            )
+          );
+        }
+        actions.push(
           h(
             NButton,
-            { text: true, size: 'small', onClick: () => startEdit(row) },
-            { icon: () => h(Edit2, { size: 14 }) }
-          ),
+            {
+              size: 'small',
+              tertiary: true,
+              loading: isRecordUpdating(row.id),
+              disabled: isRecordBusy(row.id),
+              onClick: () => emit('edit', row),
+            },
+            {
+              icon: () => h(Edit2, { size: 14 }),
+              default: () => '编辑',
+            }
+          )
+        );
+        actions.push(
           h(
             NButton,
-            { text: true, type: 'error', size: 'small', onClick: () => confirmDelete(row) },
+            { text: true, type: 'error', size: 'small', loading: isRecordDeleting(row.id), disabled: isRecordBusy(row.id) && !isRecordDeleting(row.id), onClick: () => confirmDelete(row) },
             { icon: () => h(Trash2, { size: 14 }) }
-          ),
-        ]);
+          )
+        );
+        return h('div', { class: 'flex flex-wrap justify-end gap-2' }, actions);
       },
     },
   };
@@ -542,10 +559,10 @@ const columns = computed(() => {
   <template v-else>
     <div class="mb-3 flex flex-wrap items-center gap-4">
       <span class="text-xs font-semibold text-slate-500">已选 {{ checkedRowKeys.length }} 条</span>
-      <NButton size="tiny" secondary :disabled="checkedRowKeys.length === 0" @click="confirmBatchStatus(true)">批量启用</NButton>
-      <NButton size="tiny" secondary :disabled="checkedRowKeys.length === 0" @click="confirmBatchStatus(false)">批量禁用</NButton>
-      <NButton size="tiny" type="error" secondary :disabled="checkedRowKeys.length === 0" @click="confirmBatchDelete">批量删除</NButton>
-      <NButton size="tiny" quaternary :disabled="checkedRowKeys.length === 0" @click="clearSelection">清空选择</NButton>
+      <NButton size="tiny" secondary :loading="batchStatusLoading === 'enable'" :disabled="checkedRowKeys.length === 0 || !!batchStatusLoading || !!batchDeleteLoading" @click="confirmBatchStatus(true)">批量启用</NButton>
+      <NButton size="tiny" secondary :loading="batchStatusLoading === 'disable'" :disabled="checkedRowKeys.length === 0 || !!batchStatusLoading || !!batchDeleteLoading" @click="confirmBatchStatus(false)">批量禁用</NButton>
+      <NButton size="tiny" type="error" secondary :loading="!!batchDeleteLoading" :disabled="checkedRowKeys.length === 0 || !!batchStatusLoading || !!batchDeleteLoading" @click="confirmBatchDelete">批量删除</NButton>
+      <NButton size="tiny" quaternary :disabled="checkedRowKeys.length === 0 || !!batchStatusLoading || !!batchDeleteLoading" @click="clearSelection">清空选择</NButton>
       <div class="flex-1" />
 
       <NPopover v-if="!isMobile" trigger="click" placement="bottom-end">
@@ -582,7 +599,7 @@ const columns = computed(() => {
 
     <div v-if="isMobile" class="space-y-2">
       <div
-        v-for="record in paginatedRecords"
+        v-for="record in visibleRecords"
         :key="record.id"
         class="rounded-lg border border-panel-border bg-panel-surface p-3"
       >
@@ -608,13 +625,12 @@ const columns = computed(() => {
               <NTag v-if="caps.supportsStatus" size="small" :type="record.enabled !== false ? 'success' : 'default'" :bordered="false">
                 {{ record.enabled !== false ? '启用' : '禁用' }}
               </NTag>
-              <component :is="renderAccelerationTag(record)" v-if="showAccelerationToggle" />
+              <NTag v-if="isAccelerationActive(record)" size="small" type="success" :bordered="false">
+                已加速
+              </NTag>
             </div>
             <div class="truncate font-mono text-sm font-semibold text-slate-800">{{ record.name }}</div>
             <div class="mt-1 break-all font-mono text-xs text-slate-500">{{ record.content }}</div>
-            <p v-if="showAccelerationToggle" class="mt-2 text-[11px] text-slate-400">
-              {{ getAccelerationActionHint(record) }}
-            </p>
           </div>
           <NCheckbox
             :checked="checkedRowKeys.includes(record.id)"
@@ -623,11 +639,23 @@ const columns = computed(() => {
         </div>
         <div class="mb-2 flex items-center justify-between text-xs text-slate-500">
           <span>TTL: {{ formatTTL(record.ttl) }}</span>
-          <span v-if="caps.supportsLine">{{ record.lineName || record.line || '-' }}</span>
+          <span>{{ formatLineDisplay(record) }}</span>
         </div>
 
         <div class="flex flex-wrap items-center gap-4">
-          <NButton text size="tiny" @click="startEdit(record)">
+          <NButton
+            v-if="canToggleAcceleration(record)"
+            secondary
+            round
+            size="tiny"
+            :type="isAccelerationActive(record) ? 'success' : 'primary'"
+            :loading="isRecordAccelerationLoading(record.id)"
+            :disabled="isRecordBusy(record.id) && !isRecordAccelerationLoading(record.id)"
+            @click="emit('edit', record, { focusAcceleration: true })"
+          >
+            {{ accelerationButtonLabel(record) }}
+          </NButton>
+          <NButton tertiary size="tiny" :loading="isRecordUpdating(record.id)" :disabled="isRecordBusy(record.id)" @click="emit('edit', record)">
             <template #icon><Edit2 :size="12" /></template>
             编辑
           </NButton>
@@ -635,11 +663,13 @@ const columns = computed(() => {
             v-if="caps.supportsStatus"
             text
             size="tiny"
+            :loading="isRecordStatusLoading(record.id)"
+            :disabled="isRecordBusy(record.id) && !isRecordStatusLoading(record.id)"
             @click="confirmStatusToggle(record, record.enabled === false)"
           >
             {{ record.enabled === false ? '启用' : '禁用' }}
           </NButton>
-          <NButton text size="tiny" type="error" @click="confirmDelete(record)">
+          <NButton text size="tiny" type="error" :loading="isRecordDeleting(record.id)" :disabled="isRecordBusy(record.id) && !isRecordDeleting(record.id)" @click="confirmDelete(record)">
             <template #icon><Trash2 :size="12" /></template>
             删除
           </NButton>
@@ -650,7 +680,7 @@ const columns = computed(() => {
     <NDataTable
       v-else
       :columns="columns"
-      :data="paginatedRecords"
+      :data="visibleRecords"
       :row-key="(row: DNSRecord) => row.id"
       :checked-row-keys="checkedRowKeys"
       :bordered="false"
@@ -658,87 +688,91 @@ const columns = computed(() => {
       class="table-scrollable"
       :scroll-x="1100"
       :max-height="600"
-      :virtual-scroll="paginatedRecords.length > 120"
+      :virtual-scroll="visibleRecords.length > 120"
       @update:checked-row-keys="setCheckedRowKeys"
     />
 
-    <div v-if="visibleRecords.length > pageSize" class="mt-4 flex justify-end">
+    <NModal
+      :show="showAccelerationActionModal"
+      preset="card"
+      title="加速操作"
+      :style="{ width: 'min(92vw, 480px)' }"
+      @update:show="(v: boolean) => { if (!v) closeAccelerationActionModal(); }"
+    >
+      <div v-if="accelerationActionRecord" class="space-y-3">
+        <div class="flex flex-wrap items-center gap-2">
+          <NTag
+            size="small"
+            :type="accelerationButtonType(accelerationActionRecord) === 'error' ? 'error' : isAccelerationPaused(accelerationActionRecord) ? 'warning' : 'success'"
+            :bordered="false"
+          >
+            {{ accelerationButtonLabel(accelerationActionRecord) }}
+          </NTag>
+          <span class="font-mono text-sm text-slate-700">{{ accelerationActionRecord.name }}</span>
+        </div>
+        <div class="rounded-lg border border-panel-border bg-panel-bg p-3 text-xs text-slate-500 space-y-1">
+          <div>
+            加速域名：<span class="font-mono text-slate-700">{{ accelerationActionRecord.acceleration?.domainName || accelerationActionRecord.name }}</span>
+          </div>
+          <div>
+            EdgeOne CNAME：<span class="font-mono text-slate-700">{{ accelerationActionRecord.acceleration?.target || accelerationActionRecord.content || '-' }}</span>
+          </div>
+          <div v-if="accelerationActionRecord.acceleration?.originalRecord?.type && accelerationActionRecord.acceleration?.originalRecord?.value">
+            原始记录：<span class="font-mono text-slate-700">{{ accelerationActionRecord.acceleration.originalRecord.type }} {{ accelerationActionRecord.acceleration.originalRecord.value }}</span>
+          </div>
+          <div v-if="accelerationActionRecord.acceleration?.uiState === 'cname_pending'" class="mt-2 text-red-500 font-medium">
+            ⚠ 异常：请添加 CNAME 记录指向上方目标地址
+          </div>
+          <div v-if="accelerationActionRecord.acceleration?.uiState === 'deploying'" class="mt-2 text-amber-600 font-medium">
+            ⏳ 部署中：加速配置正在生效，请稍候
+          </div>
+        </div>
+        <NAlert type="info" :bordered="false">
+          <template v-if="isAccelerationPaused(accelerationActionRecord)">
+            恢复加速后 EdgeOne 将重新接管此域名的加速服务。
+          </template>
+          <template v-else>
+            暂停加速后 DNS 记录保持 CNAME，但 EdgeOne 不再提供加速。
+          </template>
+          「返回源站」会把 DNS 记录恢复为开启加速前的原始值。
+        </NAlert>
+        <div class="flex flex-wrap justify-end gap-2 pt-2">
+          <NButton @click="closeAccelerationActionModal">取消</NButton>
+          <NButton
+            type="warning"
+            :loading="isRecordAccelerationLoading(accelerationActionRecord.id)"
+            :disabled="isRecordBusy(accelerationActionRecord.id) && !isRecordAccelerationLoading(accelerationActionRecord.id)"
+            @click="triggerAccelerationRestoreOrigin"
+          >
+            返回源站
+          </NButton>
+          <NButton
+            type="primary"
+            :loading="isRecordAccelerationLoading(accelerationActionRecord.id)"
+            :disabled="isRecordBusy(accelerationActionRecord.id) && !isRecordAccelerationLoading(accelerationActionRecord.id)"
+            @click="triggerAccelerationPauseOrResume"
+          >
+            {{ isAccelerationPaused(accelerationActionRecord) ? '恢复加速' : '暂停加速' }}
+          </NButton>
+        </div>
+      </div>
+    </NModal>
+
+    <div v-if="totalCount > 0" class="mt-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+      <div class="text-xs text-slate-500">
+        共 {{ totalCount }} 条 · 当前第 {{ currentPage }} 页 · 共 {{ totalPages }} 页 · 每页 {{ currentPageSize }} 条
+      </div>
       <NPagination
-        v-model:page="currentPage"
-        :page-size="pageSize"
-        :item-count="visibleRecords.length"
+        :page="currentPage"
+        :page-size="currentPageSize"
+        :item-count="totalCount"
+        :page-sizes="resolvedPageSizeOptions"
         show-quick-jumper
+        show-size-picker
         size="small"
+        @update:page="handlePageChange"
+        @update:page-size="handlePageSizeChange"
       />
     </div>
   </template>
-
-  <NModal
-    :show="mobileEditVisible"
-    preset="card"
-    title="编辑 DNS 记录"
-    :style="{ width: 'min(96vw, 560px)' }"
-    @update:show="(v: boolean) => { if (!v) cancelEdit(); }"
-  >
-    <div class="space-y-3">
-      <NInput
-        :value="editForm.name"
-        placeholder="记录名称"
-        size="small"
-        @update:value="(v: string) => { editForm.name = v; }"
-      />
-      <NInput
-        :value="editForm.content"
-        placeholder="记录值"
-        size="small"
-        @update:value="(v: string) => { editForm.content = v; }"
-      />
-      <NSelect
-        :value="editForm.ttl"
-        :options="ttlOptions"
-        size="small"
-        @update:value="(v: number) => { editForm.ttl = v; }"
-      />
-      <NSelect
-        v-if="caps.supportsLine && lineOptions.length > 0"
-        :value="editForm.line"
-        :options="lineOptions"
-        size="small"
-        placeholder="线路"
-        @update:value="(v: string) => { editForm.line = v; }"
-      />
-      <NInput
-        v-if="caps.supportsRemark"
-        :value="editForm.remark"
-        placeholder="备注"
-        size="small"
-        @update:value="(v: string) => { editForm.remark = v; }"
-      />
-      <div v-if="isCloudflare" class="flex items-center justify-between rounded-lg border border-panel-border bg-panel-bg px-3 py-2">
-        <span class="text-sm text-slate-600">Cloudflare 代理</span>
-        <NSwitch
-          :value="!!editForm.proxied"
-          size="small"
-          @update:value="(v: boolean) => { editForm.proxied = v; }"
-        />
-      </div>
-
-      <div v-if="showAccelerationToggle" class="flex items-center justify-between rounded-lg border border-panel-border bg-panel-bg px-3 py-2">
-        <div>
-          <p class="text-sm text-slate-600">{{ accelerationToggleLabel || '修改后自动接入加速' }}</p>
-          <p class="text-xs text-slate-400">保存记录后自动创建或接管当前域名的加速配置</p>
-        </div>
-        <NSwitch
-          :value="!!editForm.enableAcceleration"
-          size="small"
-          @update:value="(v: boolean) => { editForm.enableAcceleration = v; }"
-        />
-      </div>
-
-      <div class="flex justify-end gap-4 pt-1">
-        <NButton size="small" @click="cancelEdit">取消</NButton>
-        <NButton size="small" type="primary" @click="saveEdit">保存</NButton>
-      </div>
-    </div>
-  </NModal>
 </template>

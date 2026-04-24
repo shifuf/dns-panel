@@ -9,7 +9,6 @@ import os
 import re
 import sqlite3
 import subprocess
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -22,12 +21,17 @@ from pathlib import Path
 from typing import Any, Dict, List
 from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from modules.provider_catalog import get_all_provider_capabilities, get_provider_capabilities
+from modules.provider_catalog import (
+    get_all_provider_capabilities,
+    get_provider_capabilities,
+    get_provider_display_name,
+    get_supported_provider_types,
+    get_supported_provider_types_by_category,
+)
+from modules.acceleration_registry import build_acceleration_plugin, validate_acceleration_credentials
 from modules.two_factor import generate_base32_secret, make_otpauth_url, make_qr_data_url, verify_totp
 from modules.cloudflare_api import CloudflareApi, CloudflareApiError
 from modules.dnspod_api import DnspodApi, DnspodApiError
-from modules.acceleration_registry import AccelerationPluginError, build_acceleration_plugin
-from modules.tencent_edgeone_api import TencentEdgeOneApi, TencentEdgeOneApiError
 
 # ── Application version ─────────────────────────────────────────
 # Fallback version for local/offline environments. GitHub Releases are the
@@ -100,7 +104,7 @@ PROVIDER_NAMES = {
     "powerdns": "PowerDNS",
     "dnsla": "DNSLA",
     "tencent_ssl": "腾讯云 SSL",
-    "tencent_edgeone": "腾讯云 EdgeOne",
+    "edgeone": "腾讯云 EdgeOne",
 }
 DEFAULT_LOG_RETENTION_DAYS = 90
 DEFAULT_RETRY_MAX_ATTEMPTS = 3
@@ -108,8 +112,36 @@ DEFAULT_RETRY_INTERVAL_SECONDS = 2
 DEFAULT_RETRY_TIMEOUT_SECONDS = 15
 DEFAULT_BACKUP_FILE_PREFIX = "dns-panel-backup"
 VALID_BACKUP_SCOPES = {"dns", "ssl"}
-ACCELERATION_SYNC_INTERVAL_SECONDS = max(0, int(os.getenv("ACCELERATION_SYNC_INTERVAL_SECONDS", "900") or "900"))
-ACCELERATION_SYNC_STARTUP_DELAY_SECONDS = max(0, int(os.getenv("ACCELERATION_SYNC_STARTUP_DELAY_SECONDS", "30") or "30"))
+SUPPORTED_PROVIDER_TYPES = tuple(
+    get_supported_provider_types()
+)
+SUPPORTED_PROVIDER_SET = frozenset(SUPPORTED_PROVIDER_TYPES)
+SUPPORTED_DNS_PROVIDER_TYPES = tuple(get_supported_provider_types_by_category("dns"))
+SUPPORTED_SSL_PROVIDER_TYPES = tuple(get_supported_provider_types_by_category("ssl"))
+SUPPORTED_ACCELERATION_PROVIDER_TYPES = tuple(get_supported_provider_types_by_category("acceleration"))
+SUPPORTED_NON_SSL_PROVIDER_TYPES = tuple(SUPPORTED_DNS_PROVIDER_TYPES)
+SUPPORTED_DNS_PROVIDER_SET = frozenset(SUPPORTED_DNS_PROVIDER_TYPES)
+SUPPORTED_SSL_PROVIDER_SET = frozenset(SUPPORTED_SSL_PROVIDER_TYPES)
+SUPPORTED_ACCELERATION_PROVIDER_SET = frozenset(SUPPORTED_ACCELERATION_PROVIDER_TYPES)
+SUPPORTED_NON_SSL_PROVIDER_SET = frozenset(SUPPORTED_NON_SSL_PROVIDER_TYPES)
+SUPPORTED_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_PROVIDER_TYPES)
+SUPPORTED_DNS_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_DNS_PROVIDER_TYPES)
+SUPPORTED_SSL_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_SSL_PROVIDER_TYPES)
+SUPPORTED_ACCELERATION_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_ACCELERATION_PROVIDER_TYPES)
+SUPPORTED_NON_SSL_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_NON_SSL_PROVIDER_TYPES)
+
+
+def is_supported_provider(provider: Any) -> bool:
+    return str(provider or "").strip() in SUPPORTED_PROVIDER_SET
+
+
+def is_supported_dns_provider(provider: Any) -> bool:
+    return str(provider or "").strip() in SUPPORTED_DNS_PROVIDER_SET
+
+
+def get_provider_name(provider: Any) -> str:
+    raw = str(provider or "").strip()
+    return get_provider_display_name(raw) or PROVIDER_NAMES.get(raw, raw)
 
 
 def resolve_db() -> Path:
@@ -335,29 +367,14 @@ def export_backup_payload(user_id: int, scopes: List[str]) -> Dict[str, Any]:
     with conn() as c:
         if "dns" in selected:
             rows = c.execute(
-                """
+                f"""
                 SELECT id, name, provider, secrets, accountId, isDefault, createdAt, updatedAt
                 FROM dns_credentials
-                WHERE userId = ? AND provider != 'tencent_ssl'
+                WHERE userId = ? AND provider IN ({SUPPORTED_NON_SSL_PROVIDER_SQL})
                 ORDER BY createdAt ASC, id ASC
                 """,
-                (user_id,),
+                (user_id, *SUPPORTED_NON_SSL_PROVIDER_TYPES),
             ).fetchall()
-            accel_rows = c.execute(
-                """
-                SELECT id, dnsCredentialId, zoneName, pluginProvider, pluginCredentialId, remoteSiteId,
-                       accelerationDomain, subDomain, siteStatus, domainStatus, verifyStatus, identificationStatus,
-                       verified, paused, accessType, area, planId, cnameTarget, cnameStatus,
-                       originType, originValue, backupOriginValue, hostHeader, originProtocol,
-                       httpOriginPort, httpsOriginPort, ipv6Status,
-                       verifyRecordName, verifyRecordType, verifyRecordValue, lastError,
-                       lastSyncedAt, createdAt, updatedAt
-                FROM domain_accelerations
-                WHERE userId = ?
-                ORDER BY createdAt ASC, id ASC
-                """,
-                (user_id,),
-            ).fetchall() if table_exists("domain_accelerations") else []
             payload["data"]["dns"] = {
                 "credentials": [
                     {
@@ -371,45 +388,6 @@ def export_backup_payload(user_id: int, scopes: List[str]) -> Dict[str, Any]:
                         "updatedAt": row["updatedAt"],
                     }
                     for row in rows
-                ],
-                "accelerations": [
-                    {
-                        "id": int(row["id"]),
-                        "dnsCredentialId": int(row["dnsCredentialId"]),
-                        "zoneName": row["zoneName"],
-                        "pluginProvider": row["pluginProvider"],
-                        "pluginCredentialId": int(row["pluginCredentialId"]),
-                        "remoteSiteId": row["remoteSiteId"],
-                        "accelerationDomain": row["accelerationDomain"],
-                        "subDomain": row["subDomain"],
-                        "siteStatus": row["siteStatus"],
-                        "domainStatus": row["domainStatus"],
-                        "verifyStatus": row["verifyStatus"],
-                        "identificationStatus": row["identificationStatus"],
-                        "verified": bool(row["verified"]),
-                        "paused": bool(row["paused"]),
-                        "accessType": row["accessType"],
-                        "area": row["area"],
-                        "planId": row["planId"],
-                        "cnameTarget": row["cnameTarget"],
-                        "cnameStatus": row["cnameStatus"],
-                        "originType": row["originType"],
-                        "originValue": row["originValue"],
-                        "backupOriginValue": row["backupOriginValue"],
-                        "hostHeader": row["hostHeader"],
-                        "originProtocol": row["originProtocol"],
-                        "httpOriginPort": row["httpOriginPort"],
-                        "httpsOriginPort": row["httpsOriginPort"],
-                        "ipv6Status": row["ipv6Status"],
-                        "verifyRecordName": row["verifyRecordName"],
-                        "verifyRecordType": row["verifyRecordType"],
-                        "verifyRecordValue": row["verifyRecordValue"],
-                        "lastError": row["lastError"],
-                        "lastSyncedAt": row["lastSyncedAt"],
-                        "createdAt": row["createdAt"],
-                        "updatedAt": row["updatedAt"],
-                    }
-                    for row in accel_rows
                 ],
             }
 
@@ -490,7 +468,6 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
 
     result = {
         "dnsCredentials": 0,
-        "domainAccelerations": 0,
         "sslCredentials": 0,
         "sslCertificates": 0,
     }
@@ -503,9 +480,10 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                 if isinstance(cred_items, list):
                     credential_id_map: Dict[int, int] = {}
                     if overwrite:
-                        c.execute("DELETE FROM dns_credentials WHERE userId = ? AND provider != 'tencent_ssl'", (user_id,))
-                        if table_exists("domain_accelerations"):
-                            c.execute("DELETE FROM domain_accelerations WHERE userId = ?", (user_id,))
+                        c.execute(
+                            f"DELETE FROM dns_credentials WHERE userId = ? AND provider IN ({SUPPORTED_NON_SSL_PROVIDER_SQL})",
+                            (user_id, *SUPPORTED_NON_SSL_PROVIDER_TYPES),
+                        )
                     for item in cred_items:
                         if not isinstance(item, dict):
                             continue
@@ -513,6 +491,8 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                         provider = str(item.get("provider") or "").strip()
                         secrets = item.get("secrets")
                         if not name or not provider or not isinstance(secrets, dict):
+                            continue
+                        if provider not in SUPPORTED_NON_SSL_PROVIDER_SET:
                             continue
                         c.execute(
                             """
@@ -534,67 +514,6 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                         if old_id > 0:
                             credential_id_map[old_id] = int(c.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
                         result["dnsCredentials"] += 1
-                    accel_items = dns_block.get("accelerations")
-                    if isinstance(accel_items, list) and table_exists("domain_accelerations"):
-                        for item in accel_items:
-                            if not isinstance(item, dict):
-                                continue
-                            dns_cred_id = credential_id_map.get(int(item.get("dnsCredentialId") or 0))
-                            plugin_cred_id = credential_id_map.get(int(item.get("pluginCredentialId") or 0))
-                            zone_name = str(item.get("zoneName") or "").strip()
-                            plugin_provider = str(item.get("pluginProvider") or "").strip()
-                            if not dns_cred_id or not plugin_cred_id or not zone_name or not plugin_provider:
-                                continue
-                            c.execute(
-                                """
-                                INSERT INTO domain_accelerations (
-                                  userId, dnsCredentialId, zoneName, pluginProvider, pluginCredentialId,
-                                  remoteSiteId, accelerationDomain, subDomain, siteStatus, domainStatus, verifyStatus, identificationStatus,
-                                  verified, paused, accessType, area, planId, cnameTarget, cnameStatus,
-                                  originType, originValue, backupOriginValue, hostHeader, originProtocol,
-                                  httpOriginPort, httpsOriginPort, ipv6Status,
-                                  verifyRecordName, verifyRecordType, verifyRecordValue, lastError,
-                                  lastSyncedAt, createdAt, updatedAt
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    user_id,
-                                    dns_cred_id,
-                                    zone_name,
-                                    plugin_provider,
-                                    plugin_cred_id,
-                                    str(item.get("remoteSiteId") or ""),
-                                    str(item.get("accelerationDomain") or ""),
-                                    str(item.get("subDomain") or "@"),
-                                    str(item.get("siteStatus") or ""),
-                                    str(item.get("domainStatus") or ""),
-                                    str(item.get("verifyStatus") or ""),
-                                    str(item.get("identificationStatus") or ""),
-                                    1 if bool(item.get("verified")) else 0,
-                                    1 if bool(item.get("paused")) else 0,
-                                    str(item.get("accessType") or "partial"),
-                                    str(item.get("area") or "global"),
-                                    str(item.get("planId") or ""),
-                                    str(item.get("cnameTarget") or ""),
-                                    str(item.get("cnameStatus") or ""),
-                                    str(item.get("originType") or ""),
-                                    str(item.get("originValue") or ""),
-                                    str(item.get("backupOriginValue") or ""),
-                                    str(item.get("hostHeader") or ""),
-                                    str(item.get("originProtocol") or "FOLLOW"),
-                                    int(item.get("httpOriginPort") or 80),
-                                    int(item.get("httpsOriginPort") or 443),
-                                    str(item.get("ipv6Status") or "follow"),
-                                    str(item.get("verifyRecordName") or ""),
-                                    str(item.get("verifyRecordType") or ""),
-                                    str(item.get("verifyRecordValue") or ""),
-                                    str(item.get("lastError") or ""),
-                                    item.get("lastSyncedAt"),
-                                    str(item.get("createdAt") or now_iso()),
-                                    str(item.get("updatedAt") or now_iso()),
-                                ),
-                            )
-                            result["domainAccelerations"] += 1
 
         if "ssl" in selected:
             ssl_block = data.get("ssl")
@@ -615,6 +534,8 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                         provider = str(item.get("provider") or "tencent_ssl").strip() or "tencent_ssl"
                         secrets = item.get("secrets")
                         if not name or not isinstance(secrets, dict):
+                            continue
+                        if provider not in SUPPORTED_SSL_PROVIDER_SET:
                             continue
                         cur = c.execute(
                             """
@@ -644,7 +565,8 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                         remote_cert_id = str(item.get("remoteCertId") or "").strip()
                         old_cred_id = int(item.get("credentialId") or 0)
                         new_cred_id = credential_id_map.get(old_cred_id)
-                        if not remote_cert_id or not new_cred_id:
+                        cert_provider = str(item.get("provider") or "tencent_ssl").strip() or "tencent_ssl"
+                        if not remote_cert_id or not new_cred_id or cert_provider not in SUPPORTED_SSL_PROVIDER_SET:
                             continue
                         c.execute(
                             """
@@ -657,7 +579,7 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                             (
                                 user_id,
                                 new_cred_id,
-                                str(item.get("provider") or "tencent_ssl").strip() or "tencent_ssl",
+                                cert_provider,
                                 remote_cert_id,
                                 str(item.get("domain") or "").strip(),
                                 item.get("san"),
@@ -686,116 +608,6 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
 def init_db() -> None:
     run_db_migrations(DB)
     with conn() as c:
-        if table_exists("domain_accelerations"):
-            row = c.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'domain_accelerations' LIMIT 1"
-            ).fetchone()
-            accel_sql = str(row["sql"] or "") if row else ""
-            normalized_accel_sql = re.sub(r"\s+", "", accel_sql).lower()
-            old_unique = "unique(userid,dnscredentialid,zonename,pluginprovider)"
-            new_unique = "unique(userid,dnscredentialid,zonename,pluginprovider,accelerationdomain)"
-            if old_unique in normalized_accel_sql and new_unique not in normalized_accel_sql:
-                c.execute(
-                    """
-                    CREATE TABLE domain_accelerations_v2 (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        userId INTEGER NOT NULL,
-                        dnsCredentialId INTEGER NOT NULL,
-                        zoneName TEXT NOT NULL,
-                        pluginProvider TEXT NOT NULL,
-                        pluginCredentialId INTEGER NOT NULL,
-                        remoteSiteId TEXT DEFAULT '',
-                        accelerationDomain TEXT DEFAULT '',
-                        subDomain TEXT DEFAULT '@',
-                        siteStatus TEXT DEFAULT '',
-                        domainStatus TEXT DEFAULT '',
-                        verifyStatus TEXT DEFAULT '',
-                        identificationStatus TEXT DEFAULT '',
-                        verified INTEGER NOT NULL DEFAULT 0,
-                        paused INTEGER NOT NULL DEFAULT 0,
-                        accessType TEXT DEFAULT 'partial',
-                        area TEXT DEFAULT 'global',
-                        planId TEXT DEFAULT '',
-                        cnameTarget TEXT DEFAULT '',
-                        cnameStatus TEXT DEFAULT '',
-                        originType TEXT DEFAULT '',
-                        originValue TEXT DEFAULT '',
-                        backupOriginValue TEXT DEFAULT '',
-                        hostHeader TEXT DEFAULT '',
-                        originProtocol TEXT DEFAULT 'FOLLOW',
-                        httpOriginPort INTEGER DEFAULT 80,
-                        httpsOriginPort INTEGER DEFAULT 443,
-                        ipv6Status TEXT DEFAULT 'follow',
-                        verifyRecordName TEXT DEFAULT '',
-                        verifyRecordType TEXT DEFAULT '',
-                        verifyRecordValue TEXT DEFAULT '',
-                        lastError TEXT DEFAULT '',
-                        lastSyncedAt TEXT,
-                        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(userId, dnsCredentialId, zoneName, pluginProvider, accelerationDomain)
-                    )
-                    """
-                )
-                c.execute(
-                    """
-                    INSERT INTO domain_accelerations_v2 (
-                        id, userId, dnsCredentialId, zoneName, pluginProvider, pluginCredentialId,
-                        remoteSiteId, accelerationDomain, subDomain, siteStatus, domainStatus, verifyStatus, identificationStatus,
-                        verified, paused, accessType, area, planId, cnameTarget, cnameStatus,
-                        originType, originValue, backupOriginValue, hostHeader, originProtocol,
-                        httpOriginPort, httpsOriginPort, ipv6Status,
-                        verifyRecordName, verifyRecordType, verifyRecordValue, lastError, lastSyncedAt, createdAt, updatedAt
-                    )
-                    SELECT
-                        id,
-                        userId,
-                        dnsCredentialId,
-                        zoneName,
-                        pluginProvider,
-                        pluginCredentialId,
-                        remoteSiteId,
-                        CASE
-                            WHEN accelerationDomain IS NULL OR TRIM(accelerationDomain) = '' THEN zoneName
-                            ELSE accelerationDomain
-                        END AS accelerationDomain,
-                        CASE
-                            WHEN subDomain IS NULL OR TRIM(subDomain) = '' THEN '@'
-                            ELSE subDomain
-                        END AS subDomain,
-                        siteStatus,
-                        domainStatus,
-                        verifyStatus,
-                        identificationStatus,
-                        verified,
-                        paused,
-                        accessType,
-                        area,
-                        planId,
-                        cnameTarget,
-                        cnameStatus,
-                        originType,
-                        originValue,
-                        backupOriginValue,
-                        hostHeader,
-                        originProtocol,
-                        httpOriginPort,
-                        httpsOriginPort,
-                        ipv6Status,
-                        verifyRecordName,
-                        verifyRecordType,
-                        verifyRecordValue,
-                        lastError,
-                        lastSyncedAt,
-                        createdAt,
-                        updatedAt
-                    FROM domain_accelerations
-                    """
-                )
-                c.execute("DROP TABLE domain_accelerations")
-                c.execute("ALTER TABLE domain_accelerations_v2 RENAME TO domain_accelerations")
-                c.execute("CREATE INDEX IF NOT EXISTS idx_domain_accelerations_user_zone ON domain_accelerations(userId, zoneName)")
-                c.execute("CREATE INDEX IF NOT EXISTS idx_domain_accelerations_dns_cred ON domain_accelerations(dnsCredentialId)")
         if table_exists("users"):
             cols = {str(row["name"]) for row in c.execute("PRAGMA table_info(users)").fetchall()}
             if "role" not in cols:
@@ -842,69 +654,6 @@ def init_db() -> None:
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_certs_user ON ssl_certificates(userId)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_certs_cred ON ssl_certificates(credentialId)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_certs_status ON ssl_certificates(status)")
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS domain_accelerations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                userId INTEGER NOT NULL,
-                dnsCredentialId INTEGER NOT NULL,
-                zoneName TEXT NOT NULL,
-                pluginProvider TEXT NOT NULL,
-                pluginCredentialId INTEGER NOT NULL,
-                remoteSiteId TEXT DEFAULT '',
-                accelerationDomain TEXT DEFAULT '',
-                subDomain TEXT DEFAULT '@',
-                siteStatus TEXT DEFAULT '',
-                domainStatus TEXT DEFAULT '',
-                verifyStatus TEXT DEFAULT '',
-                identificationStatus TEXT DEFAULT '',
-                verified INTEGER NOT NULL DEFAULT 0,
-                paused INTEGER NOT NULL DEFAULT 0,
-                accessType TEXT DEFAULT 'partial',
-                area TEXT DEFAULT 'global',
-                planId TEXT DEFAULT '',
-                cnameTarget TEXT DEFAULT '',
-                cnameStatus TEXT DEFAULT '',
-                originType TEXT DEFAULT '',
-                originValue TEXT DEFAULT '',
-                backupOriginValue TEXT DEFAULT '',
-                hostHeader TEXT DEFAULT '',
-                originProtocol TEXT DEFAULT 'FOLLOW',
-                httpOriginPort INTEGER DEFAULT 80,
-                httpsOriginPort INTEGER DEFAULT 443,
-                ipv6Status TEXT DEFAULT 'follow',
-                verifyRecordName TEXT DEFAULT '',
-                verifyRecordType TEXT DEFAULT '',
-                verifyRecordValue TEXT DEFAULT '',
-                lastError TEXT DEFAULT '',
-                lastSyncedAt TEXT,
-              createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-              updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-              UNIQUE(userId, dnsCredentialId, zoneName, pluginProvider, accelerationDomain)
-            )
-            """
-        )
-        c.execute("CREATE INDEX IF NOT EXISTS idx_domain_accelerations_user_zone ON domain_accelerations(userId, zoneName)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_domain_accelerations_dns_cred ON domain_accelerations(dnsCredentialId)")
-        accel_columns = {
-            "accelerationDomain": "TEXT DEFAULT ''",
-            "subDomain": "TEXT DEFAULT '@'",
-            "domainStatus": "TEXT DEFAULT ''",
-            "identificationStatus": "TEXT DEFAULT ''",
-            "cnameTarget": "TEXT DEFAULT ''",
-            "cnameStatus": "TEXT DEFAULT ''",
-            "originType": "TEXT DEFAULT ''",
-            "originValue": "TEXT DEFAULT ''",
-            "backupOriginValue": "TEXT DEFAULT ''",
-            "hostHeader": "TEXT DEFAULT ''",
-            "originProtocol": "TEXT DEFAULT 'FOLLOW'",
-            "httpOriginPort": "INTEGER DEFAULT 80",
-            "httpsOriginPort": "INTEGER DEFAULT 443",
-            "ipv6Status": "TEXT DEFAULT 'follow'",
-        }
-        for column_name, column_type in accel_columns.items():
-            if not column_exists("domain_accelerations", column_name):
-                c.execute(f"ALTER TABLE domain_accelerations ADD COLUMN {column_name} {column_type}")
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS system_settings (
@@ -1523,6 +1272,7 @@ class H(BaseHTTPRequestHandler):
                     "nativeRoutes": [
                         "/api/auth/*",
                         "/api/dns-credentials/*",
+                        "/api/accelerations/*",
                         "/api/dns-records/*",
                         "/api/hostnames/*",
                         "/api/tunnels/*",
@@ -1530,7 +1280,6 @@ class H(BaseHTTPRequestHandler):
                         "/api/logs/*",
                         "/api/domain-expiry/*",
                         "/api/dashboard/*",
-                        "/api/accelerations/*",
                         "/api/ssl/*",
                     ],
                     "proxyBase": LEGACY,
@@ -1551,6 +1300,9 @@ class H(BaseHTTPRequestHandler):
         if path.startswith("/api/dns-credentials"):
             self._dns_credentials_routes(path, q, b)
             return
+        if path.startswith("/api/accelerations"):
+            self._acceleration_routes(path, q, b)
+            return
         if path.startswith("/api/dns-records"):
             self._dns_records_routes(path, q, b)
             return
@@ -1565,9 +1317,6 @@ class H(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/dashboard"):
             self._dashboard(path, q, b)
-            return
-        if path.startswith("/api/accelerations"):
-            self._acceleration_routes(path, q, b)
             return
         if path.startswith("/api/ssl"):
             self._ssl_routes(path, q, b)
@@ -1735,6 +1484,28 @@ class H(BaseHTTPRequestHandler):
         if not access_key_id or not access_key_secret:
             raise ValueError("缺少阿里云 AccessKeyId/AccessKeySecret")
         return {"credentialId": row["id"], "accessKeyId": access_key_id, "accessKeySecret": access_key_secret}
+
+    def _acceleration_auth(self, user_id: int, credential_id: int | None, provider: str | None = None) -> Dict[str, Any]:
+        raw_provider = str(provider or "").strip().lower()
+        row = None
+        if raw_provider:
+            row = self._get_credential_row(user_id, credential_id, raw_provider, default_only=credential_id is None)
+        elif credential_id is not None:
+            row = self._get_credential_row(user_id, credential_id)
+        elif SUPPORTED_ACCELERATION_PROVIDER_TYPES:
+            for candidate in SUPPORTED_ACCELERATION_PROVIDER_TYPES:
+                row = self._get_credential_row(user_id, None, candidate, default_only=True) or self._get_credential_row(user_id, None, candidate)
+                if row:
+                    break
+        if not row:
+            raise ValueError("加速凭证不存在或无权访问")
+        resolved_provider = str(row["provider"] or "").strip().lower()
+        if resolved_provider not in SUPPORTED_ACCELERATION_PROVIDER_SET:
+            raise ValueError(f"该凭证不支持加速操作: {resolved_provider}")
+        secrets = self._credential_secrets(row)
+        validate_acceleration_credentials(resolved_provider, secrets)
+        plugin = build_acceleration_plugin(resolved_provider, secrets)
+        return {"credential": row, "provider": resolved_provider, "plugin": plugin, "api": getattr(plugin, "api", None)}
 
     @staticmethod
     def _norm_hostname(value: Any) -> str:
@@ -1920,7 +1691,17 @@ class H(BaseHTTPRequestHandler):
             if not row:
                 raise ValueError("凭证不存在或无权访问")
         else:
-            row = self._get_credential_row(uid, None, default_only=True)
+            with conn() as c:
+                row = c.execute(
+                    f"""
+                    SELECT *
+                    FROM dns_credentials
+                    WHERE userId = ? AND provider IN ({SUPPORTED_DNS_PROVIDER_SQL})
+                    ORDER BY isDefault DESC, createdAt ASC, id ASC
+                    LIMIT 1
+                    """,
+                    (uid, *SUPPORTED_DNS_PROVIDER_TYPES),
+                ).fetchone()
             if not row:
                 raise ValueError("未配置默认凭证")
         provider = str(row["provider"] or "").strip().lower()
@@ -2111,7 +1892,10 @@ class H(BaseHTTPRequestHandler):
         fail = sum(1 for x in done if x.get("status") == "failed")
         dur = [int(x.get("durationMs") or 0) for x in jobs if isinstance(x.get("durationMs"), int) and int(x.get("durationMs") or 0) > 0]
         with conn() as c:
-            creds = c.execute("SELECT provider FROM dns_credentials WHERE userId = ?", (uid,)).fetchall()
+            creds = c.execute(
+                f"SELECT provider FROM dns_credentials WHERE userId = ? AND provider IN ({SUPPORTED_DNS_PROVIDER_SQL})",
+                (uid, *SUPPORTED_DNS_PROVIDER_TYPES),
+            ).fetchall()
             logs = c.execute("SELECT action,status,recordType,newValue,oldValue FROM logs WHERE userId = ? AND datetime(timestamp)>=datetime(?)", (uid, t24.isoformat().replace("+00:00", "Z"))).fetchall()
             exp7 = c.execute("SELECT COUNT(*) c FROM domain_expiry_notifications WHERE userId = ? AND datetime(expiresAt)>=datetime('now') AND datetime(expiresAt)<=datetime(?)", (uid, (now() + timedelta(days=7)).isoformat().replace("+00:00", "Z"))).fetchone()["c"]
             exp30 = c.execute("SELECT COUNT(*) c FROM domain_expiry_notifications WHERE userId = ? AND datetime(expiresAt)>=datetime('now') AND datetime(expiresAt)<=datetime(?)", (uid, (now() + timedelta(days=30)).isoformat().replace("+00:00", "Z"))).fetchone()["c"]
@@ -2300,160 +2084,10 @@ class H(BaseHTTPRequestHandler):
 attach_route_methods(H, globals())
 
 
-def _load_credential_secrets_from_row(row: sqlite3.Row | None) -> Dict[str, Any]:
-    if not row:
-        return {}
-    plain = decrypt_text(row["secrets"])
-    try:
-        parsed = json.loads(plain)
-    except Exception:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _sync_acceleration_row(row: sqlite3.Row) -> None:
-    provider = str(row["pluginProvider"] or "").strip().lower()
-    zone_name = norm_domain(row["zoneName"])
-    remote_site_id = str(row["remoteSiteId"] or "").strip()
-    plugin_credential_id = int(row["pluginCredentialId"])
-    user_id = int(row["userId"])
-
-    with conn() as c:
-        cred_row = c.execute(
-            "SELECT * FROM dns_credentials WHERE id = ? AND userId = ? LIMIT 1",
-            (plugin_credential_id, user_id),
-        ).fetchone()
-    if not cred_row:
-        raise ValueError("加速凭证不存在")
-
-    plugin = build_acceleration_plugin(provider, _load_credential_secrets_from_row(cred_row))
-    row_config: Dict[str, Any] = {}
-    for key in (
-        "accelerationDomain",
-        "subDomain",
-        "originType",
-        "originValue",
-        "backupOriginValue",
-        "hostHeader",
-        "originProtocol",
-        "ipv6Status",
-    ):
-        value = row[key]
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            row_config[key] = text
-    for key in ("httpOriginPort", "httpsOriginPort"):
-        value = row[key]
-        if value in (None, ""):
-            continue
-        try:
-            row_config[key] = int(value)
-        except Exception:
-            pass
-    state = plugin.get_site(zone_name, remote_site_id, row_config or None)
-    with conn() as c:
-        c.execute(
-            """
-            UPDATE domain_accelerations
-            SET remoteSiteId = ?, accelerationDomain = ?, subDomain = ?, siteStatus = ?, domainStatus = ?,
-                verifyStatus = ?, identificationStatus = ?, verified = ?, paused = ?, accessType = ?, area = ?,
-                planId = ?, cnameTarget = ?, cnameStatus = ?, originType = ?, originValue = ?, backupOriginValue = ?,
-                hostHeader = ?, originProtocol = ?, httpOriginPort = ?, httpsOriginPort = ?, ipv6Status = ?,
-                verifyRecordName = ?, verifyRecordType = ?, verifyRecordValue = ?, lastError = '',
-                lastSyncedAt = ?, updatedAt = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (
-                str(state.get("remoteSiteId") or ""),
-                str(state.get("accelerationDomain") or ""),
-                str(state.get("subDomain") or "@"),
-                str(state.get("siteStatus") or ""),
-                str(state.get("domainStatus") or ""),
-                str(state.get("verifyStatus") or ""),
-                str(state.get("identificationStatus") or ""),
-                1 if bool(state.get("verified")) else 0,
-                1 if bool(state.get("paused")) else 0,
-                str(state.get("accessType") or "partial"),
-                str(state.get("area") or "global"),
-                str(state.get("planId") or ""),
-                str(state.get("cnameTarget") or ""),
-                str(state.get("cnameStatus") or ""),
-                str(state.get("originType") or ""),
-                str(state.get("originValue") or ""),
-                str(state.get("backupOriginValue") or ""),
-                str(state.get("hostHeader") or ""),
-                str(state.get("originProtocol") or "FOLLOW"),
-                int(state.get("httpOriginPort") or 80),
-                int(state.get("httpsOriginPort") or 443),
-                str(state.get("ipv6Status") or "follow"),
-                str(state.get("verifyRecordName") or ""),
-                str(state.get("verifyRecordType") or "TXT"),
-                str(state.get("verifyRecordValue") or ""),
-                now_iso(),
-                int(row["id"]),
-            ),
-        )
-        c.commit()
-
-
-def sync_domain_accelerations_once() -> Dict[str, int]:
-    if not table_exists("domain_accelerations"):
-        return {"synced": 0, "failed": 0}
-
-    with conn() as c:
-        rows = c.execute(
-            "SELECT * FROM domain_accelerations ORDER BY updatedAt DESC, id DESC"
-        ).fetchall()
-
-    synced = 0
-    failed = 0
-    for row in rows:
-        try:
-            _sync_acceleration_row(row)
-            synced += 1
-        except Exception as exc:
-            failed += 1
-            try:
-                with conn() as c:
-                    c.execute(
-                        """
-                        UPDATE domain_accelerations
-                        SET lastError = ?, lastSyncedAt = ?, updatedAt = CURRENT_TIMESTAMP
-                        WHERE id = ?
-                        """,
-                        (str(exc), now_iso(), int(row["id"])),
-                    )
-                    c.commit()
-            except Exception:
-                pass
-    return {"synced": synced, "failed": failed}
-
-
-def start_acceleration_sync_thread() -> threading.Thread | None:
-    if ACCELERATION_SYNC_INTERVAL_SECONDS <= 0:
-        return None
-
-    def _runner() -> None:
-        if ACCELERATION_SYNC_STARTUP_DELAY_SECONDS > 0:
-            time.sleep(ACCELERATION_SYNC_STARTUP_DELAY_SECONDS)
-        while True:
-            try:
-                sync_domain_accelerations_once()
-            except Exception:
-                pass
-            time.sleep(ACCELERATION_SYNC_INTERVAL_SECONDS)
-
-    thread = threading.Thread(target=_runner, name="acceleration-auto-sync", daemon=True)
-    thread.start()
-    return thread
-
 def main() -> None:
     init_db()
     from modules.cache import cache_ping
     redis_ok = cache_ping()
-    start_acceleration_sync_thread()
     s = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     print(json.dumps({"message": "Python Backend V2 started", "port": PORT, "legacyProxy": LEGACY, "databasePath": str(DB), "redis": "connected" if redis_ok else "unavailable (degraded mode)"}, ensure_ascii=False))
     try:

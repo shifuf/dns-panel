@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Protocol
-
-from modules.tencent_edgeone_api import TencentEdgeOneApi, TencentEdgeOneApiError
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Protocol
+import importlib
+import pkgutil
+import threading
 
 
 class AccelerationPluginError(Exception):
@@ -12,224 +14,155 @@ class AccelerationPluginError(Exception):
 
 
 class AccelerationPlugin(Protocol):
-    provider: str
+    def list_sites(self) -> list[Dict[str, Any]]: ...
 
-    def ensure_site(self, zone_name: str, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        ...
+    def discover_site(self, zone_name: str) -> Dict[str, Any] | None: ...
 
-    def list_sites(self) -> list[Dict[str, Any]]:
-        ...
-
-    def discover_site(self, zone_name: str) -> Dict[str, Any] | None:
-        ...
-
-    def get_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        ...
-
-    def verify_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        ...
-
-    def set_site_status(self, zone_name: str, site_id: str | None, enabled: bool, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        ...
-
-    def delete_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        ...
-
-
-class TencentEdgeOneAccelerationPlugin:
-    provider = "tencent_edgeone"
-
-    def __init__(self, secrets: Dict[str, Any]) -> None:
-        self._secrets = dict(secrets or {})
-        self.api = TencentEdgeOneApi(
-            str(self._secrets.get("secretId") or "").strip(),
-            str(self._secrets.get("secretKey") or "").strip(),
-            str(self._secrets.get("planId") or "").strip() or None,
-            str(self._secrets.get("endpoint") or "").strip() or None,
-        )
-
-    @staticmethod
-    def _sub_domain(zone_name: str, acceleration_domain: str) -> str:
-        zone = TencentEdgeOneApi.normalize_zone_name(zone_name)
-        target = TencentEdgeOneApi.normalize_domain_name(acceleration_domain)
-        if not zone or not target or target == zone:
-            return "@"
-        suffix = f".{zone}"
-        return target[:-len(suffix)] if target.endswith(suffix) else target
-
-    def _build_acceleration_domain(self, zone_name: str, config: Dict[str, Any] | None = None) -> str:
-        cfg = dict(config or {})
-        explicit = TencentEdgeOneApi.normalize_domain_name(str(cfg.get("accelerationDomain") or ""))
-        if explicit:
-            return explicit
-        sub_domain = str(cfg.get("subDomain") or "@").strip()
-        zone = TencentEdgeOneApi.normalize_zone_name(zone_name)
-        if not zone:
-            raise AccelerationPluginError("缺少根域名", 400)
-        if not sub_domain or sub_domain == "@":
-            return zone
-        normalized_sub = sub_domain.rstrip(".").lower()
-        if normalized_sub.endswith(f".{zone}"):
-            return normalized_sub
-        return f"{normalized_sub}.{zone}"
-
-    def _resolve_target_domain(self, zone_name: str, config: Dict[str, Any] | None = None) -> str:
-        return self._build_acceleration_domain(zone_name, config)
-
-    def _find_matching_domain(self, zone: Dict[str, Any], zone_name: str, config: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
-        site_id = str(zone.get("siteId") or "")
-        if not site_id:
-            return None
-        target = self._resolve_target_domain(zone_name, config)
-        items = self.api.list_acceleration_domains(site_id).get("items") or []
-        for item in items:
-            if TencentEdgeOneApi.normalize_domain_name(item.get("domainName")) == target:
-                return item
-        return None
-
-    def _to_state(
+    def get_site(
         self,
         zone_name: str,
-        zone: Dict[str, Any],
-        domain: Dict[str, Any] | None = None,
-        verification: Dict[str, Any] | None = None,
+        site_id: str | None = None,
         config: Dict[str, Any] | None = None,
-    ) -> Dict[str, Any]:
-        verification = verification or {}
-        domain_data = domain if isinstance(domain, dict) else {}
-        fallback_domain = self._resolve_target_domain(zone_name, config) if config else str(zone_name)
-        acceleration_domain = str(domain_data.get("domainName") or fallback_domain) if domain_data else fallback_domain
-        site_status = str(zone.get("status") or "unknown")
-        domain_status = str(domain_data.get("domainStatus") or site_status) if domain_data else site_status
-        verify_status = str(
-            domain_data.get("identificationStatus")
-            or domain_data.get("cnameStatus")
-            or zone.get("verifyStatus")
-            or domain_status
-        ) if domain_data else str(zone.get("verifyStatus") or site_status)
-        return {
-            "provider": self.provider,
-            "remoteSiteId": str(zone.get("siteId") or ""),
-            "zoneName": str(zone.get("zoneName") or zone_name),
-            "siteStatus": site_status,
-            "verifyStatus": verify_status,
-            "verified": bool(domain_data.get("verified")) if domain_data else bool(zone.get("verified")),
-            "paused": bool(domain_data.get("paused")) if domain_data else bool(zone.get("paused")),
-            "accessType": str(zone.get("type") or "partial"),
-            "area": str(zone.get("area") or "global"),
-            "planId": str(zone.get("planId") or self._secrets.get("planId") or ""),
-            "accelerationDomain": acceleration_domain,
-            "subDomain": self._sub_domain(str(zone.get("zoneName") or zone_name), acceleration_domain),
-            "domainStatus": domain_status,
-            "identificationStatus": str(domain_data.get("identificationStatus") or verify_status) if domain_data else verify_status,
-            "cnameTarget": str(domain_data.get("cnameTarget") or ""),
-            "cnameStatus": str(domain_data.get("cnameStatus") or verify_status) if domain_data else verify_status,
-            "originType": str(domain_data.get("originType") or "IP_DOMAIN"),
-            "originValue": str(domain_data.get("originValue") or ""),
-            "backupOriginValue": str(domain_data.get("backupOriginValue") or ""),
-            "hostHeader": str(domain_data.get("hostHeader") or ""),
-            "originProtocol": str(domain_data.get("originProtocol") or "FOLLOW"),
-            "httpOriginPort": int(domain_data.get("httpOriginPort") or 80),
-            "httpsOriginPort": int(domain_data.get("httpsOriginPort") or 443),
-            "ipv6Status": str(domain_data.get("ipv6Status") or "follow"),
-            "verifyRecordName": str(verification.get("recordName") or domain_data.get("verifyRecordName") or ""),
-            "verifyRecordType": str(verification.get("recordType") or domain_data.get("verifyRecordType") or "TXT"),
-            "verifyRecordValue": str(verification.get("recordValue") or domain_data.get("verifyRecordValue") or ""),
-            "raw": {
-                "zone": zone.get("raw") if isinstance(zone.get("raw"), dict) else zone,
-                "domain": domain_data.get("raw") if isinstance(domain_data.get("raw"), dict) else domain,
-            },
+    ) -> Dict[str, Any]: ...
+
+    def ensure_site(self, zone_name: str, config: Dict[str, Any] | None = None) -> Dict[str, Any]: ...
+
+    def verify_site(
+        self,
+        zone_name: str,
+        site_id: str | None = None,
+        config: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]: ...
+
+    def set_site_status(
+        self,
+        zone_name: str,
+        site_id: str | None,
+        enabled: bool,
+        config: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]: ...
+
+    def delete_site(
+        self,
+        zone_name: str,
+        site_id: str | None = None,
+        config: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]: ...
+
+
+@dataclass
+class AccelerationPluginDefinition:
+    provider: str
+    name: str
+    auth_fields: list[Dict[str, Any]]
+    factory: Callable[[Dict[str, Any]], AccelerationPlugin]
+    validator: Callable[[Dict[str, Any]], None] | None = None
+    icon: str | None = None
+    capability_overrides: Dict[str, Any] = field(default_factory=dict)
+
+    def to_capabilities(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "provider": str(self.provider or "").strip().lower(),
+            "name": self.name,
+            "category": "acceleration",
+            "supportsWeight": False,
+            "supportsLine": False,
+            "supportsStatus": True,
+            "supportsRemark": False,
+            "supportsUrlForward": False,
+            "supportsLogs": True,
+            "remarkMode": "unsupported",
+            "paging": "server",
+            "requiresDomainId": False,
+            "recordTypes": [],
+            "authFields": list(self.auth_fields or []),
+            "domainCacheTtl": 60,
+            "recordCacheTtl": 0,
+            "retryableErrors": [],
+            "maxRetries": 2,
         }
+        if self.icon:
+            data["icon"] = self.icon
+        if self.capability_overrides:
+            data.update(self.capability_overrides)
+            data["provider"] = str(self.provider or "").strip().lower()
+            data["name"] = self.name
+            data["category"] = "acceleration"
+            data["authFields"] = list(self.auth_fields or [])
+        return data
 
-    def ensure_site(self, zone_name: str, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        existing = self.api.find_zone_by_name(zone_name)
-        if existing:
-            zone = self.api.describe_zone(zone_name, existing.get("siteId"))
-        else:
-            created = self.api.create_zone(zone_name)
-            zone = self.api.describe_zone(zone_name, created.get("siteId"))
-            verification = created.get("verification") or {}
-            if config and str(config.get("originValue") or "").strip():
-                domain_name = self._build_acceleration_domain(zone_name, config)
-                domain = self.api.upsert_acceleration_domain(str(zone.get("siteId") or ""), domain_name, config)
-                return self._to_state(zone_name, zone, domain, verification, config)
-            return self._to_state(zone_name, zone, None, verification, config)
 
-        if config and str(config.get("originValue") or "").strip():
-            domain_name = self._build_acceleration_domain(zone_name, config)
-            domain = self.api.upsert_acceleration_domain(str(zone.get("siteId") or ""), domain_name, config)
-            return self._to_state(zone_name, zone, domain, None, config)
+_PLUGIN_REGISTRY: dict[str, AccelerationPluginDefinition] = {}
+_PLUGINS_LOADED = False
+_LOAD_LOCK = threading.Lock()
 
-        domain = self._find_matching_domain(zone, zone_name, config)
-        return self._to_state(zone_name, zone, domain, None, config)
 
-    def list_sites(self) -> list[Dict[str, Any]]:
-        offset = 0
-        limit = 100
-        out: list[Dict[str, Any]] = []
-        for _ in range(20):
-            result = self.api.list_zones(offset=offset, limit=limit)
-            zones = result.get("zones") or []
-            for zone in zones:
-                domains = self.api.list_acceleration_domains(str(zone.get("siteId") or "")).get("items") or []
-                if domains:
-                    for domain in domains:
-                        out.append(self._to_state(str(zone.get("zoneName") or ""), zone, domain))
-                else:
-                    out.append(self._to_state(str(zone.get("zoneName") or ""), zone, None))
-            if len(zones) < limit:
-                break
-            offset += limit
-        return out
+def register_acceleration_plugin(definition: AccelerationPluginDefinition) -> None:
+    provider = str(definition.provider or "").strip().lower()
+    if not provider:
+        raise AccelerationPluginError("加速插件缺少 provider 标识", 500)
+    normalized = AccelerationPluginDefinition(
+        provider=provider,
+        name=str(definition.name or provider).strip() or provider,
+        auth_fields=list(definition.auth_fields or []),
+        factory=definition.factory,
+        validator=definition.validator,
+        icon=definition.icon,
+        capability_overrides=dict(definition.capability_overrides or {}),
+    )
+    _PLUGIN_REGISTRY[provider] = normalized
 
-    def discover_site(self, zone_name: str) -> Dict[str, Any] | None:
-        existing = self.api.find_zone_by_name(zone_name)
-        if not existing:
-            return None
-        return self.get_site(zone_name, existing.get("siteId"))
 
-    def get_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        zone = self.api.describe_zone(zone_name, zone_id=site_id)
-        domain = self._find_matching_domain(zone, zone_name, config)
-        verification: Dict[str, Any] = {}
-        if not zone.get("verified"):
-            try:
-                identification = self.api.identify_zone(zone_name)
-                verification = identification.get("verification") or {}
-                identified_zone = identification.get("zone")
-                if isinstance(identified_zone, dict):
-                    zone = identified_zone
-            except TencentEdgeOneApiError:
-                pass
-        return self._to_state(zone_name, zone, domain, verification, config)
-
-    def verify_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def ensure_acceleration_plugins_loaded() -> None:
+    global _PLUGINS_LOADED
+    if _PLUGINS_LOADED:
+        return
+    with _LOAD_LOCK:
+        if _PLUGINS_LOADED:
+            return
         try:
-            self.api.identify_zone(zone_name)
-        except TencentEdgeOneApiError:
-            pass
-        return self.get_site(zone_name, site_id=site_id, config=config)
+            package = importlib.import_module("modules.acceleration_plugins")
+            package_path = getattr(package, "__path__", None)
+            if package_path:
+                prefix = f"{package.__name__}."
+                for module_info in pkgutil.iter_modules(package_path, prefix):
+                    importlib.import_module(module_info.name)
+            _PLUGINS_LOADED = True
+        except ModuleNotFoundError:
+            _PLUGINS_LOADED = True
 
-    def set_site_status(self, zone_name: str, site_id: str | None, enabled: bool, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        zone = self.api.describe_zone(zone_name, zone_id=site_id)
-        domain = self._find_matching_domain(zone, zone_name, config)
-        if domain and domain.get("domainName"):
-            self.api.modify_acceleration_domain_statuses(str(zone.get("siteId") or ""), [str(domain.get("domainName") or "")], enabled)
-            domain = self.api.get_acceleration_domain(str(zone.get("siteId") or ""), str(domain.get("domainName") or ""))
-            return self._to_state(zone_name, zone, domain, None, config)
-        self.api.modify_zone_status(str(zone.get("siteId") or ""), enabled)
-        return self.get_site(zone_name, str(zone.get("siteId") or ""), config=config)
 
-    def delete_site(self, zone_name: str, site_id: str | None = None, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        zone = self.api.describe_zone(zone_name, zone_id=site_id)
-        domain = self._find_matching_domain(zone, zone_name, config)
-        if domain and domain.get("domainName"):
-            return self.api.delete_acceleration_domains(str(zone.get("siteId") or ""), [str(domain.get("domainName") or "")])
-        return self.api.delete_zone(str(zone.get("siteId") or ""))
+def get_acceleration_provider_capabilities() -> list[Dict[str, Any]]:
+    ensure_acceleration_plugins_loaded()
+    return [item.to_capabilities() for item in _PLUGIN_REGISTRY.values()]
+
+
+def get_registered_acceleration_providers() -> tuple[str, ...]:
+    ensure_acceleration_plugins_loaded()
+    return tuple(_PLUGIN_REGISTRY.keys())
+
+
+def get_acceleration_plugin_definition(provider: str) -> AccelerationPluginDefinition | None:
+    ensure_acceleration_plugins_loaded()
+    return _PLUGIN_REGISTRY.get(str(provider or "").strip().lower())
 
 
 def build_acceleration_plugin(provider: str, secrets: Dict[str, Any]) -> AccelerationPlugin:
-    provider_key = str(provider or "").strip().lower()
-    if provider_key == "tencent_edgeone":
-        return TencentEdgeOneAccelerationPlugin(secrets)
-    raise AccelerationPluginError(f"不支持的加速插件: {provider}", 400)
+    definition = get_acceleration_plugin_definition(provider)
+    if definition is None:
+        raise AccelerationPluginError(f"不支持的加速插件: {provider}", 400)
+    plugin = definition.factory(dict(secrets or {}))
+    if plugin is None:
+        raise AccelerationPluginError(f"加速插件初始化失败: {provider}", 500)
+    return plugin
+
+
+def validate_acceleration_credentials(provider: str, secrets: Dict[str, Any]) -> None:
+    definition = get_acceleration_plugin_definition(provider)
+    if definition is None:
+        raise AccelerationPluginError(f"不支持的加速插件: {provider}", 400)
+    payload = dict(secrets or {})
+    if callable(definition.validator):
+        definition.validator(payload)
+        return
+    build_acceleration_plugin(provider, payload)

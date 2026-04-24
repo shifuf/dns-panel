@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { useDialog } from 'naive-ui';
 import {
-  Globe2, LayoutDashboard, History, Settings, LogOut, ShieldCheck, Moon, Sun, Zap,
+  Globe2, LayoutDashboard, History, Settings, LogOut, ShieldCheck, Moon, Sun, Rocket,
 } from 'lucide-vue-next';
 import { useTheme } from '@/composables/useTheme';
 import { useProviderStore } from '@/stores/provider';
@@ -172,9 +172,9 @@ function goToSsl() {
   navigate('/ssl');
 }
 
-function goToAccelerations() {
+function goToEdgeOne() {
   providerStore.selectProvider(null);
-  navigate('/accelerations');
+  navigate('/edgeone');
 }
 
 
@@ -214,7 +214,7 @@ async function navigate(path: string) {
       </div>
     </header>
 
-    <button class="nav-btn" :class="{ active: !providerStore.selectedProvider && route.path !== '/ssl' && route.path !== '/accelerations' }" @click="goToDashboard">
+    <button class="nav-btn" :class="{ active: route.path === '/' }" @click="goToDashboard">
       <LayoutDashboard :size="18" />
       总览仪表盘
     </button>
@@ -224,9 +224,9 @@ async function navigate(path: string) {
       SSL 证书
     </button>
 
-    <button class="nav-btn" :class="{ active: route.path === '/accelerations' }" @click="goToAccelerations">
-      <Zap :size="18" />
-      加速管理
+    <button class="nav-btn" :class="{ active: route.path === '/edgeone' }" @click="goToEdgeOne">
+      <Rocket :size="18" />
+      EdgeOne 加速
     </button>
 
     <div class="providers-section">

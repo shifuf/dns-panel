@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
-import { NAlert, NButton, NSpin, NTag, useMessage } from 'naive-ui';
+import { NButton, NSpin, NTag, useMessage } from 'naive-ui';
 import { Plus, RefreshCw, Globe } from 'lucide-vue-next';
 import {
   getDNSRecords,
@@ -12,34 +12,30 @@ import {
   updateDNSRecord,
   deleteDNSRecord,
   setDNSRecordStatus,
+  setDNSRecordAcceleration,
   refreshDNSRecords,
   batchDeleteDNSRecords,
   batchSetDNSRecordStatus,
 } from '@/services/dns';
+import { listAccelerationDomains, listAccelerationSites, updateAccelerationDomainStatus, finalizeAccelerationDomain, autoConfigureAccelerationCname, type AccelerationDomain } from '@/services/accelerations';
+import { getDnsCredentials } from '@/services/dnsCredentials';
 import { getDomainById } from '@/services/domains';
-import { getDnsCredentials, getProviders } from '@/services/dnsCredentials';
-import {
-  listAccelerationConfigs,
-  discoverAccelerationSites,
-  enableAcceleration,
-  createAccelerationVerifyRecord,
-  updateAccelerationConfig,
-  type AccelerationConfigInput,
-  type DomainAccelerationConfig,
-  type DiscoveredAccelerationSite,
-} from '@/services/accelerations';
-import type { RecordsResponseCapabilities } from '@/services/dns';
+import type { DNSRecordsResponseData, RecordsResponseCapabilities } from '@/services/dns';
 import { useProviderStore } from '@/stores/provider';
 import { useBreadcrumbStore } from '@/stores/breadcrumb';
 import { useCredentialResolver } from '@/composables/useCredentialResolver';
-import type { DNSRecord, Domain } from '@/types';
+import type { DNSRecord, DNSRecordAcceleration } from '@/types';
 import type { DnsCredential, DnsLine } from '@/types/dns';
 import { normalizeProviderType } from '@/utils/provider';
+import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import DNSRecordTable from '@/components/DNSRecordTable/DNSRecordTable.vue';
 import QuickAddForm from '@/components/QuickAddForm/QuickAddForm.vue';
-import AddAccelerationCredentialDialog from '@/components/Dashboard/AddAccelerationCredentialDialog.vue';
-import AccelerationSiteDialog from '@/components/Acceleration/AccelerationSiteDialog.vue';
-import AccelerationResultDialog from '@/components/Acceleration/AccelerationResultDialog.vue';
+
+type ResolvedAccelerationDomain = AccelerationDomain & {
+  accelerationCredentialId: number;
+  accelerationCredentialName?: string;
+  siteId: string;
+};
 
 const route = useRoute();
 const router = useRouter();
@@ -51,43 +47,20 @@ const { credentialId } = useCredentialResolver();
 
 const zoneId = computed(() => route.params.zoneId as string);
 const showAddDialog = ref(false);
-const showAddAccelerationCredential = ref(false);
-const showAccelerationSiteDialog = ref(false);
-const showAccelerationResultDialog = ref(false);
-const accelerationDialogMode = ref<'create' | 'edit'>('create');
-const accelerationDialogLockDomain = ref(true);
-const accelerationDialogLockPluginCredential = ref(false);
-const accelerationDialogValue = ref<(Partial<DomainAccelerationConfig> & {
-  zoneName?: string;
-  dnsCredentialId?: number | null;
-  pluginCredentialId?: number | null;
-}) | null>(null);
-const accelerationResultState = ref<{
-  title?: string;
-  dnsCredentialId?: number | null;
-  pluginCredentialId?: number | null;
-  remoteSiteId?: string;
-  accelerationDomain?: string;
-  config?: DomainAccelerationConfig | null;
-  site?: DiscoveredAccelerationSite['site'] | null;
-  dnsRecordsAdded?: Array<{ zoneName: string; type: string; name: string; value: string }>;
-  dnsRecordsSkipped?: Array<{ zoneName: string; type: string; name: string; value: string }>;
-  dnsErrors?: Array<{ error: string; name?: string }>;
-} | null>(null);
-const pendingAccelerationRecordAction = ref<null | {
-  kind: 'create' | 'update';
-  recordId?: string;
-  params: any;
-}>(null);
-const selectedAccelerationCredentialId = ref<number | null>(null);
-
-type AccelerationSiteDialogPayload = AccelerationConfigInput & {
-  zoneName: string;
-  dnsCredentialId: number;
-  pluginCredentialId: number;
-  autoDnsRecord?: boolean;
-};
-
+const editingRecord = ref<DNSRecord | null>(null);
+const editorDefaultOpenAcceleration = ref(false);
+const editorNeedsRestoreInput = ref(false);
+const editorSaving = ref(false);
+const refreshing = ref(false);
+const updatingRecordIds = ref<string[]>([]);
+const deletingRecordIds = ref<string[]>([]);
+const statusChangingRecordIds = ref<string[]>([]);
+const accelerationChangingRecordIds = ref<string[]>([]);
+const batchStatusLoading = ref<'enable' | 'disable' | null>(null);
+const batchDeleteLoading = ref(false);
+const currentPage = ref(1);
+const currentPageSize = ref(TABLE_PAGE_SIZE);
+const pageSizeOptions = [10, 20, 50, 100, 200];
 const capabilities = computed<RecordsResponseCapabilities>(() => {
   const apiCaps = recordsData.value?.capabilities;
   if (apiCaps) return apiCaps;
@@ -101,6 +74,24 @@ const capabilities = computed<RecordsResponseCapabilities>(() => {
 });
 const isCloudflare = computed(() => providerStore.selectedProvider === 'cloudflare');
 
+function normalizeHost(value?: string | null) {
+  return String(value || '').trim().replace(/\.+$/, '').toLowerCase();
+}
+
+function hasOriginalRecordSnapshot(acceleration?: DNSRecordAcceleration | null) {
+  const original = acceleration?.originalRecord;
+  if (!original) return false;
+  return [
+    original.type,
+    original.value,
+    original.line,
+    original.remark,
+  ].some((value) => String(value ?? '').trim())
+    || original.ttl != null
+    || original.priority != null
+    || original.weight != null;
+}
+
 const { data: domainData } = useQuery({
   queryKey: computed(() => ['domain-detail', zoneId.value, credentialId.value]),
   queryFn: async () => {
@@ -110,26 +101,238 @@ const { data: domainData } = useQuery({
   enabled: computed(() => !!zoneId.value),
 });
 
+const recordsQueryKey = computed(() => [
+  'dns-records',
+  zoneId.value,
+  credentialId.value,
+  currentPage.value,
+  currentPageSize.value,
+]);
+const accelerationDomainsQueryKey = computed(() => [
+  'dns-detail-acceleration-domains',
+  zoneName.value,
+  accelerationCredentials.value.map((item) => item.id).join(','),
+]);
+
 // DNS records
 const { data: recordsData, isLoading: recordsLoading, refetch: refetchRecords } = useQuery({
-  queryKey: computed(() => ['dns-records', zoneId.value, credentialId.value]),
+  queryKey: recordsQueryKey,
   queryFn: async () => {
-    const res = await getDNSRecords(zoneId.value, credentialId.value);
-    return res.data as { records: DNSRecord[]; capabilities?: RecordsResponseCapabilities };
+    const res = await getDNSRecords(zoneId.value, {
+      page: currentPage.value,
+      pageSize: currentPageSize.value,
+      credentialId: credentialId.value,
+    });
+    return res.data as DNSRecordsResponseData;
   },
   enabled: computed(() => !!zoneId.value),
 });
 
 const records = computed(() => recordsData.value?.records || []);
+const totalRecords = computed(() => Math.max(0, Number(recordsData.value?.total || 0)));
+const totalPages = computed(() => Math.max(1, Math.ceil(totalRecords.value / currentPageSize.value)));
 const zoneName = computed(() =>
   domainData.value?.name || records.value[0]?.zoneName || ''
 );
-const visibleRecords = computed(() =>
-  records.value.filter((r) => !(r.type === 'NS' && r.name === r.zoneName))
+const { data: accelerationCredentialsData } = useQuery({
+  queryKey: ['acceleration-credentials', 'edgeone'],
+  queryFn: async () => {
+    const res = await getDnsCredentials('acceleration');
+    return (res.data?.credentials || []).filter((item) => normalizeProviderType(item.provider) === 'edgeone');
+  },
+  staleTime: 60_000,
+});
+const accelerationCredentials = computed<DnsCredential[]>(() => accelerationCredentialsData.value || []);
+const hasAccelerationCandidates = computed(() => {
+  const normalizedZone = normalizeHost(zoneName.value);
+  return records.value.some((record) => {
+    const normalizedName = normalizeHost(record.name);
+    return ['A', 'AAAA', 'CNAME'].includes(record.type) && !!normalizedName && normalizedName !== normalizedZone;
+  });
+});
+
+type RecordsQueryData = DNSRecordsResponseData;
+
+function updateRecordsCache(updater: (records: DNSRecord[]) => DNSRecord[]) {
+  const current = queryClient.getQueryData<RecordsQueryData>(recordsQueryKey.value);
+  if (!current) return false;
+  queryClient.setQueryData<RecordsQueryData>(recordsQueryKey.value, {
+    ...current,
+    records: updater([...(current.records || [])]),
+  });
+  return true;
+}
+
+function replaceCachedRecord(record?: DNSRecord | null) {
+  if (!record) return false;
+  return updateRecordsCache((current) => {
+    const index = current.findIndex((item) => item.id === record.id);
+    if (index < 0) return current;
+    const next = [...current];
+    next[index] = record;
+    return next;
+  });
+}
+
+async function loadAccelerationDomainsForZone(): Promise<ResolvedAccelerationDomain[]> {
+  const normalizedZone = normalizeHost(zoneName.value);
+  if (!normalizedZone || !accelerationCredentials.value.length || !hasAccelerationCandidates.value) return [];
+
+  const results = await Promise.all(
+    accelerationCredentials.value.map(async (credential) => {
+      try {
+        const sitesRes = await listAccelerationSites({
+          credentialId: credential.id,
+          provider: 'edgeone',
+          keyword: normalizedZone,
+        });
+        const matchedSites = (sitesRes.data?.sites || []).filter((item) =>
+          normalizeHost(item.zoneName || item.siteName) === normalizedZone
+        );
+        if (!matchedSites.length) return [];
+
+        const domainGroups = await Promise.all(
+          matchedSites.map(async (site) => {
+            const siteId = String(site.siteId || site.zoneId || '').trim();
+            if (!siteId) return [];
+            const domainsRes = await listAccelerationDomains({
+              credentialId: credential.id,
+              provider: 'edgeone',
+              siteId,
+            });
+            return (domainsRes.data?.domains || []).map((domain) => ({
+              ...domain,
+              siteId,
+              accelerationCredentialId: credential.id,
+              accelerationCredentialName: credential.name,
+            }));
+          })
+        );
+        return domainGroups.flat();
+      } catch {
+        return [];
+      }
+    })
+  );
+
+  return results.flat();
+}
+
+const { data: accelerationDomainsData } = useQuery({
+  queryKey: accelerationDomainsQueryKey,
+  queryFn: loadAccelerationDomainsForZone,
+  enabled: computed(() => !!zoneName.value && accelerationCredentials.value.length > 0 && hasAccelerationCandidates.value),
+  retry: false,
+  staleTime: 120_000,
+});
+
+const accelerationDomainMap = computed(() => {
+  if (!hasAccelerationCandidates.value) return new Map<string, ResolvedAccelerationDomain>();
+  const map = new Map<string, ResolvedAccelerationDomain>();
+  for (const item of accelerationDomainsData.value || []) {
+    const key = normalizeHost(item.domainName);
+    if (key && !map.has(key)) map.set(key, item);
+  }
+  return map;
+});
+
+function buildDisplayRecord(record: DNSRecord, domainMap: Map<string, ResolvedAccelerationDomain>): DNSRecord {
+  const currentAcceleration = record.acceleration
+    ? {
+        ...record.acceleration,
+        source: record.acceleration.source || 'state',
+        restorable: record.acceleration.restorable ?? hasOriginalRecordSnapshot(record.acceleration),
+      }
+    : null;
+  const matchedDomain = domainMap.get(normalizeHost(record.name));
+  const matchedTarget = normalizeHost(matchedDomain?.cnameTarget);
+  const targetMatched = !!matchedDomain
+    && ['A', 'AAAA', 'CNAME'].includes(record.type)
+    && !!matchedTarget
+    && normalizeHost(record.content) === matchedTarget;
+
+  const cnamePending = !!matchedDomain
+    && ['A', 'AAAA'].includes(record.type)
+    && !targetMatched
+    && !currentAcceleration?.enabled;
+
+  if (!targetMatched && !cnamePending) {
+    if (currentAcceleration) {
+      let uiState = matchedDomain?.uiState || currentAcceleration.uiState || 'active';
+      if (currentAcceleration.enabled && record.type !== 'CNAME' && !targetMatched) {
+        uiState = 'cname_pending';
+      }
+      if (matchedDomain?.paused) {
+        uiState = 'paused';
+      }
+      return { ...record, acceleration: { ...currentAcceleration, uiState } };
+    }
+    return record;
+  }
+
+  if (cnamePending && !currentAcceleration?.enabled) {
+    const domainUiState = matchedDomain?.uiState || 'cname_pending';
+    return {
+      ...record,
+      acceleration: {
+        enabled: false,
+        source: 'matched',
+        restorable: false,
+        uiState: domainUiState === 'cname_pending' || domainUiState === 'deploying' ? domainUiState : 'cname_pending',
+        provider: currentAcceleration?.provider || 'edgeone',
+        credentialId: currentAcceleration?.credentialId ?? matchedDomain?.accelerationCredentialId ?? null,
+        siteId: currentAcceleration?.siteId ?? matchedDomain?.siteId ?? null,
+        domainName: matchedDomain?.domainName || record.name,
+        target: matchedDomain?.cnameTarget || null,
+        originalRecord: currentAcceleration?.originalRecord || null,
+      },
+    };
+  }
+
+  let uiState = matchedDomain?.uiState || currentAcceleration?.uiState || 'active';
+  if (currentAcceleration?.enabled && record.type !== 'CNAME' && !targetMatched) {
+    uiState = 'cname_pending';
+  }
+  if (matchedDomain?.paused) {
+    uiState = 'paused';
+  }
+
+  return {
+    ...record,
+    acceleration: {
+      ...(currentAcceleration || {}),
+      enabled: true,
+      source: currentAcceleration?.source || 'matched',
+      restorable: currentAcceleration?.restorable ?? false,
+      uiState,
+      provider: currentAcceleration?.provider || 'edgeone',
+      credentialId: currentAcceleration?.credentialId ?? matchedDomain?.accelerationCredentialId ?? null,
+      siteId: currentAcceleration?.siteId ?? matchedDomain?.siteId ?? null,
+      domainName: currentAcceleration?.domainName || matchedDomain?.domainName || record.name,
+      target: currentAcceleration?.target || matchedDomain?.cnameTarget || null,
+      originalRecord: currentAcceleration?.originalRecord || null,
+    },
+  };
+}
+
+const tableRecords = computed(() => {
+  const domainMap = accelerationDomainMap.value;
+  const hasDomainMatches = domainMap.size > 0;
+  return records.value.map((record) => {
+    if (!hasDomainMatches && !record.acceleration) return record;
+    return buildDisplayRecord(record, domainMap);
+  });
+});
+const visibleTableRecords = computed(() =>
+  tableRecords.value.filter((r) => !(r.type === 'NS' && r.name === r.zoneName))
 );
-const hiddenRootNsCount = computed(() => records.value.length - visibleRecords.value.length);
-const enabledCount = computed(() => visibleRecords.value.filter(r => r.enabled !== false).length);
-const recordTypeCount = computed(() => new Set(visibleRecords.value.map(r => r.type)).size);
+const currentPageRecordCount = computed(() => visibleTableRecords.value.length);
+const hiddenRootNsCount = computed(() => tableRecords.value.length - visibleTableRecords.value.length);
+const enabledCount = computed(() => visibleTableRecords.value.filter(r => r.enabled !== false).length);
+const recordTypeCount = computed(() => new Set(visibleTableRecords.value.map(r => r.type)).size);
+const currentPageEnabledRatio = computed(() =>
+  currentPageRecordCount.value > 0 ? Math.round((enabledCount.value / currentPageRecordCount.value) * 100) : 0
+);
 
 // DNS lines
 const { data: linesData } = useQuery({
@@ -153,90 +356,25 @@ const { data: minTTLData } = useQuery({
 });
 const minTTL = computed(() => minTTLData.value ?? 1);
 
-const { data: accelerationCredentialData, refetch: refetchAccelerationCredentials } = useQuery({
-  queryKey: ['acceleration-credentials'],
-  queryFn: async () => {
-    const [providersRes, credentialsRes] = await Promise.all([
-      getProviders(),
-      getDnsCredentials(),
-    ]);
-    const accelerationProviderSet = new Set(
-      (providersRes.data?.providers || [])
-        .filter((item) => (item.category || 'dns') === 'acceleration')
-        .map((item) => normalizeProviderType(item.type)),
-    );
-    return (credentialsRes.data?.credentials || []).filter((item) =>
-      accelerationProviderSet.has(normalizeProviderType(item.provider)),
-    ) as DnsCredential[];
-  },
-});
-
-const accelerationCredentials = computed(() => accelerationCredentialData.value || []);
-const currentAccelerationDomains = computed<Domain[]>(() => {
-  if (!zoneName.value || typeof credentialId.value !== 'number') return [];
-  return [{
-    id: String(domainData.value?.id || zoneId.value),
-    name: zoneName.value,
-    status: String(domainData.value?.status || ''),
-    credentialId: credentialId.value,
-    credentialName: providerStore.credentials.find((item) => item.id === credentialId.value)?.name,
-    provider: providerStore.credentials.find((item) => item.id === credentialId.value)?.provider,
-  }];
-});
-
-watch(accelerationCredentials, (list) => {
-  if (!list.length) {
-    selectedAccelerationCredentialId.value = null;
-    return;
-  }
-  if (selectedAccelerationCredentialId.value && list.some((item) => item.id === selectedAccelerationCredentialId.value)) {
-    return;
-  }
-  selectedAccelerationCredentialId.value = list[0].id;
-}, { immediate: true });
-
-const { data: accelerationConfigData, isLoading: accelerationLoading, refetch: refetchAccelerationConfig } = useQuery({
-  queryKey: computed(() => ['acceleration-config', zoneName.value, credentialId.value]),
-  queryFn: async () => {
-    if (!zoneName.value || typeof credentialId.value !== 'number') return null;
-    const res = await listAccelerationConfigs({
-      zoneName: zoneName.value,
-      dnsCredentialId: credentialId.value,
-    });
-    return res.data?.items?.[0] || null;
-  },
-  enabled: computed(() => !!zoneName.value && typeof credentialId.value === 'number'),
-});
-
-const accelerationConfig = computed<DomainAccelerationConfig | null>(() => accelerationConfigData.value || null);
-
-const { data: discoveredAccelerationData, isLoading: discoveringAcceleration, refetch: refetchDiscoveredAcceleration } = useQuery({
-  queryKey: computed(() => ['acceleration-discover', zoneName.value]),
-  queryFn: async () => {
-    if (!zoneName.value) return [];
-    const res = await discoverAccelerationSites({ zoneName: zoneName.value });
-    return res.data?.items || [];
-  },
-  enabled: computed(() => !!zoneName.value),
-});
-
-const discoveredAccelerationSites = computed<DiscoveredAccelerationSite[]>(() => discoveredAccelerationData.value || []);
-
-watch(accelerationConfig, (config) => {
-  if (config?.pluginCredentialId) {
-    selectedAccelerationCredentialId.value = config.pluginCredentialId;
-  }
-}, { immediate: true });
-
-watch(discoveredAccelerationSites, (list) => {
-  if (accelerationConfig.value?.pluginCredentialId) return;
-  if (selectedAccelerationCredentialId.value && list.some((item) => item.pluginCredentialId === selectedAccelerationCredentialId.value)) return;
-  if (list[0]?.pluginCredentialId) {
-    selectedAccelerationCredentialId.value = list[0].pluginCredentialId;
-  }
-}, { immediate: true });
-
 // Keep provider context in sync when navigating from dashboard with credentialId.
+watch(
+  [zoneId, credentialId],
+  () => {
+    currentPage.value = 1;
+  }
+);
+
+watch(
+  [totalRecords, currentPageSize],
+  () => {
+    const maxPage = Math.max(1, Math.ceil(totalRecords.value / currentPageSize.value));
+    if (currentPage.value > maxPage) {
+      currentPage.value = maxPage;
+    }
+  },
+  { immediate: true }
+);
+
 watch(
   [credentialId, () => providerStore.credentials.length],
   ([credId]) => {
@@ -261,575 +399,236 @@ watch(zoneName, () => {
   }
 }, { immediate: true });
 
-function normalizeAccelerationState(value: unknown) {
-  return String(value || '').trim().toLowerCase();
-}
-
-function isAccelerationEffective(site: Partial<DomainAccelerationConfig | DiscoveredAccelerationSite['site']> | null | undefined) {
-  if (!site) return false;
-  const domainStatus = normalizeAccelerationState(site.domainStatus);
-  const cnameStatus = normalizeAccelerationState(site.cnameStatus || site.identificationStatus || site.verifyStatus);
-  return Boolean(site.verified)
-    || ['online', 'active', 'enabled'].includes(domainStatus)
-    || ['finished', 'active', 'verified', 'success', 'completed'].includes(cnameStatus);
-}
-
-function getAccelerationStatusMeta(
-  site: Partial<DomainAccelerationConfig | DiscoveredAccelerationSite['site']> | null | undefined,
-  options?: { remote?: boolean; lastError?: string },
-) {
-  if (!site) return { type: 'default' as const, label: '未接入', detail: '尚未接入加速' };
-  const detail = String(
-    site.cnameStatus
-      || site.identificationStatus
-      || site.verifyStatus
-      || site.domainStatus
-      || site.siteStatus
-      || '',
-  ).trim();
-  if (site.paused) {
-    return {
-      type: 'warning' as const,
-      label: '已暂停',
-      detail: detail || '加速站点当前已暂停',
-    };
-  }
-  if (String(options?.lastError || '').trim()) {
-    return {
-      type: 'error' as const,
-      label: '异常',
-      detail: String(options?.lastError || '').trim(),
-    };
-  }
-  if (isAccelerationEffective(site)) {
-    return {
-      type: 'success' as const,
-      label: '已生效',
-      detail: detail || '加速已生效',
-    };
-  }
-  return {
-    type: 'warning' as const,
-    label: options?.remote ? '待完成' : '待验证',
-    detail: detail || '等待配置或验证完成',
-  };
-}
-
-function getAccelerationComparableDomain(
-  site: Partial<DomainAccelerationConfig | DiscoveredAccelerationSite['site']> | null | undefined,
-) {
-  return normalizeAccelerationState(site?.accelerationDomain || site?.zoneName);
-}
-
-const accelerationStatusDisplay = computed(() =>
-  getAccelerationStatusMeta(accelerationConfig.value, { lastError: accelerationConfig.value?.lastError }),
-);
-
-const selectedDiscoveredSite = computed<DiscoveredAccelerationSite | null>(() => {
-  const currentConfig = accelerationConfig.value;
-  const currentCredentialId = selectedAccelerationCredentialId.value;
-  const expectedDomain = currentConfig
-    ? getAccelerationComparableDomain(currentConfig)
-    : normalizeAccelerationState(zoneName.value);
-
-  if (currentConfig?.remoteSiteId) {
-    const matchedByRemoteId = discoveredAccelerationSites.value.find((item) =>
-      String(item.site.remoteSiteId || '') === String(currentConfig.remoteSiteId || ''),
-    );
-    if (matchedByRemoteId) return matchedByRemoteId;
-  }
-
-  if (currentCredentialId) {
-    const matchedByCredentialAndDomain = discoveredAccelerationSites.value.find((item) =>
-      item.pluginCredentialId === currentCredentialId
-      && getAccelerationComparableDomain(item.site) === expectedDomain,
-    );
-    if (matchedByCredentialAndDomain) return matchedByCredentialAndDomain;
-
-    const matchedByCredential = discoveredAccelerationSites.value.find((item) => item.pluginCredentialId === currentCredentialId);
-    if (matchedByCredential) return matchedByCredential;
-  }
-
-  const matchedByDomain = discoveredAccelerationSites.value.find((item) =>
-    getAccelerationComparableDomain(item.site) === expectedDomain,
-  );
-  if (matchedByDomain) return matchedByDomain;
-
-  return discoveredAccelerationSites.value[0] || null;
-});
-
-
-const effectiveAccelerationView = computed(() => {
-  if (selectedDiscoveredSite.value) {
-    return {
-      source: 'remote' as const,
-      site: selectedDiscoveredSite.value.site,
-      credentialName: selectedDiscoveredSite.value.pluginCredentialName,
-    };
-  }
-  if (accelerationConfig.value) {
-    return {
-      source: 'cache' as const,
-      site: accelerationConfig.value,
-      credentialName: accelerationCredentials.value.find((item) => item.id === accelerationConfig.value?.pluginCredentialId)?.name || '',
-    };
-  }
-  return null;
-});
-
-const accelerationDomainLabel = computed(() =>
-  effectiveAccelerationView.value?.site.accelerationDomain
-  || effectiveAccelerationView.value?.site.zoneName
-  || zoneName.value
-  || '-',
-);
-
-const accelerationOriginSummary = computed(() => {
-  const site = effectiveAccelerationView.value?.site;
-  if (!site) return '-';
-  const protocol = site.originProtocol || 'FOLLOW';
-  const httpPort = site.httpOriginPort || 80;
-  const httpsPort = site.httpsOriginPort || 443;
-  return `${protocol} · HTTP ${httpPort} / HTTPS ${httpsPort}`;
-});
-
-const accelerationSourceDetail = computed(() => {
-  const current = effectiveAccelerationView.value;
-  if (!current) return '-';
-  if (current.credentialName) return current.credentialName;
-  return accelerationConfig.value?.lastSyncedAt
-    ? new Date(accelerationConfig.value.lastSyncedAt).toLocaleString('zh-CN')
-    : '等待首次同步';
-});
-
-const accelerationCnameHint = computed(() => {
-  const site = effectiveAccelerationView.value?.site;
-  if (!site) return '当前还没有可用的接入信息';
-  if (!site.cnameTarget) return '等待 EdgeOne 下发 CNAME 记录值';
-  return isAccelerationEffective(site)
-    ? '当前 CNAME 已可用于解析接入，可继续观察实际生效情况'
-    : '请前往 DNS 服务商添加以下 CNAME 记录，等待解析生效';
-});
-
-const saveAccelerationMutation = useMutation({
-  mutationFn: async (payload: AccelerationSiteDialogPayload) => {
-    if (accelerationDialogMode.value === 'edit') {
-      return updateAccelerationConfig(payload);
-    }
-    return enableAcceleration({
-      ...payload,
-      zoneId: zoneId.value,
-      autoDnsRecord: payload.autoDnsRecord !== false,
-    });
-  },
-  onSuccess: async (res) => {
-    if (accelerationDialogMode.value === 'edit') {
-      message.success('加速配置已更新');
-    } else {
-      const added = res.data?.dnsRecordsAdded?.length || 0;
-      const skipped = res.data?.dnsRecordsSkipped?.length || 0;
-      const failed = res.data?.dnsErrors?.length || 0;
-      let text = '加速域名已创建';
-      if (added) text += `，新增 ${added} 条验证记录`;
-      if (skipped) text += `，${skipped} 条验证记录已存在`;
-      if (failed) text += `，${failed} 条验证记录写入失败`;
-      message.success(text);
-    }
-    showAccelerationSiteDialog.value = false;
-    accelerationDialogValue.value = null;
-    pendingAccelerationRecordAction.value = null;
-    accelerationResultState.value = {
-      title: accelerationDialogMode.value === 'edit' ? '加速配置已更新' : '加速域名已创建',
-      dnsCredentialId: typeof credentialId.value === 'number' ? credentialId.value : null,
-      pluginCredentialId: selectedAccelerationCredentialId.value,
-      remoteSiteId: String(res.data?.config?.remoteSiteId || res.data?.site?.remoteSiteId || ''),
-      accelerationDomain: String(res.data?.config?.accelerationDomain || res.data?.site?.accelerationDomain || ''),
-      config: res.data?.config || null,
-      site: (res.data?.site as DiscoveredAccelerationSite['site'] | null) || null,
-      dnsRecordsAdded: res.data?.dnsRecordsAdded || [],
-      dnsRecordsSkipped: res.data?.dnsRecordsSkipped || [],
-      dnsErrors: res.data?.dnsErrors || [],
-    };
-    showAccelerationResultDialog.value = true;
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-    queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const createVerifyRecordMutation = useMutation({
-  mutationFn: async (payload: { zoneName: string; dnsCredentialId: number; pluginCredentialId?: number; remoteSiteId?: string; accelerationDomain?: string }) =>
-    createAccelerationVerifyRecord(payload),
-  onSuccess: async (res) => {
-    const added = res.data?.dnsRecordsAdded?.length || 0;
-    const skipped = res.data?.dnsRecordsSkipped?.length || 0;
-    const failed = res.data?.dnsErrors?.length || 0;
-    let text = '验证记录处理完成';
-    if (added) text += `，新增 ${added} 条`;
-    if (skipped) text += `，${skipped} 条已存在`;
-    if (failed) text += `，${failed} 条失败`;
-    message.success(text);
-    accelerationResultState.value = {
-      ...(accelerationResultState.value || {}),
-      config: res.data?.config || accelerationResultState.value?.config || null,
-      site: (res.data?.site as DiscoveredAccelerationSite['site'] | null) || accelerationResultState.value?.site || null,
-      dnsRecordsAdded: res.data?.dnsRecordsAdded || [],
-      dnsRecordsSkipped: res.data?.dnsRecordsSkipped || [],
-      dnsErrors: res.data?.dnsErrors || [],
-    };
-    showAccelerationResultDialog.value = true;
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-function openCreateAccelerationDialog() {
-  if (typeof credentialId.value !== 'number' || !zoneName.value) {
-    message.warning('当前域名信息尚未加载完成');
-    return;
-  }
-  accelerationDialogMode.value = 'create';
-  accelerationDialogLockDomain.value = true;
-  accelerationDialogLockPluginCredential.value = false;
-  const remoteSite = selectedDiscoveredSite.value?.site;
-  accelerationDialogValue.value = {
-    zoneName: zoneName.value,
-    dnsCredentialId: credentialId.value,
-    pluginCredentialId: selectedAccelerationCredentialId.value || accelerationCredentials.value[0]?.id || null,
-    accelerationDomain: remoteSite?.accelerationDomain,
-    subDomain: remoteSite?.subDomain || '@',
-    originType: remoteSite?.originType || 'IP_DOMAIN',
-    originValue: remoteSite?.originValue || '',
-    backupOriginValue: remoteSite?.backupOriginValue || '',
-    hostHeader: remoteSite?.hostHeader || '',
-    originProtocol: remoteSite?.originProtocol || 'FOLLOW',
-    httpOriginPort: remoteSite?.httpOriginPort || 80,
-    httpsOriginPort: remoteSite?.httpsOriginPort || 443,
-    ipv6Status: remoteSite?.ipv6Status || 'follow',
-  };
-  showAccelerationSiteDialog.value = true;
-}
-
-function openEditAccelerationDialog() {
-  if (!accelerationConfig.value) {
-    openCreateAccelerationDialog();
-    return;
-  }
-  accelerationDialogMode.value = 'edit';
-  accelerationDialogLockDomain.value = true;
-  accelerationDialogLockPluginCredential.value = true;
-  accelerationDialogValue.value = { ...accelerationConfig.value };
-  showAccelerationSiteDialog.value = true;
-}
-
-function openAccelerationDialog() {
-  if (accelerationConfig.value) {
-    openEditAccelerationDialog();
-    return;
-  }
-  openCreateAccelerationDialog();
-}
-
-const canEnableAccelerationWhenAddingRecord = computed(() =>
-  accelerationCredentials.value.length > 0 && typeof credentialId.value === 'number' && !!zoneName.value,
-);
-
-const addRecordAccelerationLabel = computed(() => {
-  if (effectiveAccelerationView.value) {
-    return '保存后填写并更新当前记录的加速配置';
-  }
-  const selected = accelerationCredentials.value.find((item) => item.id === selectedAccelerationCredentialId.value);
-  return selected ? `保存后填写加速配置（${selected.name}）` : '保存后填写加速配置';
-});
-
-const recordAccelerationStateResolver = computed(() => {
-  const localConfig = accelerationConfig.value;
-  const remoteSite = selectedDiscoveredSite.value?.site;
-  const remoteMeta = remoteSite ? getAccelerationStatusMeta(remoteSite, { remote: true }) : null;
-  const localMeta = localConfig ? getAccelerationStatusMeta(localConfig, { lastError: localConfig.lastError }) : null;
-
-  return (record: DNSRecord) => {
-    const recordDomain = buildDomainNameFromRecord(record.name);
-    if (!recordDomain) {
-      return null;
-    }
-
-    const localDomain = normalizeAccelerationState(localConfig?.accelerationDomain || localConfig?.zoneName);
-    if (localConfig && recordDomain === localDomain) {
-      return {
-        matched: true,
-        label: localMeta?.label || '已接入',
-        type: localMeta?.type || 'success',
-        detail: localMeta?.detail || `当前记录 ${recordDomain} 已纳入加速配置`,
-      };
-    }
-
-    const remoteDomain = normalizeAccelerationState(remoteSite?.accelerationDomain || remoteSite?.zoneName);
-    if (!localConfig && remoteSite && recordDomain === remoteDomain) {
-      return {
-        matched: true,
-        label: remoteMeta?.label || '已接入',
-        type: remoteMeta?.type || 'warning',
-        detail: remoteMeta?.detail || `远端已存在 ${recordDomain} 的加速站点`,
-      };
-    }
-
-    const rootZone = normalizeAccelerationState(zoneName.value);
-    if (localConfig && localDomain === rootZone && recordDomain.endsWith(`.${rootZone}`)) {
-      return {
-        matched: false,
-        label: '站点已接入',
-        type: 'warning' as const,
-        detail: '当前根域名已接入加速，若要让该子域单独加速，保存后会同步为对应子域配置',
-      };
-    }
-
-    if (!localConfig && remoteSite && remoteDomain === rootZone && recordDomain.endsWith(`.${rootZone}`)) {
-      return {
-        matched: false,
-        label: '远端根站点',
-        type: 'warning' as const,
-        detail: '远端已存在根域站点，保存后可继续补全当前子域的加速配置',
-      };
-    }
-
-    return {
-      matched: false,
-      label: '未接入',
-      type: 'default' as const,
-      detail: `保存后可将 ${recordDomain} 接入加速`,
-    };
-  };
-});
-
-function buildDomainNameFromRecord(name: string) {
-  const recordName = String(name || '').trim();
-  const zone = String(zoneName.value || '').trim().toLowerCase();
-  if (!zone) return '';
-  if (!recordName || recordName === '@') return zone;
-  const normalized = recordName.toLowerCase();
-  return normalized.endsWith(`.${zone}`) ? normalized : `${normalized}.${zone}`;
-}
-
-function buildAccelerationConfigFromRecord(params: any): AccelerationConfigInput {
-  return {
-    accelerationDomain: buildDomainNameFromRecord(params?.name),
-    subDomain: String(params?.name || '@').trim() || '@',
-    originType: 'IP_DOMAIN',
-    originValue: String(params?.content || '').trim(),
-    originProtocol: 'FOLLOW',
-    httpOriginPort: 80,
-    httpsOriginPort: 443,
-    ipv6Status: 'follow',
-  };
-}
-
-function openAccelerationDialogForRecordAction(action: { kind: 'create' | 'update'; recordId?: string; params: any }) {
-  if (typeof credentialId.value !== 'number' || !zoneName.value) {
-    message.warning('当前域名信息尚未加载完成');
-    return;
-  }
-  pendingAccelerationRecordAction.value = action;
-  accelerationDialogMode.value = accelerationConfig.value ? 'edit' : 'create';
-  accelerationDialogLockDomain.value = true;
-  accelerationDialogLockPluginCredential.value = Boolean(accelerationConfig.value?.pluginCredentialId);
-  const recordConfig = buildAccelerationConfigFromRecord(action.params);
-  accelerationDialogValue.value = {
-    ...accelerationConfig.value,
-    ...recordConfig,
-    zoneName: zoneName.value,
-    dnsCredentialId: credentialId.value,
-    pluginCredentialId: accelerationConfig.value?.pluginCredentialId || selectedAccelerationCredentialId.value || accelerationCredentials.value[0]?.id || null,
-    originType: accelerationConfig.value?.originType || recordConfig.originType || 'IP_DOMAIN',
-    originValue: accelerationConfig.value?.originValue || recordConfig.originValue || '',
-    backupOriginValue: accelerationConfig.value?.backupOriginValue || '',
-    hostHeader: accelerationConfig.value?.hostHeader || '',
-    originProtocol: accelerationConfig.value?.originProtocol || recordConfig.originProtocol || 'FOLLOW',
-    httpOriginPort: accelerationConfig.value?.httpOriginPort || recordConfig.httpOriginPort || 80,
-    httpsOriginPort: accelerationConfig.value?.httpsOriginPort || recordConfig.httpsOriginPort || 443,
-    ipv6Status: accelerationConfig.value?.ipv6Status || recordConfig.ipv6Status || 'follow',
-  };
-  showAccelerationSiteDialog.value = true;
-}
-
 // Mutations
-const createMutation = useMutation({
-  mutationFn: async (params: Parameters<typeof createDNSRecord>[1] & { enableAcceleration?: boolean; accelerationConfig?: AccelerationConfigInput; autoDnsRecord?: boolean }) => {
-    const { enableAcceleration: enableAfterCreate, accelerationConfig: accelerationConfigInput, autoDnsRecord, ...recordParams } = params;
-    const recordResult = await createDNSRecord(zoneId.value, recordParams, credentialId.value);
-    let accelerationResult: Awaited<ReturnType<typeof enableAcceleration | typeof updateAccelerationConfig>> | null = null;
-    if (
-      enableAfterCreate
-      && typeof credentialId.value === 'number'
-      && zoneName.value
-    ) {
-      const payload = {
-        zoneName: zoneName.value,
-        dnsCredentialId: credentialId.value,
-        pluginCredentialId: accelerationConfig.value?.pluginCredentialId || selectedAccelerationCredentialId.value || undefined,
-        ...(accelerationConfigInput || buildAccelerationConfigFromRecord(recordParams)),
-      };
-      if (accelerationConfig.value?.pluginCredentialId) {
-        accelerationResult = await updateAccelerationConfig(payload);
-      } else if (selectedAccelerationCredentialId.value) {
-        accelerationResult = await enableAcceleration({
-          ...payload,
-          zoneId: zoneId.value,
-          pluginCredentialId: selectedAccelerationCredentialId.value,
-          autoDnsRecord: autoDnsRecord !== false,
-        });
-      }
-    }
-    return { recordResult, accelerationResult };
-  },
-  onSuccess: async (result) => {
-    let text = '记录已添加';
-    if (result.accelerationResult) {
-      const added = result.accelerationResult.data?.dnsRecordsAdded?.length || 0;
-      const skipped = result.accelerationResult.data?.dnsRecordsSkipped?.length || 0;
-      const failed = result.accelerationResult.data?.dnsErrors?.length || 0;
-      text += '，并已提交加速接入';
-      if (added) text += `（新增 ${added} 条验证记录）`;
-      if (skipped) text += `（${skipped} 条验证记录已存在）`;
-      if (failed) text += `（${failed} 条验证记录写入失败）`;
-    }
-    message.success(text);
-    showAddDialog.value = false;
-    pendingAccelerationRecordAction.value = null;
-    showAccelerationSiteDialog.value = false;
-    accelerationDialogValue.value = null;
-    if (result.accelerationResult) {
-      accelerationResultState.value = {
-        title: 'DNS 记录和加速配置已提交',
-        dnsCredentialId: typeof credentialId.value === 'number' ? credentialId.value : null,
-        pluginCredentialId: selectedAccelerationCredentialId.value,
-        remoteSiteId: String(result.accelerationResult.data?.config?.remoteSiteId || result.accelerationResult.data?.site?.remoteSiteId || ''),
-        accelerationDomain: String(result.accelerationResult.data?.config?.accelerationDomain || result.accelerationResult.data?.site?.accelerationDomain || ''),
-        config: result.accelerationResult.data?.config || null,
-        site: (result.accelerationResult.data?.site as DiscoveredAccelerationSite['site'] | null) || null,
-        dnsRecordsAdded: result.accelerationResult.data?.dnsRecordsAdded || [],
-        dnsRecordsSkipped: result.accelerationResult.data?.dnsRecordsSkipped || [],
-        dnsErrors: result.accelerationResult.data?.dnsErrors || [],
-      };
-      showAccelerationResultDialog.value = true;
-    }
-    await refetchRecords();
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-    queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
-  },
-  onError: (err: any) => message.error(String(err)),
-});
+function appendPendingId(target: typeof updatingRecordIds, id: string) {
+  if (!id || target.value.includes(id)) return;
+  target.value = [...target.value, id];
+}
 
-const updateMutation = useMutation({
-  mutationFn: async (vars: { recordId: string; params: Parameters<typeof updateDNSRecord>[2] & { enableAcceleration?: boolean; accelerationConfig?: AccelerationConfigInput; autoDnsRecord?: boolean } }) => {
-    const { enableAcceleration: enableAfterUpdate, accelerationConfig: accelerationConfigInput, autoDnsRecord, ...recordParams } = vars.params;
-    const recordResult = await updateDNSRecord(zoneId.value, vars.recordId, recordParams, credentialId.value);
-    let accelerationResult: Awaited<ReturnType<typeof enableAcceleration | typeof updateAccelerationConfig>> | null = null;
-    if (
-      enableAfterUpdate
-      && typeof credentialId.value === 'number'
-      && zoneName.value
-    ) {
-      const payload = {
-        zoneName: zoneName.value,
-        dnsCredentialId: credentialId.value,
-        pluginCredentialId: accelerationConfig.value?.pluginCredentialId || selectedAccelerationCredentialId.value || undefined,
-        ...(accelerationConfigInput || buildAccelerationConfigFromRecord(recordParams)),
-      };
-      if (accelerationConfig.value?.pluginCredentialId) {
-        accelerationResult = await updateAccelerationConfig(payload);
-      } else if (selectedAccelerationCredentialId.value) {
-        accelerationResult = await enableAcceleration({
-          ...payload,
-          zoneId: zoneId.value,
-          pluginCredentialId: selectedAccelerationCredentialId.value,
-          autoDnsRecord: autoDnsRecord !== false,
-        });
-      }
-    }
-    return { recordResult, accelerationResult };
-  },
-  onSuccess: async (result) => {
-    let text = '记录已更新';
-    if (result.accelerationResult) {
-      const added = result.accelerationResult.data?.dnsRecordsAdded?.length || 0;
-      const skipped = result.accelerationResult.data?.dnsRecordsSkipped?.length || 0;
-      const failed = result.accelerationResult.data?.dnsErrors?.length || 0;
-      text += '，并已提交加速接入';
-      if (added) text += `（新增 ${added} 条验证记录）`;
-      if (skipped) text += `（${skipped} 条验证记录已存在）`;
-      if (failed) text += `（${failed} 条验证记录写入失败）`;
-    }
-    message.success(text);
-    pendingAccelerationRecordAction.value = null;
-    showAccelerationSiteDialog.value = false;
-    accelerationDialogValue.value = null;
-    if (result.accelerationResult) {
-      accelerationResultState.value = {
-        title: 'DNS 记录和加速配置已更新',
-        dnsCredentialId: typeof credentialId.value === 'number' ? credentialId.value : null,
-        pluginCredentialId: selectedAccelerationCredentialId.value,
-        remoteSiteId: String(result.accelerationResult.data?.config?.remoteSiteId || result.accelerationResult.data?.site?.remoteSiteId || ''),
-        accelerationDomain: String(result.accelerationResult.data?.config?.accelerationDomain || result.accelerationResult.data?.site?.accelerationDomain || ''),
-        config: result.accelerationResult.data?.config || null,
-        site: (result.accelerationResult.data?.site as DiscoveredAccelerationSite['site'] | null) || null,
-        dnsRecordsAdded: result.accelerationResult.data?.dnsRecordsAdded || [],
-        dnsRecordsSkipped: result.accelerationResult.data?.dnsRecordsSkipped || [],
-        dnsErrors: result.accelerationResult.data?.dnsErrors || [],
-      };
-      showAccelerationResultDialog.value = true;
-    }
-    await refetchRecords();
-    await refetchAccelerationConfig();
-    await refetchDiscoveredAcceleration();
-    queryClient.invalidateQueries({ queryKey: ['acceleration-configs-dashboard'] });
-    queryClient.invalidateQueries({ queryKey: ['remote-acceleration-sites-dashboard'] });
-  },
-  onError: (err: any) => message.error(String(err)),
-});
+function removePendingId(target: typeof updatingRecordIds, id: string) {
+  target.value = target.value.filter((item) => item !== id);
+}
 
 const deleteRecordMutation = useMutation({
   mutationFn: (recordId: string) => deleteDNSRecord(zoneId.value, recordId, credentialId.value),
-  onSuccess: () => { message.success('记录已删除'); refetchRecords(); },
+  onMutate: (recordId) => {
+    appendPendingId(deletingRecordIds, recordId);
+  },
+  onSuccess: async () => {
+    message.success('记录已删除');
+    await refetchRecords();
+  },
+  onSettled: (_data, _error, recordId) => {
+    removePendingId(deletingRecordIds, recordId);
+  },
   onError: (err: any) => message.error(String(err)),
 });
 
 const statusMutation = useMutation({
   mutationFn: (vars: { recordId: string; enabled: boolean }) =>
     setDNSRecordStatus(zoneId.value, vars.recordId, vars.enabled, credentialId.value),
-  onSuccess: () => { message.success('状态已更新'); refetchRecords(); },
+  onMutate: (vars) => {
+    appendPendingId(statusChangingRecordIds, vars.recordId);
+  },
+  onSuccess: async (res, vars) => {
+    message.success('状态已更新');
+    const replaced = replaceCachedRecord(res.data?.record);
+    if (!replaced) {
+      const updated = updateRecordsCache((current) => current.map((item) =>
+        item.id === vars.recordId ? { ...item, enabled: vars.enabled } : item
+      ));
+      if (!updated) await refetchRecords();
+    }
+  },
+  onSettled: (_data, _error, vars) => {
+    removePendingId(statusChangingRecordIds, vars.recordId);
+  },
   onError: (err: any) => message.error(String(err)),
 });
 
 async function handleRefresh() {
+  if (refreshing.value) return;
+  refreshing.value = true;
   try {
     await refreshDNSRecords(zoneId.value, credentialId.value);
     await refetchRecords();
     message.success('已刷新');
   } catch (err: any) {
     message.error(String(err));
+  } finally {
+    refreshing.value = false;
   }
 }
 
-function handleAddSubmit(params: any) {
-  if (params?.enableAcceleration) {
-    openAccelerationDialogForRecordAction({ kind: 'create', params });
-    return;
-  }
-  createMutation.mutate(params);
+function openCreate() {
+  editingRecord.value = null;
+  editorDefaultOpenAcceleration.value = false;
+  editorNeedsRestoreInput.value = false;
+  showAddDialog.value = true;
 }
 
-function handleUpdate(recordId: string, params: any) {
-  if (params?.enableAcceleration) {
-    openAccelerationDialogForRecordAction({ kind: 'update', recordId, params });
-    return;
+function handleEditRecord(record: DNSRecord, options: { focusAcceleration?: boolean } = {}) {
+  editingRecord.value = record;
+  editorDefaultOpenAcceleration.value = !!options.focusAcceleration;
+  editorNeedsRestoreInput.value = false;
+  showAddDialog.value = true;
+}
+
+async function handleSubmit(params: any) {
+  if (editorSaving.value) return;
+  editorSaving.value = true;
+  try {
+    const { recordId, acceleration, dnsChanged, ...dnsFields } = params;
+    const isEdit = !!recordId;
+    let resultRecord: DNSRecord | null = editingRecord.value;
+
+    if (!isEdit) {
+      const res = await createDNSRecord(zoneId.value, {
+        type: dnsFields.type,
+        name: dnsFields.name,
+        content: dnsFields.content,
+        ttl: dnsFields.ttl,
+        proxied: dnsFields.proxied,
+        priority: dnsFields.priority,
+        weight: dnsFields.weight,
+        line: dnsFields.line,
+        remark: dnsFields.remark,
+      }, credentialId.value);
+      resultRecord = res.data?.record || null;
+    } else if (dnsChanged) {
+      appendPendingId(updatingRecordIds, recordId);
+      try {
+        const res = await updateDNSRecord(zoneId.value, recordId, {
+          type: dnsFields.type,
+          name: dnsFields.name,
+          content: dnsFields.content,
+          ttl: dnsFields.ttl,
+          proxied: dnsFields.proxied,
+          priority: dnsFields.priority,
+          weight: dnsFields.weight,
+          line: dnsFields.line,
+          remark: dnsFields.remark,
+        }, credentialId.value);
+        resultRecord = res.data?.record || null;
+        replaceCachedRecord(resultRecord);
+      } finally {
+        removePendingId(updatingRecordIds, recordId);
+      }
+    }
+
+    const targetId: string | undefined = resultRecord?.id || recordId;
+    const accelerationPayload = acceleration as
+      | {
+          enabled: boolean;
+          origin?: {
+            originType: string;
+            originValue: string;
+            backupOriginValue?: string;
+            hostHeaderMode: 'acceleration' | 'custom';
+            customHostHeader?: string;
+            originProtocol: string;
+            httpOriginPort: number;
+            httpsOriginPort: number;
+            ipv6Status: string;
+          };
+          restoreRecord?: { type: string; value: string; ttl?: number };
+        }
+      | undefined;
+
+    if (accelerationPayload && targetId) {
+      appendPendingId(accelerationChangingRecordIds, targetId);
+      try {
+        if (accelerationPayload.enabled) {
+          const accelRes = await setDNSRecordAcceleration(zoneId.value, targetId, true, credentialId.value);
+          const accel = accelRes.data?.acceleration;
+          replaceCachedRecord(accelRes.data?.record ?? null);
+          if (
+            accelerationPayload.origin
+            && accel?.domainName
+            && accel?.siteId
+            && accel?.credentialId
+          ) {
+            const o = accelerationPayload.origin;
+            const hostHeader = o.hostHeaderMode === 'custom' ? String(o.customHostHeader || '').trim() : undefined;
+            try {
+              await finalizeAccelerationDomain(accel.domainName, {
+                credentialId: accel.credentialId,
+                provider: accel.provider || 'edgeone',
+                siteId: accel.siteId,
+                originType: o.originType,
+                originValue: o.originValue,
+                backupOriginValue: o.backupOriginValue || undefined,
+                hostHeader: hostHeader || undefined,
+                originProtocol: o.originProtocol,
+                httpOriginPort: o.httpOriginPort,
+                httpsOriginPort: o.httpsOriginPort,
+                ipv6Status: o.ipv6Status,
+                dnsCredentialId: credentialId.value,
+                autoMatchDns: true,
+              });
+            } catch (finalizeErr: any) {
+              try {
+                await autoConfigureAccelerationCname({
+                  credentialId: accel.credentialId,
+                  provider: accel.provider || 'edgeone',
+                  siteId: accel.siteId,
+                  domainName: accel.domainName,
+                  dnsCredentialId: credentialId.value,
+                  autoMatchDns: true,
+                });
+              } catch (_cnameErr: any) {
+                void _cnameErr;
+              }
+            }
+          } else if (accel?.domainName && accel?.siteId && accel?.credentialId) {
+            try {
+              await autoConfigureAccelerationCname({
+                credentialId: accel.credentialId,
+                provider: accel.provider || 'edgeone',
+                siteId: accel.siteId,
+                domainName: accel.domainName,
+                dnsCredentialId: credentialId.value,
+                autoMatchDns: true,
+              });
+            } catch (_cnameErr: any) {
+              void _cnameErr;
+            }
+          }
+          void queryClient.invalidateQueries({ queryKey: accelerationDomainsQueryKey.value });
+        } else {
+          const disableRes = await setDNSRecordAcceleration(zoneId.value, targetId, false, credentialId.value, {
+            restoreRecord: accelerationPayload.restoreRecord,
+          });
+          if (disableRes.data?.needsRestoreInput) {
+            if (disableRes.data.currentRecord) editingRecord.value = disableRes.data.currentRecord;
+            editorDefaultOpenAcceleration.value = true;
+            editorNeedsRestoreInput.value = true;
+            message.warning(disableRes.message || '请填写原始记录值后再取消加速');
+            return;
+          }
+          replaceCachedRecord(disableRes.data?.record ?? null);
+          void queryClient.invalidateQueries({ queryKey: accelerationDomainsQueryKey.value });
+        }
+      } finally {
+        removePendingId(accelerationChangingRecordIds, targetId);
+      }
+    }
+
+    message.success(isEdit ? '记录已保存' : '记录已添加');
+    showAddDialog.value = false;
+    editingRecord.value = null;
+    editorNeedsRestoreInput.value = false;
+    editorDefaultOpenAcceleration.value = false;
+    if (!isEdit && currentPage.value !== 1) {
+      currentPage.value = 1;
+    } else {
+      await refetchRecords();
+    }
+  } catch (err: any) {
+    message.error(String(err?.message || err));
+  } finally {
+    editorSaving.value = false;
   }
-  updateMutation.mutate({ recordId, params });
 }
 
 function handleDelete(recordId: string) {
@@ -840,8 +639,18 @@ function handleStatusChange(recordId: string, enabled: boolean) {
   statusMutation.mutate({ recordId, enabled });
 }
 
+function handlePageChange(page: number) {
+  currentPage.value = Math.max(1, Number(page || 1));
+}
+
+function handlePageSizeChange(pageSize: number) {
+  currentPageSize.value = Math.max(1, Number(pageSize || TABLE_PAGE_SIZE));
+  currentPage.value = 1;
+}
+
 async function handleBatchDelete(recordIds: string[]) {
-  if (!recordIds.length) return;
+  if (!recordIds.length || batchDeleteLoading.value) return;
+  batchDeleteLoading.value = true;
   try {
     const res = await batchDeleteDNSRecords(zoneId.value, recordIds, credentialId.value);
     const success = Number(res.data?.successCount || 0);
@@ -851,14 +660,23 @@ async function handleBatchDelete(recordIds: string[]) {
     } else {
       message.success(`已删除 ${success} 条记录`);
     }
-    await refetchRecords();
+    const successIds = (res.data?.results || [])
+      .filter((item) => item.success)
+      .map((item) => String(item.recordId || '').trim())
+      .filter(Boolean);
+    if (successIds.length > 0) {
+      await refetchRecords();
+    }
   } catch (err: any) {
     message.error(String(err));
+  } finally {
+    batchDeleteLoading.value = false;
   }
 }
 
 async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
-  if (!recordIds.length) return;
+  if (!recordIds.length || batchStatusLoading.value) return;
+  batchStatusLoading.value = enabled ? 'enable' : 'disable';
   try {
     const res = await batchSetDNSRecordStatus(zoneId.value, recordIds, enabled, credentialId.value);
     const success = Number(res.data?.successCount || 0);
@@ -868,44 +686,154 @@ async function handleBatchStatusChange(recordIds: string[], enabled: boolean) {
     } else {
       message.success(`已${enabled ? '启用' : '禁用'} ${success} 条记录`);
     }
-    await refetchRecords();
+    const successIds = new Set(
+      (res.data?.results || [])
+        .filter((item) => item.success)
+        .map((item) => String(item.recordId || '').trim())
+        .filter(Boolean)
+    );
+    if (!successIds.size || !updateRecordsCache((current) => current.map((item) =>
+      successIds.has(item.id) ? { ...item, enabled } : item
+    ))) {
+      await refetchRecords();
+    }
   } catch (err: any) {
     message.error(String(err));
+  } finally {
+    batchStatusLoading.value = null;
   }
 }
 
-function handleAccelerationDialogSubmit(payload: AccelerationSiteDialogPayload) {
-  const pendingAction = pendingAccelerationRecordAction.value;
-  if (!pendingAction) {
-    saveAccelerationMutation.mutate(payload);
+async function toggleAccelerationDomainEnabled(record: DNSRecord, enabled: boolean) {
+  const accel = record.acceleration;
+  const domainName = accel?.domainName || record.name;
+  let accelCredentialId = accel?.credentialId;
+  let siteId = accel?.siteId;
+
+  if (!accelCredentialId || !siteId) {
+    const normalized = normalizeHost(domainName);
+    const matched = accelerationDomainMap.value.get(normalized);
+    if (matched) {
+      accelCredentialId = accelCredentialId || matched.accelerationCredentialId;
+      siteId = siteId || matched.siteId;
+    }
+  }
+
+  if (!accelCredentialId || !siteId || !domainName) {
+    message.error('缺少加速域名信息，无法切换');
     return;
   }
-  if (pendingAction.kind === 'create') {
-    createMutation.mutate({
-      ...pendingAction.params,
-      enableAcceleration: true,
-      accelerationConfig: payload,
-      autoDnsRecord: payload.autoDnsRecord,
+  appendPendingId(accelerationChangingRecordIds, record.id);
+  try {
+    await updateAccelerationDomainStatus(domainName, {
+      credentialId: accelCredentialId,
+      provider: accel?.provider || 'edgeone',
+      siteId,
+      enabled,
     });
-    return;
+    if (!enabled && accel?.restorable) {
+      try {
+        const restoreRes = await setDNSRecordAcceleration(zoneId.value, record.id, false, credentialId.value);
+        if (!restoreRes.data?.needsRestoreInput) {
+          replaceCachedRecord(restoreRes.data?.record ?? null);
+        }
+      } catch (_restoreErr: any) {
+        void _restoreErr;
+      }
+    }
+    if (enabled) {
+      try {
+        const reAccelRes = await setDNSRecordAcceleration(zoneId.value, record.id, true, accelCredentialId);
+        replaceCachedRecord(reAccelRes.data?.record ?? null);
+      } catch (_reAccelErr: any) {
+        void _reAccelErr;
+      }
+    }
+    void queryClient.invalidateQueries({ queryKey: accelerationDomainsQueryKey.value });
+    await refetchRecords();
+    message.success(enabled ? '加速已恢复' : '加速已暂停，DNS已恢复源站');
+  } catch (err: any) {
+    message.error(String(err?.message || err));
+  } finally {
+    removePendingId(accelerationChangingRecordIds, record.id);
   }
-  updateMutation.mutate({
-    recordId: String(pendingAction.recordId || ''),
-    params: {
-      ...pendingAction.params,
-      enableAcceleration: true,
-      accelerationConfig: payload,
-      autoDnsRecord: payload.autoDnsRecord,
-    },
-  });
 }
 
-function handleAccelerationDialogVisibleChange(value: boolean) {
-  showAccelerationSiteDialog.value = value;
-  if (!value) {
-    pendingAccelerationRecordAction.value = null;
+function handlePauseAcceleration(record: DNSRecord) {
+  void toggleAccelerationDomainEnabled(record, false);
+}
+
+function handleResumeAcceleration(record: DNSRecord) {
+  void toggleAccelerationDomainEnabled(record, true);
+}
+
+async function handleRestoreOrigin(record: DNSRecord) {
+  appendPendingId(accelerationChangingRecordIds, record.id);
+  try {
+    const res = await setDNSRecordAcceleration(zoneId.value, record.id, false, credentialId.value);
+    if (res.data?.needsRestoreInput) {
+      editingRecord.value = res.data.currentRecord || record;
+      editorDefaultOpenAcceleration.value = true;
+      editorNeedsRestoreInput.value = true;
+      showAddDialog.value = true;
+      message.warning(res.message || '请填写原始记录值后再取消加速');
+      return;
+    }
+    replaceCachedRecord(res.data?.record ?? null);
+    void queryClient.invalidateQueries({ queryKey: accelerationDomainsQueryKey.value });
+    await refetchRecords();
+    message.success('已返回源站');
+  } catch (err: any) {
+    message.error(String(err?.message || err));
+  } finally {
+    removePendingId(accelerationChangingRecordIds, record.id);
   }
 }
+
+const accelerationPollingTimer = ref<ReturnType<typeof setInterval> | null>(null);
+
+const hasTransitionalAcceleration = computed(() => {
+  return visibleTableRecords.value.some((r: DNSRecord) => {
+    const ui = r.acceleration?.uiState;
+    return r.acceleration?.enabled && (ui === 'deploying' || ui === 'cname_pending');
+  });
+});
+
+function startAccelerationPolling() {
+  if (accelerationPollingTimer.value) return;
+  accelerationPollingTimer.value = setInterval(async () => {
+    if (!hasTransitionalAcceleration.value) {
+      stopAccelerationPolling();
+      return;
+    }
+    try {
+      await refetchRecords();
+    } catch {
+      void 0;
+    }
+  }, 15000);
+}
+
+function stopAccelerationPolling() {
+  if (accelerationPollingTimer.value) {
+    clearInterval(accelerationPollingTimer.value);
+    accelerationPollingTimer.value = null;
+  }
+}
+
+watch(hasTransitionalAcceleration, (val) => {
+  if (val) startAccelerationPolling();
+  else stopAccelerationPolling();
+});
+
+onMounted(() => {
+  if (hasTransitionalAcceleration.value) startAccelerationPolling();
+});
+
+onUnmounted(() => {
+  stopAccelerationPolling();
+});
+
 </script>
 
 <template>
@@ -928,10 +856,10 @@ function handleAccelerationDialogVisibleChange(value: boolean) {
         </div>
         <div class="flex flex-wrap items-center gap-3">
           <NTag size="small" :bordered="false" type="success">
-            启用记录 {{ enabledCount }}
+            当前页启用 {{ enabledCount }}
           </NTag>
           <NTag size="small" :bordered="false">
-            类型 {{ recordTypeCount }}
+            当前页类型 {{ recordTypeCount }}
           </NTag>
           <NButton
             v-if="isCloudflare"
@@ -942,11 +870,11 @@ function handleAccelerationDialogVisibleChange(value: boolean) {
             <template #icon><Globe :size="14" /></template>
             Hostnames
           </NButton>
-          <NButton size="small" type="primary" @click="showAddDialog = true">
+          <NButton size="small" type="primary" @click="openCreate">
             <template #icon><Plus :size="14" /></template>
             添加记录
           </NButton>
-          <NButton size="small" secondary @click="handleRefresh">
+          <NButton size="small" secondary :loading="refreshing" @click="handleRefresh">
             <template #icon><RefreshCw :size="14" /></template>
           </NButton>
         </div>
@@ -959,13 +887,13 @@ function handleAccelerationDialogVisibleChange(value: boolean) {
           <div class="relative z-10">
             <p class="text-xs uppercase tracking-widest text-slate-500">记录总数</p>
             <div class="mt-2">
-              <p class="text-5xl bg-gradient-to-r from-indigo-600 to-violet-600 bg-clip-text text-transparent">{{ visibleRecords.length }}</p>
+              <p class="text-5xl bg-gradient-to-r from-indigo-600 to-violet-600 bg-clip-text text-transparent">{{ totalRecords }}</p>
             </div>
             <div class="mt-3 h-2.5 bg-slate-100 rounded-full overflow-hidden">
-              <div class="h-full bg-gradient-to-r from-indigo-500 to-violet-500 rounded-full" :style="{ width: Math.min(100, (enabledCount / Math.max(1, visibleRecords.length)) * 100) + '%' }"></div>
+              <div class="h-full bg-gradient-to-r from-indigo-500 to-violet-500 rounded-full" :style="{ width: currentPageEnabledRatio + '%' }"></div>
             </div>
             <p class="mt-3 text-xs text-slate-500">
-              启用 {{ enabledCount }} 条 · 占比 {{ visibleRecords.length > 0 ? Math.round((enabledCount / visibleRecords.length) * 100) : 0 }}%
+              当前页 {{ currentPageRecordCount }} 条 · 启用 {{ enabledCount }} 条 · 共 {{ totalPages }} 页
             </p>
           </div>
         </article>
@@ -1014,81 +942,6 @@ function handleAccelerationDialogVisibleChange(value: boolean) {
         </article>
       </div>
     </section>
-
-    <section class="bento-card col-span-12">
-      <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-        <div>
-          <p class="bento-section-title">加速管理</p>
-          <p class="bento-section-meta">可以直接在这里填写源站类型、源站地址、IPv6、端口和 Host Header，完成当前域名的加速配置。</p>
-        </div>
-        <div class="flex flex-wrap gap-2">
-          <NButton
-            size="small"
-            type="primary"
-            :disabled="!accelerationCredentials.length || !currentAccelerationDomains.length"
-            @click="openAccelerationDialog"
-          >
-            {{ accelerationConfig ? '编辑加速域名' : '添加加速域名' }}
-          </NButton>
-          <NButton
-            size="small"
-            secondary
-            @click="router.push({ path: '/accelerations', query: credentialId ? { zoneName, dnsCredentialId: String(credentialId) } : { zoneName } })"
-          >
-            打开加速列表
-          </NButton>
-          <NButton size="small" secondary @click="showAddAccelerationCredential = true">
-            添加加速账户
-          </NButton>
-        </div>
-      </div>
-
-      <div v-if="accelerationLoading || discoveringAcceleration" class="flex justify-center py-10">
-        <NSpin size="large" />
-      </div>
-
-      <div v-else class="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <article class="rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm">
-          <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">当前状态</p>
-          <div class="mt-3 flex items-center gap-2">
-            <NTag size="small" :bordered="false" :type="accelerationStatusDisplay.type">
-              {{ accelerationStatusDisplay.label }}
-            </NTag>
-            <NTag v-if="effectiveAccelerationView?.site?.remoteSiteId" size="small" :bordered="false">
-              Site {{ effectiveAccelerationView.site.remoteSiteId }}
-            </NTag>
-          </div>
-          <p class="mt-3 break-all text-sm font-semibold text-slate-900">{{ accelerationDomainLabel }}</p>
-          <p class="mt-2 text-xs leading-6 text-slate-500">{{ accelerationStatusDisplay.detail || '当前还没有加速接入状态' }}</p>
-        </article>
-
-        <article class="rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm">
-          <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">加速账户</p>
-          <p class="mt-3 text-sm font-semibold text-slate-900">{{ accelerationSourceDetail }}</p>
-          <p class="mt-2 text-xs text-slate-500">可直接在当前页面编辑，也可以进入加速列表集中管理。</p>
-        </article>
-
-        <article class="rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm">
-          <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">回源摘要</p>
-          <p class="mt-3 break-all text-sm font-semibold text-slate-900">{{ effectiveAccelerationView?.site.originValue || '-' }}</p>
-          <p class="mt-2 text-xs text-slate-500">{{ accelerationOriginSummary }}</p>
-        </article>
-
-        <article class="rounded-[24px] border border-slate-200 bg-white p-5 shadow-sm">
-          <p class="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">验证 / CNAME</p>
-          <p class="mt-3 break-all text-sm font-semibold text-slate-900">{{ effectiveAccelerationView?.site.cnameTarget || '等待下发' }}</p>
-          <p class="mt-2 text-xs text-slate-500">{{ accelerationCnameHint }}</p>
-        </article>
-      </div>
-
-      <NAlert v-if="accelerationConfig?.lastError" class="mt-4" type="warning" :bordered="false">
-        {{ accelerationConfig.lastError }}
-      </NAlert>
-      <NAlert v-else-if="!accelerationCredentials.length" class="mt-4" type="info" :bordered="false">
-        还没有可用的加速账户，请先添加 EdgeOne 账户后再创建加速域名。
-      </NAlert>
-    </section>
-
     <section class="bento-card col-span-12">
       <div class="mb-4">
         <p class="bento-section-title">记录列表</p>
@@ -1101,52 +954,47 @@ function handleAccelerationDialogVisibleChange(value: boolean) {
 
       <DNSRecordTable
         v-else
-        :records="records"
+        :records="visibleTableRecords"
+        :page="currentPage"
+        :page-size="currentPageSize"
+        :total="totalRecords"
+        :total-pages="totalPages"
+        :page-size-options="pageSizeOptions"
         :lines="lines"
         :min-ttl="minTTL"
         :capabilities="capabilities"
-        :show-acceleration-toggle="canEnableAccelerationWhenAddingRecord"
-        :acceleration-toggle-label="addRecordAccelerationLabel"
-        :resolve-acceleration-state="recordAccelerationStateResolver"
-        @update="handleUpdate"
+        :update-loading-ids="updatingRecordIds"
+        :delete-loading-ids="deletingRecordIds"
+        :status-loading-ids="statusChangingRecordIds"
+        :acceleration-loading-ids="accelerationChangingRecordIds"
+        :batch-status-loading="batchStatusLoading"
+        :batch-delete-loading="batchDeleteLoading"
+        @edit="handleEditRecord"
         @delete="handleDelete"
         @status-change="handleStatusChange"
         @batch-delete="handleBatchDelete"
         @batch-status-change="handleBatchStatusChange"
+        @page-change="handlePageChange"
+        @page-size-change="handlePageSizeChange"
+        @pause-acceleration="handlePauseAcceleration"
+        @resume-acceleration="handleResumeAcceleration"
+        @restore-origin="handleRestoreOrigin"
       />
     </section>
 
     <QuickAddForm
       v-model:show="showAddDialog"
+      :mode="editingRecord ? 'edit' : 'create'"
+      :initial-record="editingRecord"
       :lines="lines"
       :min-ttl="minTTL"
-      :loading="createMutation.isPending.value"
-      :show-acceleration-toggle="canEnableAccelerationWhenAddingRecord"
-      :acceleration-toggle-label="addRecordAccelerationLabel"
-      @submit="handleAddSubmit"
-    />
-    <AccelerationSiteDialog
-      :show="showAccelerationSiteDialog"
-      :loading="saveAccelerationMutation.isPending.value || createMutation.isPending.value || updateMutation.isPending.value"
-      :mode="accelerationDialogMode"
-      :domains="currentAccelerationDomains"
-      :acceleration-credentials="accelerationCredentials"
-      :value="accelerationDialogValue"
-      :lock-domain="accelerationDialogLockDomain"
-      :lock-plugin-credential="accelerationDialogLockPluginCredential"
-      @update:show="handleAccelerationDialogVisibleChange"
-      @submit="handleAccelerationDialogSubmit"
-    />
-    <AccelerationResultDialog
-      :show="showAccelerationResultDialog"
-      :loading="createVerifyRecordMutation.isPending.value"
-      :result="accelerationResultState"
-      @update:show="showAccelerationResultDialog = $event"
-      @create-verify-record="createVerifyRecordMutation.mutate"
-    />
-    <AddAccelerationCredentialDialog
-      v-model:show="showAddAccelerationCredential"
-      @created="() => { refetchAccelerationCredentials(); refetchDiscoveredAcceleration(); }"
+      :loading="editorSaving"
+      :zone-id="zoneId"
+      :zone-name="zoneName"
+      :acceleration-state="editingRecord?.acceleration || null"
+      :default-open-acceleration="editorDefaultOpenAcceleration"
+      :needs-restore-input="editorNeedsRestoreInput"
+      @submit="handleSubmit"
     />
   </div>
 </template>

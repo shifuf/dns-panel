@@ -27,6 +27,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   namesilo: '#689fdf',
   powerdns: '#7f95b4',
   spaceship: '#5f98e0',
+  edgeone: '#4f87ff',
 };
 
 const PROVIDER_ICONS: Record<string, Component> = {
@@ -43,6 +44,7 @@ const PROVIDER_ICONS: Record<string, Component> = {
   namesilo: Layers,
   powerdns: Shield,
   spaceship: Rocket,
+  edgeone: Network,
 };
 
 const filteredProviders = computed(() =>

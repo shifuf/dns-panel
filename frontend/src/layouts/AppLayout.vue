@@ -64,7 +64,6 @@ const breadcrumbNameMap: Record<string, string> = {
   settings: '设置中心',
   tunnels: 'Cloudflare Tunnel',
   ssl: 'SSL 证书管理',
-  accelerations: '加速管理',
 };
 
 const breadcrumbs = computed(() => {
@@ -108,7 +107,7 @@ const breadcrumbs = computed(() => {
 
 const scopeHint = computed(() => {
   if (route.path.startsWith('/settings')) return '当前范围：全局设置';
-  if (route.path.startsWith('/accelerations')) return '当前范围：加速管理';
+  if (route.path.startsWith('/ssl')) return '当前范围：SSL 证书管理';
   if (!providerStore.selectedProvider) return '当前范围：全部服务商';
   return `当前范围：${selectedProviderName.value || providerStore.selectedProvider}`;
 });

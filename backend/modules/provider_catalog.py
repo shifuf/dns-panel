@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Dict, List
-
 
 PROVIDER_CAPABILITIES: List[Dict[str, Any]] = [
     {
@@ -313,40 +313,69 @@ PROVIDER_CAPABILITIES: List[Dict[str, Any]] = [
         "retryableErrors": [],
         "maxRetries": 2,
     },
-    {
-        "provider": "tencent_edgeone",
-        "name": "腾讯云 EdgeOne",
-        "category": "acceleration",
-        "supportsWeight": False,
-        "supportsLine": False,
-        "supportsStatus": False,
-        "supportsRemark": False,
-        "supportsUrlForward": False,
-        "supportsLogs": False,
-        "remarkMode": "unsupported",
-        "paging": "server",
-        "requiresDomainId": False,
-        "recordTypes": [],
-        "authFields": [
-            {"name": "secretId", "label": "SecretId", "type": "text", "required": True, "placeholder": "腾讯云 SecretId"},
-            {"name": "secretKey", "label": "SecretKey", "type": "password", "required": True, "placeholder": "腾讯云 SecretKey"},
-            {"name": "planId", "label": "套餐 PlanId", "type": "text", "required": False, "placeholder": "可选，默认使用免费/默认套餐", "helpText": "如账号下存在多个套餐，可填写指定 PlanId；留空时由接口按默认策略创建站点"},
-        ],
-        "domainCacheTtl": 0,
-        "recordCacheTtl": 0,
-        "retryableErrors": [],
-        "maxRetries": 2,
-    },
 ]
 
 
 def get_all_provider_capabilities() -> List[Dict[str, Any]]:
-    return PROVIDER_CAPABILITIES
+    merged: List[Dict[str, Any]] = []
+    source_items: List[Dict[str, Any]] = list(PROVIDER_CAPABILITIES)
+    try:
+        from modules.acceleration_registry import get_acceleration_provider_capabilities
+
+        source_items.extend(get_acceleration_provider_capabilities())
+    except Exception:
+        pass
+    for item in source_items:
+        provider = str(item.get("provider") or "").strip().lower()
+        if not provider:
+            continue
+        normalized = deepcopy(item)
+        normalized["provider"] = provider
+        normalized["category"] = str(normalized.get("category") or "dns").strip().lower() or "dns"
+        merged.append(normalized)
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for item in merged:
+        deduped[str(item["provider"])] = item
+    return list(deduped.values())
 
 
 def get_provider_capabilities(provider: str) -> Dict[str, Any] | None:
     p = str(provider or "").strip().lower()
-    for item in PROVIDER_CAPABILITIES:
+    for item in get_all_provider_capabilities():
         if str(item.get("provider") or "") == p:
             return item
     return None
+
+
+def get_provider_category(provider: str) -> str | None:
+    item = get_provider_capabilities(provider)
+    if item is None:
+        return None
+    return str(item.get("category") or "dns").strip().lower() or "dns"
+
+
+def get_supported_provider_types() -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            str(item.get("provider") or "").strip().lower()
+            for item in get_all_provider_capabilities()
+            if str(item.get("provider") or "").strip()
+        )
+    )
+
+
+def get_supported_provider_types_by_category(category: str) -> tuple[str, ...]:
+    normalized = str(category or "").strip().lower()
+    return tuple(
+        str(item.get("provider") or "").strip().lower()
+        for item in get_all_provider_capabilities()
+        if str(item.get("provider") or "").strip()
+        and str(item.get("category") or "dns").strip().lower() == normalized
+    )
+
+
+def get_provider_display_name(provider: str) -> str:
+    item = get_provider_capabilities(provider)
+    if item and str(item.get("name") or "").strip():
+        return str(item.get("name") or "").strip()
+    return str(provider or "").strip()

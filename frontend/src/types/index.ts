@@ -53,6 +53,28 @@ export type DNSRecordType =
   | 'REDIRECT_URL'
   | 'FORWARD_URL';
 
+export interface DNSRecordAcceleration {
+  enabled: boolean;
+  source?: 'state' | 'matched' | null;
+  restorable?: boolean;
+  uiState?: 'active' | 'deploying' | 'cname_pending' | 'paused' | 'error' | string;
+  provider?: string | null;
+  credentialId?: number | null;
+  siteId?: string | null;
+  domainName?: string | null;
+  target?: string | null;
+  originalRecord?: {
+    type?: string | null;
+    value?: string | null;
+    ttl?: number | null;
+    proxied?: boolean | null;
+    remark?: string | null;
+    line?: string | null;
+    priority?: number | null;
+    weight?: number | null;
+  } | null;
+}
+
 /**
  * DNS 记录
  */
@@ -69,7 +91,9 @@ export interface DNSRecord {
   line?: string;
   lineName?: string;
   remark?: string;
+  updatedAt?: string;
   enabled?: boolean;
+  acceleration?: DNSRecordAcceleration | null;
 }
 
 import { ProviderType } from './dns';

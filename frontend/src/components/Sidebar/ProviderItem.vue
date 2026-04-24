@@ -3,7 +3,7 @@ import { computed } from 'vue';
 import type { ProviderConfig, ProviderType } from '@/types/dns';
 import {
   Cloud, Server, Globe, CloudRain, CloudSun, Earth,
-  Flame, CloudCog, Waypoints, Tag, Power, Rocket, HardDrive,
+  Flame, CloudCog, Waypoints, Tag, Power, Rocket, HardDrive, Zap,
 } from 'lucide-vue-next';
 
 const props = defineProps<{
@@ -15,7 +15,7 @@ const props = defineProps<{
 
 defineEmits<{ click: [] }>();
 
-const PROVIDER_COLORS: Record<ProviderType, string> = {
+const PROVIDER_COLORS: Record<string, string> = {
   cloudflare: '#F6821F',
   aliyun: '#FF6A00',
   dnspod: '#00A4FF',
@@ -31,7 +31,7 @@ const PROVIDER_COLORS: Record<ProviderType, string> = {
   spaceship: '#795548',
 };
 
-const PROVIDER_ICONS: Record<ProviderType, any> = {
+const PROVIDER_ICONS: Record<string, any> = {
   cloudflare: Cloud,
   aliyun: Server,
   dnspod: Globe,

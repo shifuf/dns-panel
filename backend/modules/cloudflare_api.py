@@ -24,7 +24,14 @@ class CloudflareApi:
         self.api_token = token
         self.base = "https://api.cloudflare.com/client/v4"
 
-    def _request(self, method: str, path: str, query: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        query: Dict[str, Any] | None = None,
+        body: Dict[str, Any] | None = None,
+        include_meta: bool = False,
+    ) -> Any:
         qp: Dict[str, str] = {}
         for k, v in (query or {}).items():
             if v is None or v == "":
@@ -83,7 +90,21 @@ class CloudflareApi:
                 msg = str(payload.get("message") or "Cloudflare API 错误")
             raise CloudflareApiError(msg, 400, errors)
 
-        return payload.get("result")
+        return payload if include_meta else payload.get("result")
+
+    @staticmethod
+    def _extract_total(payload: Any, fallback_rows: List[Any]) -> int:
+        if isinstance(payload, dict):
+            info = payload.get("result_info")
+            if isinstance(info, dict):
+                raw_total = info.get("total_count")
+                if raw_total is None:
+                    raw_total = info.get("count")
+                try:
+                    return max(0, int(raw_total))
+                except Exception:
+                    pass
+        return len(fallback_rows)
 
     def verify_token(self) -> bool:
         try:
@@ -130,9 +151,9 @@ class CloudflareApi:
         q: Dict[str, Any] = {"page": int(page), "per_page": int(page_size)}
         if keyword:
             q["name"] = keyword
-        result = self._request("GET", "/zones", q)
-        zones = result if isinstance(result, list) else []
-        return {"zones": zones, "total": len(zones)}
+        payload = self._request("GET", "/zones", q, include_meta=True)
+        zones = payload.get("result") if isinstance(payload, dict) and isinstance(payload.get("result"), list) else []
+        return {"zones": zones, "total": self._extract_total(payload, zones)}
 
     def get_zone(self, zone_id: str) -> Dict[str, Any]:
         result = self._request("GET", f"/zones/{urllib.parse.quote(str(zone_id or '').strip())}")
@@ -161,9 +182,14 @@ class CloudflareApi:
             if v is None or v == "":
                 continue
             q[str(k)] = v
-        res = self._request("GET", f"/zones/{urllib.parse.quote(str(zone_id or '').strip())}/dns_records", q)
-        rows = res if isinstance(res, list) else []
-        return {"records": rows, "total": len(rows)}
+        payload = self._request(
+            "GET",
+            f"/zones/{urllib.parse.quote(str(zone_id or '').strip())}/dns_records",
+            q,
+            include_meta=True,
+        )
+        rows = payload.get("result") if isinstance(payload, dict) and isinstance(payload.get("result"), list) else []
+        return {"records": rows, "total": self._extract_total(payload, rows)}
 
     def get_record(self, zone_id: str, record_id: str) -> Dict[str, Any]:
         result = self._request(

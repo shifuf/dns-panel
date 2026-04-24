@@ -91,8 +91,12 @@ export async function getProviders(): Promise<ApiResponse<{ providers: ProviderC
 /**
  * 获取所有凭证
  */
-export async function getDnsCredentials(): Promise<ApiResponse<{ credentials: DnsCredential[] }>> {
-  const response = await api.get('/dns-credentials');
+export async function getDnsCredentials(
+  category?: ProviderCategory | 'all',
+): Promise<ApiResponse<{ credentials: DnsCredential[] }>> {
+  const response = await api.get('/dns-credentials', {
+    params: category ? { category } : undefined,
+  });
   return response as unknown as ApiResponse<{ credentials: DnsCredential[] }>;
 }
 

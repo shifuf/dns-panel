@@ -9,74 +9,75 @@ export interface RecordsResponseCapabilities {
   supportsRemark?: boolean;
 }
 
+export interface DNSRecordsResponseData {
+  records: DNSRecord[];
+  total: number;
+  page: number;
+  pageSize: number;
+  capabilities?: RecordsResponseCapabilities;
+}
+
+const mapDNSRecord = (r: any): DNSRecord => ({
+  id: r.id,
+  type: r.type,
+  zoneName: r.zoneName,
+  name: r.name,
+  content: r.value,
+  ttl: r.ttl,
+  proxied: !!r.proxied,
+  priority: r.priority,
+  weight: r.weight,
+  line: r.line,
+  lineName: r.lineName,
+  remark: r.remark,
+  updatedAt: r.updatedAt,
+  enabled:
+    typeof r.enabled === 'boolean'
+      ? r.enabled
+      : r.status === '1'
+        ? true
+        : r.status === '0'
+          ? false
+          : undefined,
+  acceleration: r.acceleration || null,
+});
+
 /**
  * 获取 DNS 记录列表
  */
 export const getDNSRecords = async (
   zoneId: string,
-  credentialId?: number
-): Promise<ApiResponse<{ records: DNSRecord[]; capabilities?: RecordsResponseCapabilities }>> => {
-  const params = credentialId !== undefined ? { credentialId } : {};
-
-  const pageSize = 500;
-  let page = 1;
-  let total = 0;
-  const rawRecords: any[] = [];
-  let firstResponse: any | undefined;
-
-  while (page <= 200) {
-    const response = await api.get(`/dns-records/zones/${zoneId}/records`, {
-      params: {
-        ...params,
-        page,
-        pageSize,
-      },
-    });
-
-    if (!firstResponse) firstResponse = response;
-
-    const batch = (response as any)?.data?.records || [];
-    total = (response as any)?.data?.total ?? total;
-    rawRecords.push(...batch);
-
-    if (batch.length === 0) break;
-    if (total > 0 && rawRecords.length >= total) break;
-    page += 1;
+  options: {
+    page?: number;
+    pageSize?: number;
+    credentialId?: number;
+  } = {}
+): Promise<ApiResponse<DNSRecordsResponseData>> => {
+  const page = Math.max(1, Number(options.page || 1));
+  const pageSize = Math.max(1, Number(options.pageSize || 20));
+  const params: Record<string, number> = {
+    page,
+    pageSize,
+  };
+  if (options.credentialId !== undefined) {
+    params.credentialId = options.credentialId;
   }
 
-  const records: DNSRecord[] = rawRecords.map((r: any) => ({
-    id: r.id,
-    type: r.type,
-    zoneName: r.zoneName,
-    name: r.name,
-    content: r.value,
-    ttl: r.ttl,
-    proxied: !!r.proxied,
-    priority: r.priority,
-    weight: r.weight,
-    line: r.line,
-    lineName: r.lineName,
-    remark: r.remark,
-    enabled:
-      typeof r.enabled === 'boolean'
-        ? r.enabled
-        : r.status === '1'
-          ? true
-          : r.status === '0'
-            ? false
-            : undefined,
-  }));
-
-  const capabilities = (firstResponse as any)?.data?.capabilities;
+  const response = await api.get(`/dns-records/zones/${zoneId}/records`, { params });
+  const payload = (response as any)?.data || {};
+  const rawRecords = Array.isArray(payload.records) ? payload.records : [];
 
   return {
-    ...(firstResponse as any),
+    ...(response as any),
     data: {
-      ...(firstResponse as any)?.data,
-      records,
-      capabilities,
+      ...payload,
+      records: rawRecords.map((r: any) => mapDNSRecord(r)),
+      total: Number(payload.total || 0),
+      page: Number(payload.page || page),
+      pageSize: Number(payload.pageSize || pageSize),
+      capabilities: payload.capabilities,
     },
-  } as ApiResponse<{ records: DNSRecord[]; capabilities?: RecordsResponseCapabilities }>;
+  } as ApiResponse<DNSRecordsResponseData>;
 };
 
 /**
@@ -137,22 +138,7 @@ export const createDNSRecord = async (
   );
 
   const r = (response as any)?.data?.record;
-  const record: DNSRecord | null = r
-    ? {
-        id: r.id,
-        type: r.type,
-        name: r.name,
-        content: r.value,
-        ttl: r.ttl,
-        proxied: !!r.proxied,
-        priority: r.priority,
-        weight: r.weight,
-        line: r.line,
-        lineName: r.lineName,
-        remark: r.remark,
-        enabled: r.enabled,
-      }
-    : null;
+  const record: DNSRecord | null = r ? mapDNSRecord(r) : null;
 
   return {
     ...(response as any),
@@ -201,22 +187,7 @@ export const updateDNSRecord = async (
   );
 
   const r = (response as any)?.data?.record;
-  const record: DNSRecord | null = r
-    ? {
-        id: r.id,
-        type: r.type,
-        name: r.name,
-        content: r.value,
-        ttl: r.ttl,
-        proxied: !!r.proxied,
-        priority: r.priority,
-        weight: r.weight,
-        line: r.line,
-        lineName: r.lineName,
-        remark: r.remark,
-        enabled: r.enabled,
-      }
-    : null;
+  const record: DNSRecord | null = r ? mapDNSRecord(r) : null;
 
   return {
     ...(response as any),
@@ -235,9 +206,53 @@ export const setDNSRecordStatus = async (
   recordId: string,
   enabled: boolean,
   credentialId?: number
-): Promise<ApiResponse> => {
+): Promise<ApiResponse<{ record: DNSRecord | null }>> => {
   const params = credentialId !== undefined ? { credentialId } : {};
-  return api.put(`/dns-records/zones/${zoneId}/records/${recordId}/status`, { enabled }, { params });
+  const response = await api.put(`/dns-records/zones/${zoneId}/records/${recordId}/status`, { enabled }, { params });
+  const r = (response as any)?.data?.record;
+  return {
+    ...(response as any),
+    data: {
+      ...(response as any)?.data,
+      record: r ? mapDNSRecord(r) : null,
+    },
+  } as ApiResponse<{ record: DNSRecord | null }>;
+};
+
+export interface AccelerationRestoreRecord {
+  type: string;
+  value: string;
+  ttl?: number;
+  line?: string;
+  priority?: number;
+  weight?: number;
+  remark?: string;
+  proxied?: boolean;
+}
+
+export const setDNSRecordAcceleration = async (
+  zoneId: string,
+  recordId: string,
+  enabled: boolean,
+  credentialId?: number,
+  options?: { restoreRecord?: AccelerationRestoreRecord; accelerationCredentialId?: number }
+): Promise<ApiResponse<{ record: DNSRecord | null; acceleration?: DNSRecord['acceleration']; applied?: boolean; restored?: boolean; needsRestoreInput?: boolean; currentRecord?: DNSRecord | null; suggestedType?: string }>> => {
+  const params = credentialId !== undefined ? { credentialId } : {};
+  const payload: Record<string, any> = { enabled };
+  if (options?.restoreRecord) payload.restoreRecord = options.restoreRecord;
+  if (options?.accelerationCredentialId !== undefined) payload.accelerationCredentialId = options.accelerationCredentialId;
+  const response = await api.put(`/dns-records/zones/${zoneId}/records/${recordId}/acceleration`, payload, { params });
+  const data = (response as any)?.data || {};
+  const r = data.record;
+  return {
+    ...(response as any),
+    data: {
+      ...data,
+      record: r ? mapDNSRecord(r) : null,
+      acceleration: r?.acceleration || data.acceleration || null,
+      currentRecord: data.currentRecord ? mapDNSRecord(data.currentRecord) : null,
+    },
+  } as ApiResponse<{ record: DNSRecord | null; acceleration?: DNSRecord['acceleration']; applied?: boolean; restored?: boolean; needsRestoreInput?: boolean; currentRecord?: DNSRecord | null; suggestedType?: string }>;
 };
 
 /**

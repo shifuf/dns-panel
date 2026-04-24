@@ -12,7 +12,7 @@ import {
   getDnsCredentialSecrets,
   getProviders,
 } from '@/services/dnsCredentials';
-import type { DnsCredential, ProviderConfig, ProviderType } from '@/types/dns';
+import type { DnsCredential, ProviderCategory, ProviderConfig, ProviderType } from '@/types/dns';
 import { useProviderStore } from '@/stores/provider';
 import { normalizeProviderType } from '@/utils/provider';
 import { formatDateSafe } from '@/utils/formatters';
@@ -22,11 +22,21 @@ const props = withDefaults(defineProps<{
   openAddSignal?: number;
   presetProvider?: ProviderType | null;
   embedded?: boolean;
+  category?: ProviderCategory;
+  title?: string;
+  description?: string;
 }>(), {
   openAddSignal: 0,
   presetProvider: null,
   embedded: false,
+  category: 'dns',
+  title: 'DNS 账户管理',
+  description: '管理您的所有 DNS 服务商账户凭证',
 });
+
+const emit = defineEmits<{
+  changed: [];
+}>();
 
 const message = useMessage();
 const dlg = useDialog();
@@ -52,6 +62,18 @@ const showSecretFields = ref<Record<string, boolean>>({});
 // Verify state
 const verifying = ref<number | null>(null);
 const verifyResults = ref<Record<number, boolean>>({});
+
+const EDGEONE_FALLBACK_PROVIDER: ProviderConfig = {
+  type: 'edgeone',
+  name: '腾讯云 EdgeOne',
+  category: 'acceleration',
+  authFields: [
+    { key: 'secretId', label: 'SecretId', type: 'text', required: true, placeholder: '输入腾讯云 SecretId' },
+    { key: 'secretKey', label: 'SecretKey', type: 'password', required: true, placeholder: '输入腾讯云 SecretKey' },
+    { key: 'planId', label: '默认套餐 ID', type: 'text', required: false, placeholder: '可选，创建站点时默认使用' },
+    { key: 'endpoint', label: 'API Endpoint', type: 'text', required: false, placeholder: '可选，默认 teo.tencentcloudapi.com' },
+  ],
+};
 
 function mergeProviders(list: ProviderConfig[]): ProviderConfig[] {
   const map = new Map<ProviderType, ProviderConfig>();
@@ -224,6 +246,17 @@ const PROVIDER_CREDENTIAL_GUIDE: Record<string, { title: string; steps: string[]
     ],
     link: 'https://www.spaceship.com/',
   },
+  edgeone: {
+    title: '腾讯云 EdgeOne API 密钥获取方式',
+    steps: [
+      '登录腾讯云控制台',
+      '进入「访问管理 → 访问密钥 → API 密钥管理」',
+      '创建或查看 SecretId / SecretKey',
+      '建议创建子账号并授予 EdgeOne 相关权限',
+      '如有固定套餐，可把 PlanId 一并保存，后续创建站点会自动带上',
+    ],
+    link: 'https://console.cloud.tencent.com/cam/capi',
+  },
   tencent_ssl: {
     title: '腾讯云 SSL 证书 API 密钥获取方式',
     steps: [
@@ -241,11 +274,19 @@ async function loadData() {
   isLoading.value = true;
   try {
     const [credsRes, provsRes] = await Promise.all([
-      getDnsCredentials(),
+      getDnsCredentials(props.category),
       getProviders(),
     ]);
     credentials.value = credsRes.data?.credentials || [];
-    providers.value = mergeProviders(provsRes.data?.providers || []);
+    providers.value = mergeProviders(provsRes.data?.providers || []).filter(
+      (provider) => (provider.category || 'dns') === props.category,
+    );
+    if (props.category === 'acceleration' && !providers.value.some((provider) => provider.type === 'edgeone')) {
+      providers.value = [EDGEONE_FALLBACK_PROVIDER, ...providers.value];
+    }
+    if (providers.value.length > 0 && !providers.value.some((provider) => provider.type === formProvider.value)) {
+      formProvider.value = providers.value[0].type;
+    }
   } catch {
     message.error('加载数据失败');
   } finally {
@@ -292,6 +333,13 @@ watch(
   }
 );
 
+watch(
+  () => props.category,
+  async () => {
+    await loadData();
+  }
+);
+
 // Reset secrets when provider changes in add mode
 watch(() => formProvider.value, () => {
   if (!dialogOpen.value || editing.value) return;
@@ -310,7 +358,9 @@ watch(
 function openAdd() {
   editing.value = null;
   formName.value = '';
-  formProvider.value = 'cloudflare';
+  formProvider.value = props.presetProvider
+    ? normalizeProviderType(props.presetProvider)
+    : (providers.value[0]?.type || (props.category === 'acceleration' ? 'edgeone' : 'cloudflare'));
   formSecrets.value = {};
   submitError.value = '';
   showSecretFields.value = {};
@@ -351,6 +401,13 @@ function closeDialog() {
   showSecretFields.value = {};
 }
 
+function setSecretField(key: string, value: string) {
+  formSecrets.value = {
+    ...formSecrets.value,
+    [key]: value,
+  };
+}
+
 async function handleSubmit() {
   if (!formName.value.trim()) { submitError.value = '请输入账户别名'; return; }
 
@@ -381,6 +438,17 @@ async function handleSubmit() {
     }
   }
 
+  const requiredFields = (selectedProviderConfig.value?.authFields || [])
+    .filter((field) => field.required)
+    .map((field) => field.key);
+  if (formProvider.value !== 'dnspod') {
+    const missing = requiredFields.filter((key) => !String(secrets[key] || '').trim());
+    if (missing.length > 0) {
+      submitError.value = `缺少必填字段: ${missing.join(', ')}`;
+      return;
+    }
+  }
+
   try {
     submitting.value = true;
     submitError.value = '';
@@ -401,6 +469,7 @@ async function handleSubmit() {
     await loadData();
     await providerStore.loadData();
     closeDialog();
+    emit('changed');
     message.success(editing.value ? '已更新' : '已创建');
   } catch (err: any) {
     submitError.value = typeof err === 'string' ? err : (err?.message || '操作失败');
@@ -432,6 +501,7 @@ function confirmDelete(cred: DnsCredential) {
         await deleteDnsCredential(cred.id);
         await loadData();
         await providerStore.loadData();
+        emit('changed');
         message.success('已删除');
       } catch (err: any) {
         message.error(String(err));
@@ -453,8 +523,8 @@ const currentGuide = computed(() => PROVIDER_CREDENTIAL_GUIDE[formProvider.value
       <div class="flex items-center gap-4">
         <Database :size="18" class="text-accent" />
         <div>
-          <h3 class="text-base font-semibold text-slate-700">DNS 账户管理</h3>
-          <p class="text-xs text-slate-500">管理您的所有 DNS 服务商账户凭证</p>
+          <h3 class="text-base font-semibold text-slate-700">{{ props.title }}</h3>
+          <p class="text-xs text-slate-500">{{ props.description }}</p>
         </div>
       </div>
       <NButton size="small" type="primary" @click="openAdd">
@@ -571,7 +641,7 @@ const currentGuide = computed(() => PROVIDER_CREDENTIAL_GUIDE[formProvider.value
                   :type="field.type === 'password' && !showSecretFields[field.key] ? 'password' : 'text'"
                   :placeholder="field.placeholder"
                   size="small"
-                  @update:value="(val: string) => { formSecrets = { ...formSecrets, [field.key]: val }; }"
+                  @update:value="(val: string) => setSecretField(field.key, val)"
                 >
                   <template v-if="field.type === 'password'" #suffix>
                     <button

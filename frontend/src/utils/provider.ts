@@ -13,7 +13,7 @@ export function normalizeProviderType(provider: string | ProviderType): Provider
   return (PROVIDER_ALIAS_MAP[raw] || raw) as ProviderType;
 }
 
-const PROVIDER_DISPLAY_NAME_MAP: Record<ProviderType, string> = {
+const PROVIDER_DISPLAY_NAME_MAP: Record<string, string> = {
   cloudflare: 'Cloudflare',
   aliyun: '阿里云',
   dnspod: '腾讯云',
@@ -28,7 +28,7 @@ const PROVIDER_DISPLAY_NAME_MAP: Record<ProviderType, string> = {
   powerdns: 'PowerDNS',
   spaceship: 'Spaceship',
   tencent_ssl: '腾讯云 SSL',
-  tencent_edgeone: '腾讯云 EdgeOne',
+  edgeone: '腾讯云 EdgeOne',
 };
 
 export function getProviderDisplayName(provider: ProviderType | string | null | undefined): string {

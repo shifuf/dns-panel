@@ -145,6 +145,14 @@ def esa_records_key(cred_id: int, **params: Any) -> str:
     return f"esa:records:cred:{cred_id}:{_param_hash(**params)}"
 
 
+def acceleration_sites_key(cred_id: int, provider: str, **params: Any) -> str:
+    return f"acceleration:sites:cred:{cred_id}:p:{provider}:{_param_hash(**params)}"
+
+
+def acceleration_domains_key(cred_id: int, provider: str, site_id: str, **params: Any) -> str:
+    return f"acceleration:domains:cred:{cred_id}:p:{provider}:s:{site_id}:{_param_hash(**params)}"
+
+
 def dashboard_summary_key(uid: int) -> str:
     return f"dashboard:summary:user:{uid}"
 

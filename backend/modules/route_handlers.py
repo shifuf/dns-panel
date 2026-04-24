@@ -7,6 +7,7 @@ from modules.cache import (
     cache_get, cache_set, cache_delete_pattern,
     zones_key, records_key, lines_key, providers_key,
     esa_sites_key, esa_records_key,
+    acceleration_sites_key, acceleration_domains_key,
     ssl_certs_key, ssl_cert_detail_key,
 )
 
@@ -16,12 +17,12 @@ def attach_route_methods(handler_cls: type, env: Dict[str, Any]) -> None:
         '_logs_routes',
         '_domain_expiry_routes',
         '_dns_credentials_routes',
+        '_acceleration_routes',
         '_dns_records_routes',
         '_hostnames_routes',
         '_tunnels_routes',
         '_aliyun_esa_routes',
         '_dashboard',
-        '_acceleration_routes',
         '_ssl_routes',
     ]
     for name in method_names:
@@ -908,50 +909,111 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
         return
     ip = self._client_ip()
 
+    def _provider_types_for_category(category: str | None) -> tuple[str, ...]:
+        normalized = str(category or "dns").strip().lower() or "dns"
+        if normalized == "all":
+            return SUPPORTED_PROVIDER_TYPES
+        if normalized == "dns":
+            return SUPPORTED_DNS_PROVIDER_TYPES
+        if normalized == "ssl":
+            return SUPPORTED_SSL_PROVIDER_TYPES
+        if normalized == "acceleration":
+            return SUPPORTED_ACCELERATION_PROVIDER_TYPES
+        raise ValueError("无效的 category 参数，仅支持 dns / ssl / acceleration / all")
+
+    def _provider_sql(provider_types: tuple[str, ...]) -> str:
+        return ", ".join("?" for _ in provider_types)
+
+    def _provider_category(provider: str) -> str:
+        caps = get_provider_capabilities(provider) or {}
+        return str(caps.get("category") or "dns").strip().lower() or "dns"
+
+    def _validate_credential_secrets(provider: str, raw_secrets: Any) -> Dict[str, str]:
+        if not isinstance(raw_secrets, dict):
+            raise ValueError("缺少必需参数: secrets")
+        clean: Dict[str, str] = {}
+        for key, value in raw_secrets.items():
+            if key is None:
+                continue
+            text = str(value or "").strip()
+            if text:
+                clean[str(key)] = text
+
+        if provider == "dnspod":
+            has_tc3 = bool(clean.get("secretId") and clean.get("secretKey"))
+            has_tc3_partial = bool(clean.get("secretId") or clean.get("secretKey"))
+            has_token = bool(
+                (clean.get("tokenId") and clean.get("token"))
+                or (not clean.get("tokenId") and clean.get("token") and "," in str(clean.get("token") or ""))
+            )
+            has_token_partial = bool(clean.get("tokenId") or clean.get("token"))
+            if not has_tc3 and not has_token:
+                raise ValueError("DNSPod 凭证需提供 SecretId/SecretKey 或 TokenId/Token")
+            if has_tc3_partial and not has_tc3:
+                raise ValueError("SecretId/SecretKey 需要同时填写")
+            if has_token_partial and not has_token:
+                raise ValueError("DNSPod Token 请填写 TokenId + Token，或在 Token 中使用 ID,Token 组合格式")
+            return clean
+
+        caps = get_provider_capabilities(provider)
+        if not caps:
+            raise ValueError(f"不支持的提供商: {provider}")
+        fields = caps.get("authFields") if isinstance(caps.get("authFields"), list) else []
+        required_fields = [
+            str(field.get("name") or field.get("key") or "").strip()
+            for field in fields
+            if isinstance(field, dict) and bool(field.get("required"))
+        ]
+        missing = [key for key in required_fields if not clean.get(key)]
+        if missing:
+            raise ValueError(f"缺少字段: {', '.join(missing)}")
+        return clean
+
+    def _serialize_credential_row(r: Any) -> Dict[str, Any]:
+        provider = str(r["provider"] or "")
+        created_at = r["createdAt"]
+        updated_at = r["updatedAt"]
+        if created_at and not isinstance(created_at, str):
+            created_at = created_at.isoformat().replace("+00:00", "Z") if hasattr(created_at, "isoformat") else str(created_at)
+        if updated_at and not isinstance(updated_at, str):
+            updated_at = updated_at.isoformat().replace("+00:00", "Z") if hasattr(updated_at, "isoformat") else str(updated_at)
+        return {
+            "id": r["id"],
+            "name": r["name"],
+            "provider": provider,
+            "providerName": get_provider_name(provider),
+            "accountId": r["accountId"],
+            "isDefault": bool(r["isDefault"]),
+            "createdAt": created_at,
+            "updatedAt": updated_at,
+        }
+
     if self.command == "GET" and sub == "/providers":
-        ck = providers_key()
-        cached = cache_get(ck)
-        if cached is not None:
-            self._ok(cached, "获取提供商列表成功")
-            return
         data = {"providers": get_all_provider_capabilities()}
-        cache_set(ck, data, 86400)
         self._ok(data, "获取提供商列表成功")
         return
 
     if self.command == "GET" and sub == "/":
+        try:
+            provider_types = _provider_types_for_category(first_or_none(q, "category") or "dns")
+        except ValueError as exc:
+            self._err(str(exc), 400)
+            return
+        if not provider_types:
+            self._ok({"credentials": []}, "获取凭证列表成功")
+            return
+        provider_sql = _provider_sql(provider_types)
         with conn() as c:
             rows = c.execute(
-                """
+                f"""
                 SELECT id, name, provider, accountId, isDefault, createdAt, updatedAt
                 FROM dns_credentials
-                WHERE userId = ?
-                ORDER BY isDefault DESC, createdAt ASC
+                WHERE userId = ? AND provider IN ({provider_sql})
+                ORDER BY isDefault DESC, createdAt ASC, id ASC
                 """,
-                (uid,),
+                (uid, *provider_types),
             ).fetchall()
-        credentials = []
-        for r in rows:
-            provider = str(r["provider"] or "")
-            created_at = r["createdAt"]
-            updated_at = r["updatedAt"]
-            if created_at and not isinstance(created_at, str):
-                created_at = created_at.isoformat().replace("+00:00", "Z") if hasattr(created_at, 'isoformat') else str(created_at)
-            if updated_at and not isinstance(updated_at, str):
-                updated_at = updated_at.isoformat().replace("+00:00", "Z") if hasattr(updated_at, 'isoformat') else str(updated_at)
-            credentials.append(
-                {
-                    "id": r["id"],
-                    "name": r["name"],
-                    "provider": provider,
-                    "providerName": PROVIDER_NAMES.get(provider, provider),
-                    "accountId": r["accountId"],
-                    "isDefault": bool(r["isDefault"]),
-                    "createdAt": created_at,
-                    "updatedAt": updated_at,
-                }
-            )
-        self._ok({"credentials": credentials}, "获取凭证列表成功")
+        self._ok({"credentials": [_serialize_credential_row(r) for r in rows]}, "获取凭证列表成功")
         return
 
     m = re.fullmatch(r"/([^/]+)/secrets", sub)
@@ -992,10 +1054,17 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
         if not name or not provider or not isinstance(secrets, dict):
             self._err("缺少必需参数: name, provider, secrets", 400)
             return
-        if not self._provider_supported(provider):
+        caps = get_provider_capabilities(provider)
+        if not caps:
             self._err(f"不支持的提供商: {provider}", 400)
             return
+        try:
+            secrets = _validate_credential_secrets(provider, secrets)
+        except ValueError as exc:
+            self._err(str(exc), 400)
+            return
 
+        provider_types = _provider_types_for_category(str(caps.get("category") or "dns"))
         resolved_account_id = str(account_id).strip() if account_id else None
         if provider == "cloudflare" and not resolved_account_id:
             token = str(secrets.get("apiToken") or "").strip()
@@ -1007,8 +1076,14 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
 
         secrets_enc = encrypt_text(json.dumps(secrets, ensure_ascii=False))
         with conn() as c:
-            cnt = c.execute("SELECT COUNT(*) c FROM dns_credentials WHERE userId = ?", (uid,)).fetchone()["c"]
-            is_default = 1 if int(cnt) == 0 else 0
+            count = 0
+            if provider_types:
+                provider_sql = _provider_sql(provider_types)
+                count = c.execute(
+                    f"SELECT COUNT(*) c FROM dns_credentials WHERE userId = ? AND provider IN ({provider_sql})",
+                    (uid, *provider_types),
+                ).fetchone()["c"]
+            is_default = 1 if int(count) == 0 else 0
             c.execute(
                 """
                 INSERT INTO dns_credentials (userId, name, provider, secrets, accountId, isDefault, createdAt, updatedAt)
@@ -1051,28 +1126,7 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
         except Exception:
             pass
 
-        created_at = row["createdAt"]
-        updated_at = row["updatedAt"]
-        if created_at and not isinstance(created_at, str):
-            created_at = created_at.isoformat().replace("+00:00", "Z") if hasattr(created_at, 'isoformat') else str(created_at)
-        if updated_at and not isinstance(updated_at, str):
-            updated_at = updated_at.isoformat().replace("+00:00", "Z") if hasattr(updated_at, 'isoformat') else str(updated_at)
-        self._ok(
-            {
-                "credential": {
-                    "id": row["id"],
-                    "name": row["name"],
-                    "provider": row["provider"],
-                    "providerName": PROVIDER_NAMES.get(str(row["provider"] or ""), str(row["provider"] or "")),
-                    "accountId": row["accountId"],
-                    "isDefault": bool(row["isDefault"]),
-                    "createdAt": created_at,
-                    "updatedAt": updated_at,
-                }
-            },
-            "凭证创建成功",
-            201,
-        )
+        self._ok({"credential": _serialize_credential_row(row)}, "凭证创建成功", 201)
         return
 
     m = re.fullmatch(r"/([^/]+)", sub)
@@ -1089,6 +1143,7 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
             if not existing:
                 self._err("凭证不存在", 404)
                 return
+            provider_types = _provider_types_for_category(_provider_category(str(existing["provider"] or "")))
 
             updates: Dict[str, Any] = {}
             if "name" in body and body.get("name") is not None:
@@ -1099,49 +1154,44 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
                 av = body.get("accountId")
                 updates["accountId"] = str(av).strip() if av is not None and str(av).strip() else None
             if "secrets" in body and isinstance(body.get("secrets"), dict):
-                updates["secrets"] = encrypt_text(json.dumps(body.get("secrets"), ensure_ascii=False))
-            set_default = body.get("isDefault") is True
-            if set_default:
-                c.execute("UPDATE dns_credentials SET isDefault = 0, updatedAt = CURRENT_TIMESTAMP WHERE userId = ?", (uid,))
+                try:
+                    validated = _validate_credential_secrets(str(existing["provider"] or "").strip(), body.get("secrets"))
+                except ValueError as exc:
+                    self._err(str(exc), 400)
+                    return
+                updates["secrets"] = encrypt_text(json.dumps(validated, ensure_ascii=False))
+            if body.get("isDefault") is True and provider_types:
+                provider_sql = _provider_sql(provider_types)
+                c.execute(
+                    f"""
+                    UPDATE dns_credentials
+                    SET isDefault = 0, updatedAt = CURRENT_TIMESTAMP
+                    WHERE userId = ? AND provider IN ({provider_sql})
+                    """,
+                    (uid, *provider_types),
+                )
                 updates["isDefault"] = 1
 
             if updates:
                 sets = ", ".join([f"{k} = ?" for k in updates.keys()] + ["updatedAt = CURRENT_TIMESTAMP"])
-                vals = list(updates.values()) + [cid]
-                c.execute(f"UPDATE dns_credentials SET {sets} WHERE id = ?", vals)
+                vals = list(updates.values()) + [cid, uid]
+                c.execute(f"UPDATE dns_credentials SET {sets} WHERE id = ? AND userId = ?", vals)
 
             row = c.execute(
                 """
                 SELECT id, name, provider, accountId, isDefault, createdAt, updatedAt
-                FROM dns_credentials WHERE id = ? LIMIT 1
+                FROM dns_credentials WHERE id = ? AND userId = ? LIMIT 1
                 """,
-                (cid,),
+                (cid, uid),
             ).fetchone()
             c.commit()
 
-        created_at = row["createdAt"]
-        updated_at = row["updatedAt"]
-        if created_at and not isinstance(created_at, str):
-            created_at = created_at.isoformat().replace("+00:00", "Z") if hasattr(created_at, 'isoformat') else str(created_at)
-        if updated_at and not isinstance(updated_at, str):
-            updated_at = updated_at.isoformat().replace("+00:00", "Z") if hasattr(updated_at, 'isoformat') else str(updated_at)
         cache_delete_pattern(f"dns:*:cred:{cid}:*")
         cache_delete_pattern(f"esa:*:cred:{cid}:*")
-        self._ok(
-            {
-                "credential": {
-                    "id": row["id"],
-                    "name": row["name"],
-                    "provider": row["provider"],
-                    "providerName": PROVIDER_NAMES.get(str(row["provider"] or ""), str(row["provider"] or "")),
-                    "accountId": row["accountId"],
-                    "isDefault": bool(row["isDefault"]),
-                    "createdAt": created_at,
-                    "updatedAt": updated_at,
-                }
-            },
-            "凭证更新成功",
-        )
+        cache_delete_pattern(f"acceleration:*:cred:{cid}:*")
+        cache_delete_pattern(f"ssl:*:cred:{cid}:*")
+        cache_delete_pattern(f"ssl:*:{cid}:*")
+        self._ok({"credential": _serialize_credential_row(row)}, "凭证更新成功")
         return
 
     if self.command == "DELETE" and m:
@@ -1157,11 +1207,19 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
             if not existing:
                 self._err("凭证不存在", 404)
                 return
-            c.execute("DELETE FROM dns_credentials WHERE id = ?", (cid,))
-            if bool(existing["isDefault"]):
+            provider_types = _provider_types_for_category(_provider_category(str(existing["provider"] or "")))
+            c.execute("DELETE FROM dns_credentials WHERE id = ? AND userId = ?", (cid, uid))
+            if bool(existing["isDefault"]) and provider_types:
+                provider_sql = _provider_sql(provider_types)
                 first = c.execute(
-                    "SELECT id FROM dns_credentials WHERE userId = ? ORDER BY createdAt ASC LIMIT 1",
-                    (uid,),
+                    f"""
+                    SELECT id
+                    FROM dns_credentials
+                    WHERE userId = ? AND provider IN ({provider_sql})
+                    ORDER BY createdAt ASC, id ASC
+                    LIMIT 1
+                    """,
+                    (uid, *provider_types),
                 ).fetchone()
                 if first:
                     c.execute("UPDATE dns_credentials SET isDefault = 1, updatedAt = CURRENT_TIMESTAMP WHERE id = ?", (first["id"],))
@@ -1169,6 +1227,9 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
 
         cache_delete_pattern(f"dns:*:cred:{cid}:*")
         cache_delete_pattern(f"esa:*:cred:{cid}:*")
+        cache_delete_pattern(f"acceleration:*:cred:{cid}:*")
+        cache_delete_pattern(f"ssl:*:cred:{cid}:*")
+        cache_delete_pattern(f"ssl:*:{cid}:*")
         self._ok(None, "凭证删除成功")
         return
 
@@ -1187,7 +1248,7 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
             self._err("凭证不存在", 404)
             return
 
-        provider = str(row["provider"] or "")
+        provider = str(row["provider"] or "").strip()
         valid = False
         err_msg = None
         try:
@@ -1197,30 +1258,32 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
                 if not token:
                     raise ValueError("缺少 Cloudflare API Token")
                 valid = CloudflareApi(token).verify_token()
-            elif provider == "tencent_edgeone":
-                api = TencentEdgeOneApi(
-                    str(secrets.get("secretId") or "").strip(),
-                    str(secrets.get("secretKey") or "").strip(),
-                    str(secrets.get("planId") or "").strip() or None,
-                )
-                api.list_zones(0, 1)
+            elif provider in ("dnspod", "dnspod_token"):
+                has_tc3 = str(secrets.get("secretId") or "").strip() and str(secrets.get("secretKey") or "").strip()
+                has_token = str(secrets.get("tokenId") or "").strip() and str(secrets.get("token") or "").strip()
+                if provider == "dnspod" and not (has_tc3 or has_token):
+                    raise ValueError("DNSPod 凭证需提供 SecretId/SecretKey 或 TokenId/Token")
+                if provider == "dnspod_token" and not has_token:
+                    raise ValueError("缺少 DNSPod TokenId 或 Token")
+                DnspodApi(secrets).list_zones(1, 1)
+                valid = True
+            elif provider in SUPPORTED_ACCELERATION_PROVIDER_SET:
+                validate_acceleration_credentials(provider, secrets)
                 valid = True
             else:
                 caps = get_provider_capabilities(provider)
                 if caps is None:
                     raise ValueError(f"不支持的提供商: {provider}")
                 fields = caps.get("authFields") if isinstance(caps.get("authFields"), list) else []
-                required_fields = [str(f.get("name") or "").strip() for f in fields if isinstance(f, dict) and bool(f.get("required"))]
+                required_fields = [
+                    str(f.get("name") or f.get("key") or "").strip()
+                    for f in fields
+                    if isinstance(f, dict) and bool(f.get("required"))
+                ]
                 missing = [k for k in required_fields if not str(secrets.get(k) or "").strip()]
-                # DNSPod 主凭证存在双模式，允许 secretId/secretKey 或 tokenId/token
-                if provider == "dnspod":
-                    has_tc3 = str(secrets.get("secretId") or "").strip() and str(secrets.get("secretKey") or "").strip()
-                    has_token = str(secrets.get("tokenId") or "").strip() and str(secrets.get("token") or "").strip()
-                    valid = bool(has_tc3 or has_token)
-                else:
-                    valid = len(missing) == 0
-                if not valid and missing:
-                    err_msg = f"缺少字段: {', '.join(missing)}"
+                if missing:
+                    raise ValueError(f"缺少字段: {', '.join(missing)}")
+                valid = True
         except Exception as e:
             valid = False
             err_msg = str(e)
@@ -1248,6 +1311,979 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
     self._err("接口不存在", 404)
 
 
+def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
+    sub = path[len("/api/accelerations") :] or "/"
+    body = self._json_body(b)
+    auth_user = self._auth()
+    if not auth_user:
+        return
+    uid = int(auth_user.get("id") or 0)
+    if uid <= 0:
+        self._err("认证失败", 401)
+        return
+
+    def resolve_provider(*values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip().lower()
+            if text:
+                return text
+        return "edgeone"
+
+    def auth_ctx(credential_id_value: Any = None, provider_value: Any = None) -> Dict[str, Any]:
+        credential_value = credential_id_value
+        if credential_value is None:
+            credential_value = body.get("credentialId")
+        if credential_value is None:
+            credential_value = first_or_none(q, "credentialId")
+        cid = self._parse_credential_id(credential_value)
+        provider = resolve_provider(provider_value, body.get("provider"), first_or_none(q, "provider"), "edgeone")
+        return self._acceleration_auth(uid, cid, provider)
+
+    def invalidate(auth: Dict[str, Any], site_id: str | None = None) -> None:
+        try:
+            cred_id = int(auth["credential"]["id"] or 0)
+        except Exception:
+            cred_id = 0
+        provider = str(auth.get("provider") or "").strip().lower()
+        if cred_id > 0:
+            cache_delete_pattern(f"acceleration:*:cred:{cred_id}:*")
+            if site_id:
+                cache_delete_pattern(f"acceleration:domains:cred:{cred_id}:p:{provider}:s:{site_id}:*")
+
+    def parse_dns_credential_id(source: Any = None) -> int | None:
+        value = source
+        if value is None:
+            value = body.get("dnsCredentialId")
+        if value is None:
+            value = first_or_none(q, "dnsCredentialId")
+        return self._parse_credential_id(value)
+
+    def collect_dns_apis(dns_credential_id: int | None, auto_match_dns: bool) -> tuple[list[tuple[Any, str, Any, list[Dict[str, Any]]]], list[Dict[str, Any]]]:
+        collected: list[tuple[Any, str, Any, list[Dict[str, Any]]]] = []
+        errors: list[Dict[str, Any]] = []
+        seen_credential_ids: set[int] = set()
+
+        def add_row(row: Any, report_errors: bool = False) -> None:
+            if not row:
+                return
+            try:
+                current_id = int(row["id"] or 0)
+            except Exception:
+                current_id = 0
+            if current_id > 0 and current_id in seen_credential_ids:
+                return
+            dns_provider = str(row["provider"] or "").strip().lower()
+            if dns_provider not in {"cloudflare", "dnspod", "dnspod_token"}:
+                if report_errors:
+                    errors.append({
+                        "credentialId": current_id or None,
+                        "credentialName": str(row["name"] or ""),
+                        "provider": dns_provider,
+                        "error": "所选 DNS 凭证不支持自动配置（仅 Cloudflare / DNSPod 支持）",
+                    })
+                return
+            try:
+                secrets = self._credential_secrets(row)
+                if dns_provider == "cloudflare":
+                    token = str(secrets.get("apiToken") or "").strip()
+                    if not token:
+                        raise ValueError("缺少 Cloudflare API Token")
+                    api_obj = CloudflareApi(token)
+                else:
+                    api_obj = DnspodApi(secrets)
+                zones = api_obj.list_zones(1, 200).get("zones", [])
+                collected.append((api_obj, dns_provider, row, zones if isinstance(zones, list) else []))
+                if current_id > 0:
+                    seen_credential_ids.add(current_id)
+            except Exception as exc:
+                if report_errors:
+                    errors.append({
+                        "credentialId": current_id or None,
+                        "credentialName": str(row["name"] or ""),
+                        "provider": dns_provider,
+                        "error": str(exc),
+                    })
+
+        if dns_credential_id:
+            row = self._get_credential_row(uid, dns_credential_id)
+            if row:
+                add_row(row, report_errors=True)
+            else:
+                errors.append({"credentialId": dns_credential_id, "error": "所选 DNS 凭证不存在或无权访问"})
+
+        if auto_match_dns and not collected:
+            with conn() as c:
+                rows = c.execute(
+                    """
+                    SELECT id, name, provider, secrets
+                    FROM dns_credentials
+                    WHERE userId = ? AND provider IN ('cloudflare', 'dnspod', 'dnspod_token')
+                    ORDER BY isDefault DESC, createdAt ASC, id ASC
+                    """,
+                    (uid,),
+                ).fetchall()
+            for row in rows:
+                add_row(row, report_errors=False)
+
+        return collected, errors
+
+    def match_dns_zone(check_domain: str, dns_apis: list[tuple[Any, str, Any, list[Dict[str, Any]]]]) -> tuple[Any, str | None, Any, Dict[str, Any] | None]:
+        target = str(check_domain or "").strip().lower().rstrip(".")
+        best: tuple[Any, str | None, Any, Dict[str, Any] | None] = (None, None, None, None)
+        best_length = -1
+        if not target:
+            return best
+        for api_obj, dns_provider, row, zones in dns_apis:
+            for zone in zones:
+                zone_name = str(zone.get("name") or "").strip().lower().rstrip(".")
+                if not zone_name:
+                    continue
+                if target == zone_name or target.endswith("." + zone_name):
+                    if len(zone_name) > best_length:
+                        best = (api_obj, dns_provider, row, zone)
+                        best_length = len(zone_name)
+        return best
+
+    def normalize_record_compare(record_type: str, value: Any) -> str:
+        text = str(value or "").strip().strip('"')
+        if str(record_type or "").strip().upper() == "CNAME":
+            return text.rstrip(".").lower()
+        return text
+
+    def find_existing_dns_record(api_obj: Any, dns_provider: str, zone_id: str, fqdn_name: str, record_type: str, value: str) -> Dict[str, Any] | None:
+        try:
+            result = api_obj.list_records(zone_id, 1, 200, {"name": fqdn_name, "type": record_type})
+        except Exception:
+            return None
+        records = result.get("records") if isinstance(result, dict) else []
+        expected_name = str(fqdn_name or "").strip().rstrip(".").lower()
+        expected_value = normalize_record_compare(record_type, value)
+        for item in (records or []):
+            current_type = str(item.get("type") or item.get("recordType") or "").strip().upper()
+            if current_type != str(record_type or "").strip().upper():
+                continue
+            if dns_provider == "cloudflare":
+                current_name = str(item.get("name") or "").strip().rstrip(".").lower()
+                current_value = normalize_record_compare(record_type, item.get("content"))
+            else:
+                current_name = str(item.get("name") or "").strip().rstrip(".").lower()
+                current_value = normalize_record_compare(record_type, item.get("value"))
+            if current_name == expected_name and current_value == expected_value:
+                return item
+        return None
+
+    def ensure_dns_record(
+        api_obj: Any,
+        dns_provider: str,
+        zone: Dict[str, Any],
+        fqdn_name: str,
+        record_type: str,
+        value: str,
+        ttl: int = 600,
+    ) -> Dict[str, Any]:
+        zone_id = str(zone.get("id") or "").strip()
+        if not zone_id:
+            raise ValueError("DNS 区域缺少 ID")
+        existing = find_existing_dns_record(api_obj, dns_provider, zone_id, fqdn_name, record_type, value)
+        if existing:
+            return {"existing": True, "record": existing}
+        if dns_provider == "cloudflare":
+            payload = {
+                "type": str(record_type or "").strip().upper(),
+                "name": str(fqdn_name or "").strip(),
+                "content": self._normalize_txt_for_cf(record_type, value) if str(record_type or "").strip().upper() == "TXT" else str(value or "").strip(),
+                "ttl": int(ttl) if int(ttl) > 0 else 600,
+            }
+            if str(record_type or "").strip().upper() == "CNAME":
+                payload["proxied"] = False
+            record = api_obj.create_record(zone_id, payload)
+        else:
+            payload = {
+                "type": str(record_type or "").strip().upper(),
+                "name": str(fqdn_name or "").strip(),
+                "value": str(value or "").strip(),
+                "ttl": int(ttl) if int(ttl) > 0 else 600,
+                "line": "default",
+            }
+            record = api_obj.create_record(zone_id, payload)
+        return {"existing": False, "record": record}
+
+    def normalize_fqdn(value: Any) -> str:
+        return str(value or "").strip().rstrip(".").lower()
+
+    def normalize_dns_record_item(dns_provider: str, item: Any) -> Dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        if dns_provider == "cloudflare":
+            return {
+                "id": str(item.get("id") or item.get("recordId") or "").strip(),
+                "type": str(item.get("type") or item.get("recordType") or "").strip().upper(),
+                "name": str(item.get("name") or item.get("recordName") or "").strip(),
+                "value": str(item.get("content") or item.get("value") or "").strip(),
+                "ttl": item.get("ttl"),
+                "status": str(item.get("status") or "").strip(),
+                "proxied": item.get("proxied"),
+            }
+        return {
+            "id": str(item.get("id") or item.get("recordId") or "").strip(),
+            "type": str(item.get("type") or item.get("recordType") or "").strip().upper(),
+            "name": str(item.get("name") or item.get("recordName") or "").strip(),
+            "value": str(item.get("value") or item.get("content") or "").strip(),
+            "ttl": item.get("ttl"),
+            "status": str(item.get("status") or "").strip(),
+            "proxied": item.get("proxied"),
+        }
+
+    def list_dns_records_for_name(api_obj: Any, dns_provider: str, zone_id: str, fqdn_name: str) -> List[Dict[str, Any]]:
+        try:
+            result = api_obj.list_records(zone_id, 1, 200, {"name": fqdn_name})
+        except Exception:
+            result = {"records": []}
+        rows = result.get("records") if isinstance(result, dict) else []
+        normalized_target = normalize_fqdn(fqdn_name)
+        items: List[Dict[str, Any]] = []
+        for row in (rows or []):
+            normalized = normalize_dns_record_item(dns_provider, row)
+            if not normalized:
+                continue
+            if normalize_fqdn(normalized.get("name")) != normalized_target:
+                continue
+            items.append(normalized)
+        return items
+
+    def analyze_dns_record_conflicts(
+        api_obj: Any,
+        dns_provider: str,
+        dns_row: Any,
+        zone: Dict[str, Any],
+        fqdn_name: str,
+        record_type: str,
+        expected_value: str,
+    ) -> Dict[str, Any]:
+        zone_id = str(zone.get("id") or "").strip()
+        target_type = str(record_type or "").strip().upper()
+        expected_compare = normalize_record_compare(target_type, expected_value)
+        exact_match: Dict[str, Any] | None = None
+        records = list_dns_records_for_name(api_obj, dns_provider, zone_id, fqdn_name)
+        conflicts: List[Dict[str, Any]] = []
+        for item in records:
+            current_type = str(item.get("type") or "").strip().upper()
+            current_value = normalize_record_compare(current_type, item.get("value"))
+            if current_type == target_type and current_value == expected_compare:
+                exact_match = item
+                continue
+            reason = ""
+            if target_type == "CNAME":
+                if current_type == "CNAME":
+                    reason = "同名 CNAME 已指向其他目标"
+                else:
+                    reason = "同名存在其他记录，CNAME 无法共存"
+            elif current_type == target_type and current_value != expected_compare:
+                reason = "同类型记录值不同"
+            if reason:
+                conflicts.append({
+                    "id": item.get("id"),
+                    "type": current_type,
+                    "name": item.get("name"),
+                    "value": item.get("value"),
+                    "ttl": item.get("ttl"),
+                    "status": item.get("status"),
+                    "proxied": item.get("proxied"),
+                    "reason": reason,
+                })
+        return {
+            "configured": exact_match is not None,
+            "currentValue": str(exact_match.get("value") or "") if isinstance(exact_match, dict) else "",
+            "records": records,
+            "conflicts": conflicts,
+            "provider": dns_provider,
+            "credentialId": int(dns_row["id"] or 0) if dns_row else None,
+            "credentialName": str(dns_row["name"] or "") if dns_row else "",
+            "zone": str(zone.get("name") or ""),
+            "zoneId": zone_id,
+        }
+
+    def query_public_cname_resolution(domain_name: str, expected_value: str) -> Dict[str, Any]:
+        target_domain = normalize_fqdn(domain_name)
+        expected_compare = normalize_record_compare("CNAME", expected_value)
+        if not target_domain:
+            return {
+                "checked": False,
+                "resolver": "",
+                "answers": [],
+                "currentValue": "",
+                "isResolved": False,
+                "error": "缺少域名",
+            }
+        resolvers = [
+            (
+                "google",
+                f"https://dns.google/resolve?name={urllib.parse.quote(target_domain)}&type=CNAME",
+                {},
+            ),
+            (
+                "cloudflare",
+                f"https://cloudflare-dns.com/dns-query?name={urllib.parse.quote(target_domain)}&type=CNAME",
+                {"accept": "application/dns-json"},
+            ),
+        ]
+        errors: List[str] = []
+        for resolver_name, url, headers in resolvers:
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                payload = json.loads(raw) if raw else {}
+                answers_raw = payload.get("Answer") if isinstance(payload.get("Answer"), list) else []
+                answers: List[str] = []
+                for answer in answers_raw:
+                    if not isinstance(answer, dict):
+                        continue
+                    try:
+                        answer_type = int(answer.get("type") or answer.get("Type") or 0)
+                    except Exception:
+                        answer_type = 0
+                    if answer_type != 5:
+                        continue
+                    data = str(answer.get("data") or answer.get("Data") or "").strip()
+                    if data:
+                        answers.append(data.rstrip("."))
+                normalized_answers = [normalize_record_compare("CNAME", item) for item in answers]
+                return {
+                    "checked": True,
+                    "resolver": resolver_name,
+                    "answers": answers,
+                    "currentValue": answers[0] if answers else "",
+                    "isResolved": expected_compare in normalized_answers,
+                    "status": payload.get("Status"),
+                    "error": None if answers or str(payload.get("Status") or "0") == "0" else f"DNS 查询状态: {payload.get('Status')}",
+                }
+            except Exception as exc:
+                errors.append(f"{resolver_name}: {exc}")
+        return {
+            "checked": False,
+            "resolver": "",
+            "answers": [],
+            "currentValue": "",
+            "isResolved": False,
+            "error": "；".join(errors) if errors else "公开 DNS 查询失败",
+        }
+
+    def run_site_auto_verify_dns() -> None:
+        auth = auth_ctx()
+        api = auth.get("api")
+        zone_name = str(body.get("zoneName") or body.get("siteName") or "").strip()
+        site_id = str(body.get("siteId") or body.get("remoteSiteId") or "").strip() or None
+        if api is None or not (hasattr(api, "create_ownership_verification") or hasattr(api, "identify_zone")):
+            self._err("当前加速插件不支持自动验证", 400)
+            return
+        if not zone_name:
+            self._err("缺少参数: zoneName", 400)
+            return
+        dns_credential_id = parse_dns_credential_id()
+        auto_match_dns = bool(body.get("autoMatchDns", dns_credential_id is None))
+        verification_payload = (
+            api.create_ownership_verification(zone_name, site_id)
+            if hasattr(api, "create_ownership_verification")
+            else api.identify_zone(zone_name)
+        )
+        verification = verification_payload.get("verification") if isinstance(verification_payload, dict) else {}
+        record_name = str((verification or {}).get("recordName") or "").strip()
+        record_value = str((verification or {}).get("recordValue") or "").strip()
+        record_type = str((verification or {}).get("recordType") or "TXT").strip() or "TXT"
+        response_payload: Dict[str, Any] = {
+            "zoneName": zone_name,
+            "siteId": site_id,
+            "verification": verification or {},
+            "dnsRecordsAdded": [],
+            "dnsRecordsSkipped": [],
+            "dnsErrors": [],
+        }
+        if not record_name or not record_value:
+            self._ok(response_payload, "未获取到可自动添加的验证记录")
+            return
+        dns_apis, dns_errors = collect_dns_apis(dns_credential_id, auto_match_dns)
+        response_payload["dnsErrors"].extend(dns_errors)
+        if not dns_apis:
+            self._ok(response_payload, "未找到可用的 DNS 凭证，请手动添加 TXT 记录")
+            return
+        dns_api, dns_provider, dns_row, target_zone = match_dns_zone(zone_name, dns_apis)
+        if not target_zone:
+            response_payload["dnsErrors"].append({"key": record_name, "error": f"未找到域名 {zone_name} 对应的 DNS 区域"})
+            self._ok(response_payload, "未找到匹配的 DNS 区域，请手动添加 TXT 记录")
+            return
+        try:
+            record_result = ensure_dns_record(dns_api, str(dns_provider or ""), target_zone, record_name, record_type, record_value, int(body.get("ttl") or 600))
+            record_payload = {
+                "credentialId": int(dns_row["id"] or 0) if dns_row else None,
+                "credentialName": str(dns_row["name"] or "") if dns_row else "",
+                "provider": dns_provider,
+                "zone": target_zone.get("name"),
+                "zoneId": target_zone.get("id"),
+                "type": record_type,
+                "name": record_name,
+                "value": record_value,
+                "existing": bool(record_result.get("existing")),
+            }
+            if bool(record_result.get("existing")):
+                response_payload["dnsRecordsSkipped"].append(record_payload)
+            else:
+                response_payload["dnsRecordsAdded"].append(record_payload)
+        except Exception as exc:
+            response_payload["dnsErrors"].append({"key": record_name, "error": str(exc)})
+            self._ok(response_payload, "TXT 记录自动添加失败，请改为手动配置")
+            return
+
+        if bool(body.get("autoVerify", body.get("verifyAfter", True))):
+            verify_code = str((verification or {}).get("verificationCode") or record_value).strip()
+            try:
+                verify_result = auth["plugin"].verify_site(zone_name, site_id, {"verificationCode": verify_code})
+                response_payload["verifySubmitted"] = True
+                response_payload["verifyResult"] = verify_result
+                invalidate(auth, site_id)
+            except Exception as exc:
+                response_payload["verifySubmitted"] = False
+                response_payload["verifyError"] = str(exc)
+        self._ok(response_payload, "TXT 验证记录已自动处理")
+        return
+
+    try:
+        if self.command == "GET" and sub == "/providers":
+            providers = [item for item in get_all_provider_capabilities() if str(item.get("category") or "").strip().lower() == "acceleration"]
+            self._ok({"providers": providers}, "获取加速插件列表成功")
+            return
+
+        if self.command == "GET" and sub == "/sites":
+            auth = auth_ctx()
+            keyword = str(first_or_none(q, "keyword") or "").strip().lower()
+            ck = acceleration_sites_key(int(auth["credential"]["id"]), auth["provider"], keyword=keyword)
+            cached = cache_get(ck)
+            if cached is not None:
+                self._ok(cached, "获取加速站点列表成功")
+                return
+            sites = auth["plugin"].list_sites()
+            if keyword:
+                sites = [
+                    item for item in sites
+                    if keyword in str(item.get("zoneName") or item.get("siteName") or "").strip().lower()
+                    or keyword in str(item.get("siteId") or "").strip().lower()
+                ]
+            data = {"sites": sites, "total": len(sites)}
+            cache_set(ck, data, 60)
+            self._ok(data, "获取加速站点列表成功")
+            return
+
+        if self.command == "POST" and sub == "/sites":
+            auth = auth_ctx()
+            zone_name = str(body.get("zoneName") or body.get("siteName") or "").strip()
+            if not zone_name:
+                self._err("缺少参数: zoneName", 400)
+                return
+            site = auth["plugin"].ensure_site(zone_name, body)
+            invalidate(auth, str(site.get("siteId") or site.get("zoneId") or ""))
+            self._ok({"site": site}, "创建/获取加速站点成功")
+            return
+
+        if self.command == "POST" and sub == "/sites/identify":
+            auth = auth_ctx()
+            api = auth.get("api")
+            zone_name = str(body.get("zoneName") or body.get("siteName") or "").strip()
+            if api is None or not (hasattr(api, "create_ownership_verification") or hasattr(api, "identify_zone")):
+                self._err("当前加速插件不支持站点识别", 400)
+                return
+            if not zone_name:
+                self._err("缺少参数: zoneName", 400)
+                return
+            if hasattr(api, "create_ownership_verification"):
+                data = api.create_ownership_verification(zone_name, str(body.get("siteId") or "").strip() or None)
+            else:
+                data = api.identify_zone(zone_name)
+            self._ok(data, "获取站点验证信息成功")
+            return
+
+        if self.command == "POST" and sub in {"/sites/auto-verify-dns", "/create-verify-record"}:
+            run_site_auto_verify_dns()
+            return
+
+        if self.command == "POST" and sub == "/sites/verify":
+            auth = auth_ctx()
+            zone_name = str(body.get("zoneName") or body.get("siteName") or "").strip()
+            site_id = str(body.get("siteId") or "").strip() or None
+            if not zone_name:
+                self._err("缺少参数: zoneName", 400)
+                return
+            data = auth["plugin"].verify_site(
+                zone_name,
+                site_id,
+                {"verificationCode": body.get("verificationCode") or body.get("code")},
+            )
+            invalidate(auth, site_id)
+            self._ok(data, "站点验证完成")
+            return
+
+        m = re.fullmatch(r"/sites/([^/]+)/status", sub)
+        if m and self.command in ("POST", "PUT"):
+            auth = auth_ctx()
+            site_id = urllib.parse.unquote(m.group(1))
+            zone_name = str(body.get("zoneName") or body.get("siteName") or "").strip()
+            enabled = bool(body.get("enabled"))
+            data = auth["plugin"].set_site_status(zone_name, site_id, enabled, body)
+            invalidate(auth, site_id)
+            self._ok(data, "更新加速站点状态成功")
+            return
+
+        m = re.fullmatch(r"/sites/([^/]+)", sub)
+        if m and self.command == "GET":
+            auth = auth_ctx()
+            site_id = urllib.parse.unquote(m.group(1))
+            zone_name = str(first_or_none(q, "zoneName") or "").strip()
+            site = auth["plugin"].get_site(zone_name, site_id, {})
+            self._ok({"site": site}, "获取加速站点详情成功")
+            return
+
+        if m and self.command == "DELETE":
+            auth = auth_ctx()
+            site_id = urllib.parse.unquote(m.group(1))
+            zone_name = str(first_or_none(q, "zoneName") or body.get("zoneName") or "").strip()
+            data = auth["plugin"].delete_site(zone_name, site_id, {})
+            invalidate(auth, site_id)
+            self._ok(data, "删除加速站点成功")
+            return
+
+        if self.command == "GET" and sub == "/domains":
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "list_acceleration_domains"):
+                self._err("当前加速插件不支持域名列表", 400)
+                return
+            site_id = str(first_or_none(q, "siteId") or "").strip()
+            if not site_id:
+                self._err("缺少参数: siteId", 400)
+                return
+            keyword = str(first_or_none(q, "domainName") or first_or_none(q, "keyword") or "").strip()
+            ck = acceleration_domains_key(int(auth["credential"]["id"]), auth["provider"], site_id, keyword=keyword)
+            cached = cache_get(ck)
+            if cached is not None:
+                self._ok(cached, "获取加速域名列表成功")
+                return
+            data = api.list_acceleration_domains(site_id, keyword or None)
+            items = data.get("items") if isinstance(data, dict) else []
+            payload = {"domains": items or [], "total": len(items or []), "siteId": site_id, "requestId": data.get("requestId") if isinstance(data, dict) else None}
+            cache_set(ck, payload, 30)
+            self._ok(payload, "获取加速域名列表成功")
+            return
+
+        if self.command == "POST" and sub == "/domains":
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "create_acceleration_domain"):
+                self._err("当前加速插件不支持创建加速域名", 400)
+                return
+            site_id = str(body.get("siteId") or "").strip()
+            domain_name = str(body.get("domainName") or "").strip()
+            if not site_id or not domain_name:
+                self._err("缺少参数: siteId, domainName", 400)
+                return
+            if bool(body.get("upsert")):
+                domain = api.upsert_acceleration_domain(site_id, domain_name, body)
+            else:
+                domain = api.create_acceleration_domain(site_id, domain_name, body)
+            invalidate(auth, site_id)
+            self._ok({"domain": domain}, "创建加速域名成功")
+            return
+
+        if self.command == "POST" and sub == "/domains/auto-cname":
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "get_acceleration_domain"):
+                self._err("当前加速插件不支持自动配置 CNAME", 400)
+                return
+            site_id = str(body.get("siteId") or "").strip()
+            domain_name = str(body.get("domainName") or "").strip()
+            if not site_id or not domain_name:
+                self._err("缺少参数: siteId, domainName", 400)
+                return
+            dns_credential_id = parse_dns_credential_id()
+            auto_match_dns = bool(body.get("autoMatchDns", dns_credential_id is None))
+            domain = api.get_acceleration_domain(site_id, domain_name)
+            if not domain:
+                self._err("加速域名不存在", 404)
+                return
+            cname_target = str(domain.get("cnameTarget") or "").strip()
+            response_payload: Dict[str, Any] = {
+                "domain": domain,
+                "dnsRecordsAdded": [],
+                "dnsErrors": [],
+                "dnsConflicts": [],
+            }
+            if not cname_target:
+                self._ok(response_payload, "当前域名尚未分配 CNAME，请稍后重试")
+                return
+            dns_apis, dns_errors = collect_dns_apis(dns_credential_id, auto_match_dns)
+            response_payload["dnsErrors"].extend(dns_errors)
+            public_resolution = query_public_cname_resolution(domain_name, cname_target)
+            response_payload["publicResolution"] = public_resolution
+            if not dns_apis:
+                self._ok(response_payload, "未找到可用的 DNS 凭证，请手动添加 CNAME 记录")
+                return
+            dns_api, dns_provider, dns_row, target_zone = match_dns_zone(domain_name, dns_apis)
+            if not target_zone:
+                response_payload["dnsErrors"].append({"key": domain_name, "error": f"未找到域名 {domain_name} 对应的 DNS 区域"})
+                self._ok(response_payload, "未找到匹配的 DNS 区域，请手动添加 CNAME 记录")
+                return
+            dns_check = analyze_dns_record_conflicts(
+                dns_api,
+                str(dns_provider or ""),
+                dns_row,
+                target_zone,
+                domain_name,
+                "CNAME",
+                cname_target,
+            )
+            dns_check["expectedValue"] = cname_target
+            dns_check["zoneMatched"] = True
+            dns_check["publicResolution"] = public_resolution
+            dns_check["errors"] = list(response_payload.get("dnsErrors") or [])
+            response_payload["dnsCheck"] = dns_check
+            response_payload["dnsConflicts"] = dns_check.get("conflicts") or []
+            if dns_check.get("conflicts"):
+                self._ok(response_payload, "检测到 DNS 冲突，未自动写入 CNAME")
+                return
+            if dns_check.get("configured"):
+                response_payload["dnsRecordsAdded"].append({
+                    "credentialId": dns_check.get("credentialId"),
+                    "credentialName": dns_check.get("credentialName"),
+                    "provider": dns_check.get("provider"),
+                    "zone": dns_check.get("zone"),
+                    "zoneId": dns_check.get("zoneId"),
+                    "type": "CNAME",
+                    "name": domain_name,
+                    "value": cname_target,
+                    "existing": True,
+                })
+                self._ok(response_payload, "当前 CNAME 已存在，无需重复写入")
+                return
+            try:
+                record_result = ensure_dns_record(dns_api, str(dns_provider or ""), target_zone, domain_name, "CNAME", cname_target, int(body.get("ttl") or 600))
+                response_payload["dnsRecordsAdded"].append({
+                    "credentialId": int(dns_row["id"] or 0) if dns_row else None,
+                    "credentialName": str(dns_row["name"] or "") if dns_row else "",
+                    "provider": dns_provider,
+                    "zone": target_zone.get("name"),
+                    "zoneId": target_zone.get("id"),
+                    "type": "CNAME",
+                    "name": domain_name,
+                    "value": cname_target,
+                    "existing": bool(record_result.get("existing")),
+                })
+                response_payload["dnsCheck"] = analyze_dns_record_conflicts(
+                    dns_api,
+                    str(dns_provider or ""),
+                    dns_row,
+                    target_zone,
+                    domain_name,
+                    "CNAME",
+                    cname_target,
+                )
+                if isinstance(response_payload.get("dnsCheck"), dict):
+                    response_payload["dnsCheck"]["expectedValue"] = cname_target
+                    response_payload["dnsCheck"]["zoneMatched"] = True
+                    response_payload["dnsCheck"]["publicResolution"] = public_resolution
+                    response_payload["dnsCheck"]["errors"] = list(response_payload.get("dnsErrors") or [])
+            except Exception as exc:
+                response_payload["dnsErrors"].append({"key": domain_name, "error": str(exc)})
+            self._ok(response_payload, "CNAME 记录自动配置完成")
+            return
+
+        if self.command == "POST" and sub == "/domains/status":
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "describe_domain_status"):
+                self._err("当前加速插件不支持状态查询", 400)
+                return
+            site_id = str(body.get("siteId") or "").strip()
+            domain_name = str(body.get("domainName") or "").strip()
+            if not site_id or not domain_name:
+                self._err("缺少参数: siteId, domainName", 400)
+                return
+            data = api.describe_domain_status(site_id, domain_name)
+            if hasattr(api, "get_acceleration_domain"):
+                try:
+                    domain = api.get_acceleration_domain(site_id, domain_name)
+                except Exception:
+                    domain = None
+                if domain:
+                    data["domain"] = domain
+                    domain_status = str(domain.get("status") or domain.get("domainStatus") or "").strip().lower()
+                    paused = bool(domain.get("paused"))
+                    ui_state = "active"
+                    if paused:
+                        ui_state = "paused"
+                    elif domain_status in ("deploying", "pending", "processing"):
+                        ui_state = "deploying"
+                    elif domain_status in ("active", "online", "deployed"):
+                        ui_state = "active"
+                    else:
+                        cname_target_check = str(domain.get("cnameTarget") or "").strip()
+                        if not cname_target_check:
+                            ui_state = "cname_pending"
+                    cached_status_key = f"acceleration:domain-status:{uid}:{int(auth['credential']['id'] or 0)}:{site_id}:{domain_name}"
+                    cache_set(cached_status_key, ui_state, 120)
+                    cname_target = str(domain.get("cnameTarget") or "").strip()
+                    if cname_target:
+                        dns_credential_id = parse_dns_credential_id()
+                        auto_match_dns = bool(body.get("autoMatchDns", dns_credential_id is None))
+                        dns_check: Dict[str, Any] = {
+                            "expectedValue": cname_target,
+                            "zoneMatched": False,
+                            "configured": False,
+                            "currentValue": "",
+                            "provider": None,
+                            "credentialId": None,
+                            "credentialName": "",
+                            "zone": "",
+                            "zoneId": "",
+                            "records": [],
+                            "conflicts": [],
+                            "errors": [],
+                            "publicResolution": query_public_cname_resolution(domain_name, cname_target),
+                        }
+                        dns_apis, dns_errors = collect_dns_apis(dns_credential_id, auto_match_dns)
+                        dns_check["errors"].extend(dns_errors)
+                        if dns_apis:
+                            dns_api, dns_provider, dns_row, target_zone = match_dns_zone(domain_name, dns_apis)
+                            if target_zone:
+                                dns_check["zoneMatched"] = True
+                                dns_check.update(
+                                    analyze_dns_record_conflicts(
+                                        dns_api,
+                                        str(dns_provider or ""),
+                                        dns_row,
+                                        target_zone,
+                                        domain_name,
+                                        "CNAME",
+                                        cname_target,
+                                    )
+                                )
+                            else:
+                                dns_check["errors"].append({"error": f"未找到域名 {domain_name} 对应的 DNS 区域"})
+                        data["dnsCheck"] = dns_check
+            self._ok(data, "获取加速域名状态成功")
+            return
+
+        m = re.fullmatch(r"/domains/([^/]+)/status", sub)
+        if m and self.command in ("POST", "PUT"):
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "modify_acceleration_domain_statuses"):
+                self._err("当前加速插件不支持状态修改", 400)
+                return
+            domain_name = urllib.parse.unquote(m.group(1))
+            site_id = str(body.get("siteId") or "").strip()
+            if not site_id:
+                self._err("缺少参数: siteId", 400)
+                return
+            data = api.modify_acceleration_domain_statuses(site_id, [domain_name], bool(body.get("enabled")))
+            invalidate(auth, site_id)
+            new_ui_state = "paused" if not bool(body.get("enabled")) else "active"
+            cached_status_key = f"acceleration:domain-status:{uid}:{int(auth['credential']['id'] or 0)}:{site_id}:{domain_name}"
+            cache_set(cached_status_key, new_ui_state, 120)
+            self._ok(data, "更新加速域名状态成功")
+            return
+
+        m = re.fullmatch(r"/domains/([^/]+)/finalize", sub)
+        if m and self.command == "POST":
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "upsert_acceleration_domain"):
+                self._err("当前加速插件不支持 finalize 操作", 400)
+                return
+            domain_name = urllib.parse.unquote(m.group(1))
+            site_id = str(body.get("siteId") or "").strip()
+            if not site_id or not domain_name:
+                self._err("缺少参数: siteId, domainName", 400)
+                return
+            try:
+                domain = api.upsert_acceleration_domain(site_id, domain_name, body)
+            except Exception as exc:
+                self._err(str(exc), 400)
+                return
+            invalidate(auth, site_id)
+            dns_credential_id = parse_dns_credential_id()
+            auto_match_dns = bool(body.get("autoMatchDns", dns_credential_id is None))
+            cname_target = str((domain or {}).get("cnameTarget") or "").strip()
+            response_payload: Dict[str, Any] = {
+                "domain": domain,
+                "dnsRecordsAdded": [],
+                "dnsErrors": [],
+                "dnsConflicts": [],
+            }
+            if not cname_target:
+                self._ok(response_payload, "加速域名已保存，但尚未分配 CNAME，请稍后再试")
+                return
+            dns_apis, dns_errors = collect_dns_apis(dns_credential_id, auto_match_dns)
+            response_payload["dnsErrors"].extend(dns_errors)
+            public_resolution = query_public_cname_resolution(domain_name, cname_target)
+            response_payload["publicResolution"] = public_resolution
+            if not dns_apis:
+                self._ok(response_payload, "加速域名已保存，未找到可用的 DNS 凭证，请手动添加 CNAME")
+                return
+            dns_api, dns_provider, dns_row, target_zone = match_dns_zone(domain_name, dns_apis)
+            if not target_zone:
+                response_payload["dnsErrors"].append({"key": domain_name, "error": f"未找到域名 {domain_name} 对应的 DNS 区域"})
+                self._ok(response_payload, "加速域名已保存，未找到匹配的 DNS 区域")
+                return
+            dns_check = analyze_dns_record_conflicts(
+                dns_api, str(dns_provider or ""), dns_row, target_zone, domain_name, "CNAME", cname_target,
+            )
+            dns_check["expectedValue"] = cname_target
+            dns_check["zoneMatched"] = True
+            dns_check["publicResolution"] = public_resolution
+            dns_check["errors"] = list(response_payload.get("dnsErrors") or [])
+            response_payload["dnsCheck"] = dns_check
+            response_payload["dnsConflicts"] = dns_check.get("conflicts") or []
+            if dns_check.get("conflicts"):
+                self._ok(response_payload, "加速域名已保存；检测到 DNS 冲突，未自动写入 CNAME")
+                return
+            if dns_check.get("configured"):
+                response_payload["dnsRecordsAdded"].append({
+                    "credentialId": dns_check.get("credentialId"),
+                    "credentialName": dns_check.get("credentialName"),
+                    "provider": dns_check.get("provider"),
+                    "zone": dns_check.get("zone"),
+                    "zoneId": dns_check.get("zoneId"),
+                    "type": "CNAME",
+                    "name": domain_name,
+                    "value": cname_target,
+                    "existing": True,
+                })
+                self._ok(response_payload, "加速域名已保存；当前 CNAME 已存在，无需重复写入")
+                return
+            try:
+                record_result = ensure_dns_record(dns_api, str(dns_provider or ""), target_zone, domain_name, "CNAME", cname_target, int(body.get("ttl") or 600))
+                response_payload["dnsRecordsAdded"].append({
+                    "credentialId": int(dns_row["id"] or 0) if dns_row else None,
+                    "credentialName": str(dns_row["name"] or "") if dns_row else "",
+                    "provider": dns_provider,
+                    "zone": target_zone.get("name"),
+                    "zoneId": target_zone.get("id"),
+                    "type": "CNAME",
+                    "name": domain_name,
+                    "value": cname_target,
+                    "existing": bool(record_result.get("existing")),
+                })
+                response_payload["dnsCheck"] = analyze_dns_record_conflicts(
+                    dns_api, str(dns_provider or ""), dns_row, target_zone, domain_name, "CNAME", cname_target,
+                )
+                if isinstance(response_payload.get("dnsCheck"), dict):
+                    response_payload["dnsCheck"]["expectedValue"] = cname_target
+                    response_payload["dnsCheck"]["zoneMatched"] = True
+                    response_payload["dnsCheck"]["publicResolution"] = public_resolution
+                    response_payload["dnsCheck"]["errors"] = list(response_payload.get("dnsErrors") or [])
+            except Exception as exc:
+                response_payload["dnsErrors"].append({"key": domain_name, "error": str(exc)})
+            self._ok(response_payload, "加速域名已保存且 CNAME 自动配置完成")
+            return
+
+        m = re.fullmatch(r"/domains/([^/]+)", sub)
+        if m and self.command == "GET":
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "get_acceleration_domain"):
+                self._err("当前加速插件不支持域名详情", 400)
+                return
+            site_id = str(first_or_none(q, "siteId") or "").strip()
+            if not site_id:
+                self._err("缺少参数: siteId", 400)
+                return
+            domain_name = urllib.parse.unquote(m.group(1))
+            domain = api.get_acceleration_domain(site_id, domain_name)
+            if not domain:
+                self._err("加速域名不存在", 404)
+                return
+            self._ok({"domain": domain}, "获取加速域名详情成功")
+            return
+
+        if m and self.command == "PUT":
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "modify_acceleration_domain"):
+                self._err("当前加速插件不支持更新加速域名", 400)
+                return
+            site_id = str(body.get("siteId") or "").strip()
+            if not site_id:
+                self._err("缺少参数: siteId", 400)
+                return
+            domain_name = urllib.parse.unquote(m.group(1))
+            domain = api.modify_acceleration_domain(site_id, domain_name, body)
+            invalidate(auth, site_id)
+            self._ok({"domain": domain}, "更新加速域名成功")
+            return
+
+        if m and self.command == "DELETE":
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "delete_acceleration_domains"):
+                self._err("当前加速插件不支持删除加速域名", 400)
+                return
+            site_id = str(first_or_none(q, "siteId") or body.get("siteId") or "").strip()
+            if not site_id:
+                self._err("缺少参数: siteId", 400)
+                return
+            domain_name = urllib.parse.unquote(m.group(1))
+            data = api.delete_acceleration_domains(site_id, [domain_name])
+            invalidate(auth, site_id)
+            self._ok(data, "删除加速域名成功")
+            return
+
+        if self.command == "POST" and sub == "/certificates/create":
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "create_certificate"):
+                self._err("当前加速插件不支持证书申请", 400)
+                return
+            site_id = str(body.get("siteId") or "").strip()
+            domain_name = str(body.get("domainName") or "").strip()
+            alt_names = body.get("alternativeNames") if isinstance(body.get("alternativeNames"), list) else []
+            data = api.create_certificate(site_id, domain_name, alt_names)
+            self._ok(data, "申请加速证书成功")
+            return
+
+        if self.command == "POST" and sub == "/certificates/bind":
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "modify_hosts_certificate"):
+                self._err("当前加速插件不支持证书绑定", 400)
+                return
+            site_id = str(body.get("siteId") or "").strip()
+            hosts = body.get("hosts") if isinstance(body.get("hosts"), list) else []
+            cert_type = str(body.get("certType") or "managed").strip() or "managed"
+            data = api.modify_hosts_certificate(site_id, hosts, cert_type, body.get("certId"), body.get("certInfo") if isinstance(body.get("certInfo"), dict) else None)
+            self._ok(data, "绑定加速证书成功")
+            return
+
+        if self.command == "GET" and sub == "/certificates":
+            auth = auth_ctx()
+            api = auth.get("api")
+            if api is None or not hasattr(api, "describe_host_certificates"):
+                self._err("当前加速插件不支持证书查询", 400)
+                return
+            site_id = str(first_or_none(q, "siteId") or "").strip()
+            if not site_id:
+                self._err("缺少参数: siteId", 400)
+                return
+            hosts = [str(x).strip() for x in (q.get("hosts") or []) if str(x).strip()]
+            data = api.describe_host_certificates(site_id, hosts)
+            if isinstance(data, dict) and "items" in data and "certificates" not in data:
+                data["certificates"] = data.get("items") or []
+            self._ok(data, "获取加速证书列表成功")
+            return
+
+        self._err("接口不存在", 404)
+    except Exception as e:
+        self._err(str(e), int(getattr(e, "status", 400) or 400))
+
+
 def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     sub = path[len("/api/dns-records") :] or "/"
     body = self._json_body(b)
@@ -1269,6 +2305,395 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
     is_cf = provider == "cloudflare"
     cf = ctx.get("cf")
     dnspod = ctx.get("dnspod")
+    dns_credential_id = int(ctx["credential"]["id"] or 0)
+
+    def normalize_host(value: Any) -> str:
+        return self._norm_hostname(value)
+
+    def parse_json_dict(raw_value: Any) -> Dict[str, Any]:
+        if isinstance(raw_value, dict):
+            return dict(raw_value)
+        if raw_value is None:
+            return {}
+        try:
+            parsed = json.loads(str(raw_value or ""))
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+
+    def state_table_ready() -> bool:
+        return table_exists("dns_record_acceleration_states")
+
+    def load_acceleration_state(zone_id: str, record_id: str, record_name: str | None = None) -> Any:
+        if not state_table_ready():
+            return None
+        with conn() as c:
+            row = c.execute(
+                """
+                SELECT *
+                FROM dns_record_acceleration_states
+                WHERE userId = ? AND dnsCredentialId = ? AND zoneId = ? AND recordId = ?
+                LIMIT 1
+                """,
+                (uid, dns_credential_id, zone_id, record_id),
+            ).fetchone()
+            if row:
+                return row
+            normalized_name = normalize_host(record_name)
+            if not normalized_name:
+                return None
+            rows = c.execute(
+                """
+                SELECT *
+                FROM dns_record_acceleration_states
+                WHERE userId = ? AND dnsCredentialId = ? AND zoneId = ? AND LOWER(TRIM(recordName)) = ?
+                ORDER BY updatedAt DESC, id DESC
+                LIMIT 2
+                """,
+                (uid, dns_credential_id, zone_id, normalized_name),
+            ).fetchall()
+        return rows[0] if len(rows) == 1 else None
+
+    def list_acceleration_states(zone_id: str) -> Dict[str, Any]:
+        if not state_table_ready():
+            return {}
+        with conn() as c:
+            rows = c.execute(
+                """
+                SELECT *
+                FROM dns_record_acceleration_states
+                WHERE userId = ? AND dnsCredentialId = ? AND zoneId = ?
+                """,
+                (uid, dns_credential_id, zone_id),
+            ).fetchall()
+        return {str(row["recordId"] or ""): row for row in rows if str(row["recordId"] or "").strip()}
+
+    def build_acceleration_state_payload(state_row: Any) -> Dict[str, Any]:
+        original = parse_json_dict(state_row["originalRecord"] if state_row else None)
+        target = str((state_row["accelerationTarget"] if state_row else None) or "").strip()
+        enabled = bool(int(state_row["enabled"] or 0)) if state_row else False
+        has_original = bool(original.get("type") and original.get("value"))
+        ui_state = "active"
+        if state_row:
+            accel_domain = str((state_row["accelerationDomain"] if state_row else None) or "").strip()
+            if not target or not accel_domain:
+                ui_state = "deploying"
+            else:
+                cached_status_key = f"acceleration:domain-status:{uid}:{int(state_row['accelerationCredentialId'] or 0)}:{state_row['accelerationSiteId']}:{accel_domain}"
+                cached_ui = cache_get(cached_status_key)
+                if cached_ui is not None and isinstance(cached_ui, str):
+                    ui_state = cached_ui
+        return {
+            "enabled": enabled,
+            "source": "state",
+            "restorable": has_original,
+            "uiState": ui_state,
+            "provider": str((state_row["accelerationProvider"] if state_row else None) or "edgeone").strip() or "edgeone",
+            "credentialId": int(state_row["accelerationCredentialId"]) if state_row and state_row["accelerationCredentialId"] is not None else None,
+            "siteId": str((state_row["accelerationSiteId"] if state_row else None) or "").strip() or None,
+            "domainName": str((state_row["accelerationDomain"] if state_row else None) or "").strip() or None,
+            "target": target or None,
+            "originalRecord": {
+                "type": str(original.get("type") or "").strip() or None,
+                "value": str(original.get("value") or "").strip() or None,
+                "ttl": original.get("ttl"),
+                "proxied": original.get("proxied"),
+                "remark": original.get("remark"),
+                "line": original.get("line"),
+                "priority": original.get("priority"),
+                "weight": original.get("weight"),
+            },
+        }
+
+    def attach_acceleration_state(record: Dict[str, Any], state_row: Any = None) -> Dict[str, Any]:
+        if not isinstance(record, dict):
+            return record
+        row = state_row or load_acceleration_state(str(record.get("zoneId") or ""), str(record.get("id") or ""), str(record.get("name") or ""))
+        if not row:
+            return record
+        next_record = dict(record)
+        next_record["acceleration"] = build_acceleration_state_payload(row)
+        return next_record
+
+    def delete_acceleration_state(state_row: Any = None, zone_id: str | None = None, record_id: str | None = None) -> None:
+        if not state_table_ready():
+            return
+        with conn() as c:
+            if state_row is not None and state_row["id"] is not None:
+                c.execute("DELETE FROM dns_record_acceleration_states WHERE id = ?", (int(state_row["id"]),))
+            elif zone_id and record_id:
+                c.execute(
+                    """
+                    DELETE FROM dns_record_acceleration_states
+                    WHERE userId = ? AND dnsCredentialId = ? AND zoneId = ? AND recordId = ?
+                    """,
+                    (uid, dns_credential_id, zone_id, record_id),
+                )
+            c.commit()
+
+    def persist_acceleration_state(
+        state_row: Any | None,
+        zone_id: str,
+        zone_name: str,
+        record: Dict[str, Any],
+        acceleration_info: Dict[str, Any],
+        original_record: Dict[str, Any],
+    ) -> None:
+        if not state_table_ready() or not isinstance(record, dict):
+            return
+        record_id = str(record.get("id") or "").strip()
+        record_name = normalize_host(record.get("name"))
+        if not record_id or not record_name:
+            return
+        params = (
+            normalize_host(zone_name),
+            record_id,
+            record_name,
+            str(acceleration_info.get("provider") or "edgeone").strip() or "edgeone",
+            int(acceleration_info["credentialId"]) if acceleration_info.get("credentialId") is not None else None,
+            str(acceleration_info.get("siteId") or "").strip() or None,
+            normalize_host(acceleration_info.get("domainName")),
+            normalize_host(acceleration_info.get("target")),
+            json.dumps(original_record or {}, ensure_ascii=False),
+            json.dumps(record or {}, ensure_ascii=False),
+        )
+        with conn() as c:
+            if state_row is not None and state_row["id"] is not None:
+                c.execute(
+                    """
+                    UPDATE dns_record_acceleration_states
+                    SET zoneName = ?, recordId = ?, recordName = ?, accelerationProvider = ?,
+                        accelerationCredentialId = ?, accelerationSiteId = ?, accelerationDomain = ?,
+                        accelerationTarget = ?, originalRecord = ?, acceleratedRecord = ?,
+                        enabled = 1, updatedAt = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (*params, int(state_row["id"])),
+                )
+            else:
+                c.execute(
+                    """
+                    INSERT INTO dns_record_acceleration_states (
+                      userId, dnsCredentialId, zoneId, zoneName, recordId, recordName,
+                      accelerationProvider, accelerationCredentialId, accelerationSiteId,
+                      accelerationDomain, accelerationTarget, originalRecord, acceleratedRecord,
+                      enabled, createdAt, updatedAt
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        uid,
+                        dns_credential_id,
+                        zone_id,
+                        *params,
+                    ),
+                )
+            c.commit()
+
+    def sync_acceleration_state_after_manual_update(zone_id: str, mapped_record: Dict[str, Any]) -> None:
+        state_row = load_acceleration_state(zone_id, str(mapped_record.get("id") or ""), str(mapped_record.get("name") or ""))
+        if not state_row:
+            return
+        target = normalize_host(state_row["accelerationTarget"])
+        current_type = str(mapped_record.get("type") or "").strip().upper()
+        current_value = normalize_host(mapped_record.get("value"))
+        if current_type == "CNAME" and target and current_value == target:
+            original = parse_json_dict(state_row["originalRecord"])
+            persist_acceleration_state(
+                state_row,
+                zone_id,
+                str(mapped_record.get("zoneName") or ""),
+                mapped_record,
+                {
+                    "provider": state_row["accelerationProvider"],
+                    "credentialId": state_row["accelerationCredentialId"],
+                    "siteId": state_row["accelerationSiteId"],
+                    "domainName": state_row["accelerationDomain"],
+                    "target": state_row["accelerationTarget"],
+                },
+                original,
+            )
+            return
+        delete_acceleration_state(state_row=state_row)
+
+    def list_records_for_name(zone_id: str, zone_name: str, fqdn_name: str) -> List[Dict[str, Any]]:
+        try:
+            if is_cf:
+                result = cf.list_records(zone_id, 1, 200, {"name": fqdn_name})
+                rows = result.get("records") if isinstance(result, dict) else []
+                return [
+                    self._map_cf_record(zone_id, zone_name, row)
+                    for row in rows
+                    if isinstance(row, dict) and normalize_host(row.get("name")) == normalize_host(fqdn_name)
+                ]
+            result = dnspod.list_records(zone_id, 1, 200, {"subDomain": fqdn_name})
+            rows = result.get("records") if isinstance(result, dict) else []
+            return [
+                self._map_dnspod_record(zone_id, zone_name, row)
+                for row in rows
+                if isinstance(row, dict) and normalize_host(row.get("name")) == normalize_host(fqdn_name)
+            ]
+        except Exception:
+            return []
+
+    def update_managed_record(zone_id: str, zone_name: str, record_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        if is_cf:
+            payload = {
+                "type": str(params.get("type") or "").strip().upper(),
+                "name": str(params.get("name") or "").strip(),
+                "content": self._normalize_txt_for_cf(str(params.get("type") or "").strip().upper(), params.get("value")),
+                "ttl": int(params.get("ttl")) if isinstance(params.get("ttl"), (int, float)) else 1,
+                "priority": int(params.get("priority")) if isinstance(params.get("priority"), (int, float)) else None,
+                "comment": params.get("remark"),
+            }
+            if payload["type"] in {"A", "AAAA", "CNAME"}:
+                payload["proxied"] = bool(params.get("proxied"))
+            record = cf.update_record(zone_id, record_id, payload)
+            return self._map_cf_record(zone_id, zone_name, record)
+        record = dnspod.update_record(
+            zone_id,
+            record_id,
+            {
+                "name": params.get("name"),
+                "type": params.get("type"),
+                "value": params.get("value"),
+                "ttl": params.get("ttl"),
+                "priority": params.get("priority"),
+                "weight": params.get("weight"),
+                "line": params.get("line"),
+                "remark": params.get("remark"),
+            },
+        )
+        return self._map_dnspod_record(zone_id, zone_name, record)
+
+    def build_edgeone_domain_config_from_record(fqdn_name: str, record: Dict[str, Any] | None) -> Dict[str, Any]:
+        source_record = dict(record or {})
+        record_type = str(source_record.get("type") or "").strip().upper()
+        origin_value = str(source_record.get("value") or "").strip()
+        normalized_domain = normalize_host(fqdn_name)
+        if record_type not in {"A", "AAAA", "CNAME"}:
+            raise ValueError("仅支持 A、AAAA、CNAME 记录自动创建 EdgeOne 加速域名")
+        if not origin_value:
+            raise ValueError(f"记录 {normalized_domain} 缺少源站地址，无法自动创建 EdgeOne 加速域名")
+        if record_type == "CNAME" and normalize_host(origin_value) == normalized_domain:
+            raise ValueError(f"记录 {normalized_domain} 当前指向自身，无法作为 EdgeOne 回源地址")
+        return {
+            "domainName": normalized_domain,
+            "originType": "IP_DOMAIN",
+            "originValue": origin_value,
+            "hostHeader": normalized_domain,
+            "originProtocol": "FOLLOW",
+            "httpOriginPort": 80,
+            "httpsOriginPort": 443,
+            "ipv6Status": "follow",
+        }
+
+    def resolve_edgeone_acceleration_target(
+        zone_name: str,
+        fqdn_name: str,
+        acceleration_credential_id: Any = None,
+        source_record: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        provider_types = tuple(x for x in SUPPORTED_ACCELERATION_PROVIDER_TYPES if str(x or "").strip())
+        if not provider_types:
+            raise ValueError("当前未启用加速服务商")
+        with conn() as c:
+            if acceleration_credential_id is not None:
+                rows = c.execute(
+                    f"""
+                    SELECT *
+                    FROM dns_credentials
+                    WHERE userId = ? AND id = ? AND provider IN ({SUPPORTED_ACCELERATION_PROVIDER_SQL})
+                    ORDER BY isDefault DESC, createdAt ASC, id ASC
+                    """,
+                    (uid, int(acceleration_credential_id), *provider_types),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    f"""
+                    SELECT *
+                    FROM dns_credentials
+                    WHERE userId = ? AND provider IN ({SUPPORTED_ACCELERATION_PROVIDER_SQL})
+                    ORDER BY isDefault DESC, createdAt ASC, id ASC
+                    """,
+                    (uid, *provider_types),
+                ).fetchall()
+        if not rows:
+            raise ValueError("未找到可用的 EdgeOne 加速凭证")
+
+        normalized_zone = normalize_host(zone_name)
+        normalized_domain = normalize_host(fqdn_name)
+        found_site = False
+        found_domain = False
+        cname_pending = False
+        first_error = ""
+        pending_message = ""
+
+        for row in rows:
+            try:
+                provider_name = str(row["provider"] or "").strip().lower()
+                if provider_name != "edgeone":
+                    continue
+                plugin = build_acceleration_plugin(provider_name, self._credential_secrets(row))
+                api = getattr(plugin, "api", None)
+                site = None
+                if api is not None and hasattr(api, "find_zone_by_name"):
+                    site = api.find_zone_by_name(normalized_zone)
+                elif hasattr(plugin, "discover_site"):
+                    site = plugin.discover_site(normalized_zone)
+                if not isinstance(site, dict):
+                    continue
+                found_site = True
+                site_id = str(site.get("siteId") or site.get("zoneId") or "").strip()
+                if not site_id or api is None or not hasattr(api, "get_acceleration_domain"):
+                    continue
+                domain = api.get_acceleration_domain(site_id, normalized_domain)
+                if not isinstance(domain, dict):
+                    if source_record is None or not hasattr(api, "upsert_acceleration_domain"):
+                        continue
+                    domain = api.upsert_acceleration_domain(
+                        site_id,
+                        normalized_domain,
+                        build_edgeone_domain_config_from_record(normalized_domain, source_record),
+                    )
+                if not isinstance(domain, dict):
+                    continue
+                found_domain = True
+                target = str(domain.get("cnameTarget") or "").strip()
+                if not target:
+                    cname_pending = True
+                    pending_message = f"EdgeOne 已自动创建加速域名 {normalized_domain}，但当前还未分配 CNAME"
+                    verify_name = str(domain.get("verifyRecordName") or "").strip()
+                    verify_value = str(domain.get("verifyRecordValue") or "").strip()
+                    verify_type = str(domain.get("verifyRecordType") or "TXT").strip() or "TXT"
+                    if verify_name and verify_value:
+                        pending_message = (
+                            f"{pending_message}，请先完成验证记录：{verify_name} {verify_type} {verify_value}"
+                        )
+                    continue
+                return {
+                    "provider": provider_name,
+                    "credentialId": int(row["id"] or 0),
+                    "credentialName": str(row["name"] or ""),
+                    "siteId": site_id,
+                    "siteName": str(site.get("zoneName") or site.get("siteName") or normalized_zone),
+                    "domainName": str(domain.get("domainName") or normalized_domain),
+                    "target": target,
+                    "domain": domain,
+                }
+            except Exception as exc:
+                if not first_error:
+                    first_error = str(exc)
+                continue
+
+        if found_domain or cname_pending:
+            raise ValueError(pending_message or "当前 EdgeOne 加速域名尚未分配 CNAME，请稍后重试")
+        if found_site:
+            if first_error:
+                raise ValueError(first_error)
+            raise ValueError(f"请先在 EdgeOne 加速里创建域名 {normalized_domain}")
+        if first_error:
+            raise ValueError(first_error)
+        raise ValueError(f"未找到域名 {normalized_zone} 对应的 EdgeOne 站点")
 
     if self.command == "GET" and sub == "/zones":
         page = p_int(first_or_none(q, "page") or "1", 1, 100000)
@@ -1459,7 +2884,8 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                     filters["content"] = value
                 res = cf.list_records(zone_id, page, page_size, filters)
                 records_raw = res.get("records") if isinstance(res, dict) else []
-                records = [self._map_cf_record(zone_id, zone_name, r) for r in records_raw if isinstance(r, dict)]
+                state_map = list_acceleration_states(zone_id)
+                records = [attach_acceleration_state(self._map_cf_record(zone_id, zone_name, r), state_map.get(str(r.get("id") or ""))) for r in records_raw if isinstance(r, dict)]
                 if keyword:
                     kw = keyword.lower()
                     records = [r for r in records if kw in str(r.get("name") or "").lower() or kw in str(r.get("value") or "").lower()]
@@ -1477,7 +2903,8 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                     filters["keyword"] = keyword
                 res = dnspod.list_records(zone_id, page, page_size, filters)
                 records_raw = res.get("records") if isinstance(res, dict) else []
-                records = [self._map_dnspod_record(zone_id, zone_name, r) for r in records_raw if isinstance(r, dict)]
+                state_map = list_acceleration_states(zone_id)
+                records = [attach_acceleration_state(self._map_dnspod_record(zone_id, zone_name, r), state_map.get(str(r.get("id") or ""))) for r in records_raw if isinstance(r, dict)]
             caps = get_provider_capabilities(provider) or {}
             total = int(res.get("total")) if isinstance(res, dict) and res.get("total") is not None else len(records)
             data = {
@@ -1526,6 +2953,179 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
         self._ok({"successCount": success_count, "failedCount": failed_count, "results": results}, "批量状态更新完成（部分失败）" if failed_count else "批量状态更新成功")
         return
 
+    m = re.fullmatch(r"/zones/([^/]+)/records/([^/]+)/acceleration", sub)
+    if self.command == "PUT" and m:
+        zone_id = urllib.parse.unquote(m.group(1))
+        record_id = urllib.parse.unquote(m.group(2))
+        enabled = body.get("enabled")
+        if enabled is None:
+            self._err("缺少参数: enabled (boolean)", 400)
+            return
+        enabled = bool(enabled)
+        acceleration_credential_id = body.get("accelerationCredentialId")
+        if acceleration_credential_id in ("", None):
+            acceleration_credential_id = first_or_none(q, "accelerationCredentialId")
+        if acceleration_credential_id not in ("", None):
+            try:
+                acceleration_credential_id = int(acceleration_credential_id)
+            except Exception:
+                self._err("accelerationCredentialId 必须是数字", 400)
+                return
+        else:
+            acceleration_credential_id = None
+        restore_record_raw = body.get("restoreRecord") if isinstance(body.get("restoreRecord"), dict) else None
+        restore_record_payload: Dict[str, Any] | None = None
+        if restore_record_raw:
+            restore_type = str(restore_record_raw.get("type") or "").strip().upper()
+            restore_value = str(restore_record_raw.get("value") or "").strip()
+            if restore_type and restore_value:
+                restore_record_payload = {
+                    "type": restore_type,
+                    "value": restore_value,
+                    "ttl": restore_record_raw.get("ttl"),
+                    "line": restore_record_raw.get("line"),
+                    "priority": restore_record_raw.get("priority"),
+                    "weight": restore_record_raw.get("weight"),
+                    "remark": restore_record_raw.get("remark"),
+                    "proxied": restore_record_raw.get("proxied"),
+                }
+        try:
+            if is_cf:
+                zone = cf.get_zone(zone_id)
+                zone_name = str(zone.get("name") or zone_id)
+                record_raw = cf.get_record(zone_id, record_id)
+                current_record = self._map_cf_record(zone_id, zone_name, record_raw)
+            else:
+                zone = dnspod.get_zone(zone_id)
+                zone_name = str(zone.get("name") or zone_id)
+                record_raw = dnspod.get_record(zone_id, record_id)
+                current_record = self._map_dnspod_record(zone_id, zone_name, record_raw)
+
+            fqdn_name = str(current_record.get("name") or "").strip()
+            if not fqdn_name:
+                self._err("记录名称不能为空", 400)
+                return
+
+            state_row = load_acceleration_state(zone_id, record_id, fqdn_name)
+
+            if enabled:
+                record_type = str(current_record.get("type") or "").strip().upper()
+                if normalize_host(fqdn_name) == normalize_host(zone_name):
+                    self._err("根域名暂不支持自动切换为 EdgeOne CNAME", 400)
+                    return
+                if record_type not in {"A", "AAAA", "CNAME"} and state_row is None:
+                    self._err("仅支持 A、AAAA、CNAME 记录启用 EdgeOne 加速", 400)
+                    return
+                same_name_records = list_records_for_name(zone_id, zone_name, fqdn_name)
+                conflicts = [r for r in same_name_records if str(r.get("id") or "") != record_id]
+                if conflicts:
+                    self._err("同名存在其他记录，无法自动切换为 CNAME，请先清理同名记录", 400)
+                    return
+
+                original_record = parse_json_dict(state_row["originalRecord"]) if state_row else {
+                    "id": str(current_record.get("id") or ""),
+                    "zoneId": str(current_record.get("zoneId") or zone_id),
+                    "zoneName": str(current_record.get("zoneName") or zone_name),
+                    "name": fqdn_name,
+                    "type": current_record.get("type"),
+                    "value": current_record.get("value"),
+                    "ttl": current_record.get("ttl"),
+                    "line": current_record.get("line"),
+                    "weight": current_record.get("weight"),
+                    "priority": current_record.get("priority"),
+                    "status": current_record.get("status"),
+                    "remark": current_record.get("remark"),
+                    "proxied": current_record.get("proxied"),
+                    "updatedAt": current_record.get("updatedAt"),
+                }
+                source_record = original_record or dict(current_record)
+                acceleration_info = resolve_edgeone_acceleration_target(
+                    zone_name,
+                    fqdn_name,
+                    acceleration_credential_id,
+                    source_record,
+                )
+                mapped = update_managed_record(zone_id, zone_name, record_id, {
+                    "name": fqdn_name,
+                    "type": "CNAME",
+                    "value": acceleration_info.get("target"),
+                    "ttl": current_record.get("ttl"),
+                    "proxied": False,
+                    "line": current_record.get("line"),
+                    "priority": None,
+                    "weight": None,
+                    "remark": current_record.get("remark"),
+                })
+                persist_acceleration_state(state_row, zone_id, zone_name, mapped, acceleration_info, original_record)
+                state_row = load_acceleration_state(zone_id, str(mapped.get("id") or ""), str(mapped.get("name") or ""))
+                mapped = attach_acceleration_state(mapped, state_row)
+                cache_delete_pattern(f"dns:records:cred:{ctx['credential']['id']}:z:{zone_id}:*")
+                self._ok(
+                    {
+                        "record": mapped,
+                        "acceleration": mapped.get("acceleration"),
+                        "applied": True,
+                        "restored": False,
+                    },
+                    "已启用 EdgeOne 加速，原记录已暂存",
+                )
+                return
+
+            if state_row is None:
+                original_record = {}
+            else:
+                original_record = parse_json_dict(state_row["originalRecord"])
+
+            if not original_record and not restore_record_payload:
+                current_type = str(current_record.get("type") or "").strip().upper()
+                if current_type != "CNAME":
+                    self._err("未检测到 EdgeOne 加速记录", 400)
+                    return
+                self._ok(
+                    {
+                        "applied": False,
+                        "restored": False,
+                        "needsRestoreInput": True,
+                        "currentRecord": current_record,
+                        "suggestedType": "A",
+                    },
+                    "未找到原始记录快照，请填写恢复的源站信息后再取消加速",
+                )
+                return
+
+            resolved: Dict[str, Any] = dict(original_record or {})
+            if restore_record_payload:
+                for k, v in restore_record_payload.items():
+                    if v is not None:
+                        resolved[k] = v
+
+            mapped = update_managed_record(zone_id, zone_name, record_id, {
+                "name": resolved.get("name") or fqdn_name,
+                "type": resolved.get("type"),
+                "value": resolved.get("value"),
+                "ttl": resolved.get("ttl"),
+                "proxied": resolved.get("proxied"),
+                "line": resolved.get("line"),
+                "priority": resolved.get("priority"),
+                "weight": resolved.get("weight"),
+                "remark": resolved.get("remark"),
+            })
+            if state_row is not None:
+                delete_acceleration_state(state_row=state_row)
+            cache_delete_pattern(f"dns:records:cred:{ctx['credential']['id']}:z:{zone_id}:*")
+            self._ok(
+                {
+                    "record": mapped,
+                    "applied": False,
+                    "restored": True,
+                },
+                "已恢复原始记录并关闭 EdgeOne 加速",
+            )
+        except Exception as e:
+            code = e.status if isinstance(e, (CloudflareApiError, DnspodApiError)) else 400
+            self._err(str(e), code)
+        return
+
     m = re.fullmatch(r"/zones/([^/]+)/records/([^/]+)", sub)
     if self.command == "GET" and m:
         zone_id = urllib.parse.unquote(m.group(1))
@@ -1535,12 +3135,14 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 zone = cf.get_zone(zone_id)
                 zone_name = str(zone.get("name") or zone_id)
                 record = cf.get_record(zone_id, record_id)
-                self._ok({"record": self._map_cf_record(zone_id, zone_name, record)}, "获取记录详情成功")
+                mapped = attach_acceleration_state(self._map_cf_record(zone_id, zone_name, record))
+                self._ok({"record": mapped}, "获取记录详情成功")
             else:
                 zone = dnspod.get_zone(zone_id)
                 zone_name = str(zone.get("name") or zone_id)
                 record = dnspod.get_record(zone_id, record_id)
-                self._ok({"record": self._map_dnspod_record(zone_id, zone_name, record)}, "获取记录详情成功")
+                mapped = attach_acceleration_state(self._map_dnspod_record(zone_id, zone_name, record))
+                self._ok({"record": mapped}, "获取记录详情成功")
         except Exception as e:
             code = e.status if isinstance(e, (CloudflareApiError, DnspodApiError)) else 400
             self._err(str(e), code)
@@ -1673,6 +3275,8 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 }
                 record = dnspod.update_record(zone_id, record_id, params)
                 mapped = self._map_dnspod_record(zone_id, zone_name, record)
+            sync_acceleration_state_after_manual_update(zone_id, mapped)
+            mapped = attach_acceleration_state(mapped)
             create_log(
                 user_id=uid,
                 action="UPDATE",
@@ -1719,6 +3323,7 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 except Exception:
                     old = None
                 dnspod.delete_record(zone_id, record_id)
+            delete_acceleration_state(zone_id=zone_id, record_id=record_id)
             create_log(
                 user_id=uid,
                 action="DELETE",
@@ -1763,6 +3368,7 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                     cf.delete_record(zone_id, rid)
                 else:
                     dnspod.delete_record(zone_id, rid)
+                delete_acceleration_state(zone_id=zone_id, record_id=rid)
                 results.append({"recordId": rid, "success": True})
                 try:
                     create_log(
@@ -1810,8 +3416,16 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
             return
         try:
             dnspod.set_record_status(zone_id, record_id, bool(enabled))
+            mapped = None
+            try:
+                zone = dnspod.get_zone(zone_id)
+                zone_name = str(zone.get("name") or zone_id)
+                record = dnspod.get_record(zone_id, record_id)
+                mapped = attach_acceleration_state(self._map_dnspod_record(zone_id, zone_name, record))
+            except Exception:
+                mapped = None
             cache_delete_pattern(f"dns:records:cred:{ctx['credential']['id']}:z:{zone_id}:*")
-            self._ok(None, "记录状态更新成功")
+            self._ok({"record": mapped}, "记录状态更新成功")
         except (DnspodApiError,) as e:
             self._err(str(e), e.status)
         return
@@ -2783,994 +4397,6 @@ def _dashboard(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         self._err(str(e), 500); return
     self._err("接口不存在", 404)
 
-
-def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
-    auth_user = self._auth()
-    if not auth_user:
-        return
-    uid = int(auth_user.get("id") or 0)
-    if uid <= 0:
-        self._err("认证失败", 401)
-        return
-
-    sub = path[len("/api/accelerations") :] or "/"
-    body = self._json_body(b)
-    ip = self._client_ip()
-
-    def _json_compact(value: Any) -> str:
-        try:
-            return json.dumps(value, ensure_ascii=False)
-        except Exception:
-            return str(value)
-
-    def _write_accel_log(
-        action: str,
-        status: str,
-        zone_name: str,
-        *,
-        record_name: str | None = None,
-        old_value: Any = None,
-        new_value: Any = None,
-        error_message: str | None = None,
-    ) -> None:
-        try:
-            create_log(
-                user_id=uid,
-                action=action,
-                resource_type="ACCELERATION",
-                status=status,
-                domain=zone_name or None,
-                record_name=record_name or zone_name or None,
-                old_value=_json_compact(old_value) if old_value is not None else None,
-                new_value=_json_compact(new_value) if new_value is not None else None,
-                error_message=error_message,
-                ip_address=ip,
-            )
-        except Exception:
-            pass
-
-    def _serialize_row(row: Any) -> Dict[str, Any] | None:
-        if not row:
-            return None
-        return {
-            "id": int(row["id"]),
-            "dnsCredentialId": int(row["dnsCredentialId"]),
-            "zoneName": str(row["zoneName"] or ""),
-            "pluginProvider": str(row["pluginProvider"] or ""),
-            "pluginCredentialId": int(row["pluginCredentialId"]),
-            "remoteSiteId": str(row["remoteSiteId"] or ""),
-            "accelerationDomain": str(row["accelerationDomain"] or ""),
-            "subDomain": str(row["subDomain"] or "@"),
-            "siteStatus": str(row["siteStatus"] or ""),
-            "domainStatus": str(row["domainStatus"] or ""),
-            "verifyStatus": str(row["verifyStatus"] or ""),
-            "identificationStatus": str(row["identificationStatus"] or ""),
-            "verified": bool(row["verified"]),
-            "paused": bool(row["paused"]),
-            "accessType": str(row["accessType"] or "partial"),
-            "area": str(row["area"] or "global"),
-            "planId": str(row["planId"] or ""),
-            "cnameTarget": str(row["cnameTarget"] or ""),
-            "cnameStatus": str(row["cnameStatus"] or ""),
-            "originType": str(row["originType"] or ""),
-            "originValue": str(row["originValue"] or ""),
-            "backupOriginValue": str(row["backupOriginValue"] or ""),
-            "hostHeader": str(row["hostHeader"] or ""),
-            "originProtocol": str(row["originProtocol"] or "FOLLOW"),
-            "httpOriginPort": int(row["httpOriginPort"] or 80),
-            "httpsOriginPort": int(row["httpsOriginPort"] or 443),
-            "ipv6Status": str(row["ipv6Status"] or "follow"),
-            "verifyRecordName": str(row["verifyRecordName"] or ""),
-            "verifyRecordType": str(row["verifyRecordType"] or ""),
-            "verifyRecordValue": str(row["verifyRecordValue"] or ""),
-            "lastError": str(row["lastError"] or ""),
-            "lastSyncedAt": row["lastSyncedAt"],
-            "createdAt": row["createdAt"],
-            "updatedAt": row["updatedAt"],
-        }
-
-    def _normalize_acceleration_domain(zone_name: str, source: Any) -> str:
-        zone = norm_domain(zone_name)
-        if not zone or not isinstance(source, dict):
-            return ""
-        explicit = norm_domain(source.get("accelerationDomain"))
-        if explicit:
-            return explicit
-        sub_domain = str(source.get("subDomain") or "").strip().lower().rstrip(".")
-        if not sub_domain:
-            return ""
-        if sub_domain == "@":
-            return zone
-        if sub_domain.endswith(f".{zone}"):
-            return sub_domain
-        return f"{sub_domain}.{zone}"
-
-    def _list_accel_rows(
-        dns_credential_id: int | None = None,
-        zone_name: str | None = None,
-        *,
-        acceleration_domain: str | None = None,
-        plugin_provider: str | None = None,
-        plugin_credential_id: int | None = None,
-        remote_site_id: str | None = None,
-    ) -> List[Any]:
-        sql = "SELECT * FROM domain_accelerations WHERE userId = ?"
-        params: List[Any] = [uid]
-        if dns_credential_id:
-            sql += " AND dnsCredentialId = ?"
-            params.append(int(dns_credential_id))
-        if zone_name:
-            sql += " AND zoneName = ?"
-            params.append(str(zone_name))
-        if acceleration_domain:
-            sql += " AND accelerationDomain = ?"
-            params.append(str(acceleration_domain))
-        if plugin_provider:
-            sql += " AND pluginProvider = ?"
-            params.append(str(plugin_provider))
-        if plugin_credential_id:
-            sql += " AND pluginCredentialId = ?"
-            params.append(int(plugin_credential_id))
-        if remote_site_id:
-            sql += " AND remoteSiteId = ?"
-            params.append(str(remote_site_id))
-        sql += " ORDER BY updatedAt DESC, id DESC"
-        with conn() as c:
-            return c.execute(sql, params).fetchall()
-
-    def _get_accel_row(
-        dns_credential_id: int,
-        zone_name: str,
-        *,
-        acceleration_domain: str = "",
-        plugin_provider: str | None = None,
-        plugin_credential_id: int | None = None,
-        remote_site_id: str = "",
-        allow_fallback_single: bool = True,
-    ) -> Any:
-        exact_rows = _list_accel_rows(
-            dns_credential_id,
-            zone_name,
-            acceleration_domain=acceleration_domain or None,
-            plugin_provider=plugin_provider,
-            plugin_credential_id=plugin_credential_id,
-            remote_site_id=remote_site_id or None,
-        )
-        if exact_rows:
-            return exact_rows[0]
-        if acceleration_domain or not allow_fallback_single:
-            return None
-        fallback_rows = _list_accel_rows(
-            dns_credential_id,
-            zone_name,
-            plugin_provider=plugin_provider,
-            plugin_credential_id=plugin_credential_id,
-            remote_site_id=remote_site_id or None,
-        )
-        return fallback_rows[0] if len(fallback_rows) == 1 else None
-
-    def _delete_accel_row(
-        dns_credential_id: int,
-        zone_name: str,
-        *,
-        acceleration_domain: str = "",
-        plugin_provider: str | None = None,
-        plugin_credential_id: int | None = None,
-        remote_site_id: str = "",
-    ) -> bool:
-        target_row = _get_accel_row(
-            dns_credential_id,
-            zone_name,
-            acceleration_domain=acceleration_domain,
-            plugin_provider=plugin_provider,
-            plugin_credential_id=plugin_credential_id,
-            remote_site_id=remote_site_id,
-        )
-        if not target_row:
-            return False
-        with conn() as c:
-            result = c.execute(
-                "DELETE FROM domain_accelerations WHERE userId = ? AND id = ?",
-                (uid, int(target_row["id"])),
-            )
-            c.commit()
-            return int(result.rowcount or 0) > 0
-
-    def _upsert_accel_row(
-        dns_credential_id: int,
-        zone_name: str,
-        plugin_credential_id: int,
-        state: Dict[str, Any],
-        plugin_provider: str,
-        last_error: str = "",
-        *,
-        existing_row_id: int | None = None,
-    ) -> Any:
-        acceleration_domain = norm_domain(state.get("accelerationDomain")) or norm_domain(zone_name)
-        with conn() as c:
-            c.execute(
-                """
-                INSERT INTO domain_accelerations (
-                  userId, dnsCredentialId, zoneName, pluginProvider, pluginCredentialId,
-                  remoteSiteId, accelerationDomain, subDomain, siteStatus, domainStatus, verifyStatus, identificationStatus,
-                  verified, paused, accessType, area, planId, cnameTarget, cnameStatus,
-                  originType, originValue, backupOriginValue, hostHeader, originProtocol,
-                  httpOriginPort, httpsOriginPort, ipv6Status,
-                  verifyRecordName, verifyRecordType, verifyRecordValue, lastError, lastSyncedAt, updatedAt
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(userId, dnsCredentialId, zoneName, pluginProvider, accelerationDomain)
-                DO UPDATE SET
-                  pluginCredentialId = excluded.pluginCredentialId,
-                  remoteSiteId = excluded.remoteSiteId,
-                  accelerationDomain = excluded.accelerationDomain,
-                  subDomain = excluded.subDomain,
-                  siteStatus = excluded.siteStatus,
-                  domainStatus = excluded.domainStatus,
-                  verifyStatus = excluded.verifyStatus,
-                  identificationStatus = excluded.identificationStatus,
-                  verified = excluded.verified,
-                  paused = excluded.paused,
-                  accessType = excluded.accessType,
-                  area = excluded.area,
-                  planId = excluded.planId,
-                  cnameTarget = excluded.cnameTarget,
-                  cnameStatus = excluded.cnameStatus,
-                  originType = excluded.originType,
-                  originValue = excluded.originValue,
-                  backupOriginValue = excluded.backupOriginValue,
-                  hostHeader = excluded.hostHeader,
-                  originProtocol = excluded.originProtocol,
-                  httpOriginPort = excluded.httpOriginPort,
-                  httpsOriginPort = excluded.httpsOriginPort,
-                  ipv6Status = excluded.ipv6Status,
-                  verifyRecordName = excluded.verifyRecordName,
-                  verifyRecordType = excluded.verifyRecordType,
-                  verifyRecordValue = excluded.verifyRecordValue,
-                  lastError = excluded.lastError,
-                  lastSyncedAt = excluded.lastSyncedAt,
-                  updatedAt = CURRENT_TIMESTAMP
-                """,
-                (
-                    uid,
-                    dns_credential_id,
-                    zone_name,
-                    plugin_provider,
-                    plugin_credential_id,
-                    str(state.get("remoteSiteId") or ""),
-                    acceleration_domain,
-                    str(state.get("subDomain") or "@"),
-                    str(state.get("siteStatus") or ""),
-                    str(state.get("domainStatus") or ""),
-                    str(state.get("verifyStatus") or ""),
-                    str(state.get("identificationStatus") or ""),
-                    1 if bool(state.get("verified")) else 0,
-                    1 if bool(state.get("paused")) else 0,
-                    str(state.get("accessType") or "partial"),
-                    str(state.get("area") or "global"),
-                    str(state.get("planId") or ""),
-                    str(state.get("cnameTarget") or ""),
-                    str(state.get("cnameStatus") or ""),
-                    str(state.get("originType") or ""),
-                    str(state.get("originValue") or ""),
-                    str(state.get("backupOriginValue") or ""),
-                    str(state.get("hostHeader") or ""),
-                    str(state.get("originProtocol") or "FOLLOW"),
-                    int(state.get("httpOriginPort") or 80),
-                    int(state.get("httpsOriginPort") or 443),
-                    str(state.get("ipv6Status") or "follow"),
-                    str(state.get("verifyRecordName") or ""),
-                    str(state.get("verifyRecordType") or "TXT"),
-                    str(state.get("verifyRecordValue") or ""),
-                    str(last_error or ""),
-                    now_iso(),
-                ),
-            )
-            row = c.execute(
-                """
-                SELECT *
-                FROM domain_accelerations
-                WHERE userId = ? AND dnsCredentialId = ? AND zoneName = ? AND pluginProvider = ? AND accelerationDomain = ?
-                LIMIT 1
-                """,
-                (uid, dns_credential_id, zone_name, plugin_provider, acceleration_domain),
-            ).fetchone()
-            if existing_row_id and row and int(row["id"]) != int(existing_row_id):
-                c.execute(
-                    "DELETE FROM domain_accelerations WHERE userId = ? AND id = ?",
-                    (uid, int(existing_row_id)),
-                )
-            c.commit()
-        return row
-
-    def _build_plugin_by_credential(plugin_credential_id: int):
-        row = self._get_credential_row(uid, plugin_credential_id)
-        if not row:
-            raise ValueError("加速凭证不存在或无权访问")
-        provider = str(row["provider"] or "").strip().lower()
-        secrets = self._credential_secrets(row)
-        return row, provider, build_acceleration_plugin(provider, secrets)
-
-    def _list_acceleration_credential_rows(plugin_credential_id: int | None = None) -> List[Any]:
-        if plugin_credential_id:
-            row = self._get_credential_row(uid, plugin_credential_id)
-            if not row:
-                return []
-            provider = str(row["provider"] or "").strip().lower()
-            caps = get_provider_capabilities(provider) or {}
-            return [row] if str(caps.get("category") or "dns") == "acceleration" else []
-        with conn() as c:
-            rows = c.execute(
-                """
-                SELECT *
-                FROM dns_credentials
-                WHERE userId = ?
-                ORDER BY isDefault DESC, createdAt ASC
-                """,
-                (uid,),
-            ).fetchall()
-        return [
-            row
-            for row in rows
-            if str((get_provider_capabilities(str(row["provider"] or "").strip().lower()) or {}).get("category") or "dns") == "acceleration"
-        ]
-
-    def _serialize_remote_site_item(cred_row: Any, site: Dict[str, Any], provider: str | None = None) -> Dict[str, Any]:
-        provider_name = str(provider or cred_row["provider"] or "").strip().lower()
-        return {
-            "pluginCredentialId": int(cred_row["id"]),
-            "pluginCredentialName": str(cred_row["name"] or f"#{cred_row['id']}"),
-            "pluginProvider": provider_name,
-            "site": site,
-        }
-
-    def _list_remote_site_items(plugin_credential_id: int | None = None, zone_name: str | None = None) -> List[Dict[str, Any]]:
-        normalized_zone = norm_domain(zone_name)
-        items: List[Dict[str, Any]] = []
-        for cred_row in _list_acceleration_credential_rows(plugin_credential_id):
-            plugin_cred_row, provider, plugin = _build_plugin_by_credential(int(cred_row["id"]))
-            for site in plugin.list_sites():
-                zone = norm_domain(site.get("zoneName"))
-                if normalized_zone and zone != normalized_zone:
-                    continue
-                items.append(_serialize_remote_site_item(plugin_cred_row, site, provider))
-        return items
-
-    def _refresh_row(row: Any, verify: bool = False) -> Any:
-        plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(int(row["pluginCredentialId"]))
-        zone_name = str(row["zoneName"] or "")
-        remote_site_id = str(row["remoteSiteId"] or "")
-        row_config = _accel_config_from_source(_serialize_row(row) or {})
-        state = plugin.verify_site(zone_name, remote_site_id, row_config) if verify else plugin.get_site(zone_name, remote_site_id, row_config)
-        return _upsert_accel_row(
-            int(row["dnsCredentialId"]),
-            zone_name,
-            int(plugin_cred_row["id"]),
-            state,
-            plugin_provider,
-            "",
-            existing_row_id=int(row["id"]),
-        )
-
-    def _resolve_site_target(source: Any) -> Dict[str, Any]:
-        payload = source if isinstance(source, dict) else {}
-        zone_name = norm_domain(payload.get("zoneName"))
-        dns_credential_id = self._parse_credential_id(payload.get("dnsCredentialId"))
-        plugin_credential_id = self._parse_credential_id(payload.get("pluginCredentialId"))
-        remote_site_id = str(payload.get("remoteSiteId") or "").strip()
-        target_acceleration_domain = _normalize_acceleration_domain(zone_name, payload)
-        row = (
-            _get_accel_row(
-                dns_credential_id,
-                zone_name,
-                acceleration_domain=target_acceleration_domain,
-                plugin_credential_id=plugin_credential_id,
-                remote_site_id=remote_site_id,
-            )
-            if dns_credential_id and zone_name
-            else None
-        )
-        if row:
-            zone_name = zone_name or str(row["zoneName"] or "")
-            plugin_credential_id = plugin_credential_id or int(row["pluginCredentialId"])
-            remote_site_id = remote_site_id or str(row["remoteSiteId"] or "")
-        row_config = _accel_config_from_source(_serialize_row(row) or {}) if row else {}
-        body_config = _accel_config_from_source(payload)
-        if body_config:
-            row_config.update(body_config)
-        if not zone_name:
-            raise ValueError("缺少参数: zoneName")
-        if not plugin_credential_id:
-            raise ValueError("缺少参数: pluginCredentialId")
-        plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-        return {
-            "row": row,
-            "previous": _serialize_row(row) if row else None,
-            "zone_name": zone_name,
-            "dns_credential_id": int(row["dnsCredentialId"]) if row else dns_credential_id,
-            "acceleration_domain": target_acceleration_domain or str((row["accelerationDomain"] if row else "") or ""),
-            "plugin_cred_row": plugin_cred_row,
-            "plugin_provider": plugin_provider,
-            "plugin": plugin,
-            "remote_site_id": remote_site_id,
-            "row_config": row_config,
-        }
-
-    def _store_site_state(target: Dict[str, Any], state: Dict[str, Any], last_error: str = "") -> Dict[str, Any] | None:
-        dns_credential_id = target.get("dns_credential_id")
-        if not dns_credential_id:
-            return None
-        row = _upsert_accel_row(
-            int(dns_credential_id),
-            str(target.get("zone_name") or ""),
-            int(target["plugin_cred_row"]["id"]),
-            state,
-            str(target.get("plugin_provider") or ""),
-            last_error,
-            existing_row_id=int(target["row"]["id"]) if target.get("row") else None,
-        )
-        return _serialize_row(row)
-
-    def _resolve_dns_api(dns_credential_id: int):
-        dns_row = self._get_credential_row(uid, dns_credential_id)
-        if not dns_row:
-            raise ValueError("DNS 凭证不存在或无权访问")
-        provider = str(dns_row["provider"] or "").strip().lower()
-        secrets = self._credential_secrets(dns_row)
-        if provider == "cloudflare":
-            token = str(secrets.get("apiToken") or "").strip()
-            if not token:
-                raise ValueError("缺少 Cloudflare API Token")
-            return dns_row, provider, CloudflareApi(token)
-        if provider in ("dnspod", "dnspod_token"):
-            return dns_row, provider, DnspodApi(secrets)
-        raise ValueError(f"当前域名的 DNS 服务商暂不支持自动写入加速验证记录: {provider}")
-
-    def _resolve_zone_id(dns_api: Any, dns_provider: str, zone_id: str, zone_name: str) -> str:
-        if zone_id:
-            return zone_id
-        zones = dns_api.list_zones(1, 200).get("zones", [])
-        target = self._find_best_zone(zone_name, zones)
-        if not target:
-            raise ValueError(f"未找到域名 {zone_name} 对应的 DNS 区域")
-        return str(target.get("id") or "")
-
-    def _normalize_verify_value(value: Any) -> str:
-        return str(value or "").strip().strip('"').strip("'")
-
-    def _accel_config_from_source(source: Any) -> Dict[str, Any]:
-        if not isinstance(source, dict):
-            return {}
-        config: Dict[str, Any] = {}
-        for key in (
-            "accelerationDomain",
-            "subDomain",
-            "originType",
-            "originValue",
-            "backupOriginValue",
-            "hostHeader",
-            "originProtocol",
-            "ipv6Status",
-        ):
-            value = source.get(key)
-            if value is None:
-                continue
-            text = str(value).strip()
-            if text:
-                config[key] = text
-        for key in ("httpOriginPort", "httpsOriginPort", "originPort"):
-            value = source.get(key)
-            if value is None or str(value).strip() == "":
-                continue
-            try:
-                config[key] = int(value)
-            except Exception:
-                pass
-        return config
-
-    def _auto_create_verify_record(dns_credential_id: int, zone_name: str, zone_id: str, state: Dict[str, Any]) -> tuple[list, list, list]:
-        record_name = str(state.get("verifyRecordName") or "").strip().rstrip(".")
-        record_value = str(state.get("verifyRecordValue") or "").strip()
-        record_type = str(state.get("verifyRecordType") or "TXT").strip().upper() or "TXT"
-        if not record_name or not record_value:
-            return [], [], [{"error": "未获取到加速验证记录，请稍后刷新状态后再试"}]
-
-        dns_row, dns_provider, dns_api = _resolve_dns_api(dns_credential_id)
-        resolved_zone_id = _resolve_zone_id(dns_api, dns_provider, zone_id, zone_name)
-        existing_records = []
-        try:
-            if dns_provider == "cloudflare":
-                existing_records = dns_api.list_records(
-                    resolved_zone_id,
-                    filters={"type": record_type, "name": record_name},
-                ).get("records", [])
-            else:
-                existing_records = dns_api.list_records(
-                    resolved_zone_id,
-                    filters={"type": record_type, "name": record_name},
-                ).get("records", [])
-        except Exception:
-            existing_records = []
-
-        target_name = norm_domain(record_name)
-        target_value = _normalize_verify_value(record_value)
-        for record in existing_records:
-            existing_name = norm_domain(record.get("name"))
-            existing_value = _normalize_verify_value(record.get("content") or record.get("value"))
-            existing_type = str(record.get("type") or "").strip().upper()
-            if existing_name == target_name and existing_value == target_value and existing_type == record_type:
-                return [], [{
-                    "dnsCredentialId": int(dns_row["id"]),
-                    "zoneName": zone_name,
-                    "type": record_type,
-                    "name": record_name,
-                    "value": record_value,
-                }], []
-
-        try:
-            if dns_provider == "cloudflare":
-                dns_api.create_record(
-                    resolved_zone_id,
-                    {
-                        "type": record_type,
-                        "name": record_name,
-                        "content": self._normalize_txt_for_cf(record_type, record_value),
-                        "ttl": 600,
-                    },
-                )
-            else:
-                dns_api.create_record(
-                    resolved_zone_id,
-                    {
-                        "type": record_type,
-                        "name": record_name,
-                        "value": record_value,
-                        "ttl": 600,
-                    },
-                )
-            return (
-                [
-                    {
-                        "dnsCredentialId": int(dns_row["id"]),
-                        "zoneName": zone_name,
-                        "type": record_type,
-                        "name": record_name,
-                        "value": record_value,
-                    }
-                ],
-                [],
-                [],
-            )
-        except Exception as exc:
-            return [], [], [{"error": str(exc), "name": record_name}]
-
-    try:
-        if self.command == "GET" and sub == "/configs":
-            dns_credential_id = self._parse_credential_id(first_or_none(q, "dnsCredentialId"))
-            zone_name = norm_domain(first_or_none(q, "zoneName"))
-            acceleration_domain = _normalize_acceleration_domain(zone_name, {
-                "accelerationDomain": first_or_none(q, "accelerationDomain"),
-                "subDomain": first_or_none(q, "subDomain"),
-            })
-            refresh = self._parse_bool(first_or_none(q, "refresh"))
-            sql = "SELECT * FROM domain_accelerations WHERE userId = ?"
-            params: List[Any] = [uid]
-            if dns_credential_id:
-                sql += " AND dnsCredentialId = ?"
-                params.append(dns_credential_id)
-            if zone_name:
-                sql += " AND zoneName = ?"
-                params.append(zone_name)
-            if acceleration_domain:
-                sql += " AND accelerationDomain = ?"
-                params.append(acceleration_domain)
-            sql += " ORDER BY updatedAt DESC, id DESC"
-            with conn() as c:
-                rows = c.execute(sql, params).fetchall()
-            if refresh and rows:
-                rows = [_refresh_row(row) for row in rows]
-            self._ok({"items": [_serialize_row(row) for row in rows if row]}, "获取加速配置成功")
-            return
-
-        if self.command == "GET" and sub == "/discover":
-            zone_name = norm_domain(first_or_none(q, "zoneName"))
-            plugin_credential_id = self._parse_credential_id(first_or_none(q, "pluginCredentialId"))
-            if not zone_name:
-                self._err("缺少参数: zoneName", 400)
-                return
-            found_items: List[Dict[str, Any]] = []
-            for cred_row in _list_acceleration_credential_rows(plugin_credential_id):
-                plugin_cred_row, provider, plugin = _build_plugin_by_credential(int(cred_row["id"]))
-                site = plugin.discover_site(zone_name)
-                if not site:
-                    continue
-                found_items.append(_serialize_remote_site_item(plugin_cred_row, site, provider))
-            _write_accel_log("DISCOVER", "SUCCESS", zone_name, new_value={"count": len(found_items), "pluginCredentialId": plugin_credential_id})
-            self._ok({"items": found_items}, "获取远端加速站点成功")
-            return
-
-        if self.command == "GET" and sub == "/remote-sites":
-            plugin_credential_id = self._parse_credential_id(first_or_none(q, "pluginCredentialId"))
-            zone_name = norm_domain(first_or_none(q, "zoneName"))
-            all_items = _list_remote_site_items(plugin_credential_id, zone_name)
-            self._ok({"items": all_items}, "获取远端加速站点列表成功")
-            return
-
-        if self.command == "POST" and sub == "/enable":
-            zone_name = norm_domain(body.get("zoneName"))
-            zone_id = str(body.get("zoneId") or "").strip()
-            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
-            plugin_credential_id = self._parse_credential_id(body.get("pluginCredentialId"))
-            auto_dns = bool(body.get("autoDnsRecord", True))
-            if not zone_name or not dns_credential_id or not plugin_credential_id:
-                self._err("缺少参数: zoneName, dnsCredentialId, pluginCredentialId", 400)
-                return
-
-            accel_config = _accel_config_from_source(body)
-            target_acceleration_domain = _normalize_acceleration_domain(zone_name, body)
-            old_row = _get_accel_row(
-                dns_credential_id,
-                zone_name,
-                acceleration_domain=target_acceleration_domain,
-                plugin_credential_id=plugin_credential_id,
-                allow_fallback_single=not target_acceleration_domain,
-            )
-            plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-            if not accel_config and old_row:
-                accel_config = _accel_config_from_source(_serialize_row(old_row) or {})
-            state = plugin.ensure_site(zone_name, accel_config or None)
-            dns_records_added: list = []
-            dns_records_skipped: list = []
-            dns_errors: list = []
-
-            if auto_dns and state.get("verifyRecordName") and not state.get("verified"):
-                dns_records_added, dns_records_skipped, dns_errors = _auto_create_verify_record(dns_credential_id, zone_name, zone_id, state)
-                if dns_records_added and not dns_errors:
-                    try:
-                        import time as _time
-                        _time.sleep(2)
-                        state = plugin.verify_site(zone_name, state.get("remoteSiteId"), accel_config or None)
-                    except Exception:
-                        pass
-
-            row = _upsert_accel_row(
-                dns_credential_id,
-                zone_name,
-                int(plugin_cred_row["id"]),
-                state,
-                plugin_provider,
-                dns_errors[0]["error"] if dns_errors else "",
-                existing_row_id=int(old_row["id"]) if old_row else None,
-            )
-            payload = {
-                "config": _serialize_row(row),
-                "dnsRecordsAdded": dns_records_added,
-                "dnsRecordsSkipped": dns_records_skipped,
-                "dnsErrors": dns_errors,
-            }
-            _write_accel_log(
-                "CREATE" if not old_row else "UPDATE",
-                "SUCCESS",
-                zone_name,
-                old_value=_serialize_row(old_row) if old_row else None,
-                new_value=payload,
-            )
-            self._ok(payload, "加速接入成功", 201)
-            return
-
-        if self.command == "POST" and sub == "/update-config":
-            zone_name = norm_domain(body.get("zoneName"))
-            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
-            plugin_credential_id = self._parse_credential_id(body.get("pluginCredentialId"))
-            if not zone_name or not dns_credential_id:
-                self._err("缺少参数: zoneName, dnsCredentialId", 400)
-                return
-            target_acceleration_domain = _normalize_acceleration_domain(zone_name, body)
-            existing_row = _get_accel_row(
-                dns_credential_id,
-                zone_name,
-                acceleration_domain=target_acceleration_domain,
-                plugin_credential_id=plugin_credential_id,
-                allow_fallback_single=not target_acceleration_domain,
-            )
-            if existing_row:
-                plugin_credential_id = int(existing_row["pluginCredentialId"])
-            if not plugin_credential_id:
-                self._err("缺少参数: pluginCredentialId", 400)
-                return
-            plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-            accel_config = _accel_config_from_source(body)
-            if not accel_config and existing_row:
-                accel_config = _accel_config_from_source(_serialize_row(existing_row) or {})
-            if not accel_config:
-                self._err("缺少加速配置内容", 400)
-                return
-            state = plugin.ensure_site(zone_name, accel_config)
-            row = _upsert_accel_row(
-                dns_credential_id,
-                zone_name,
-                int(plugin_cred_row["id"]),
-                state,
-                plugin_provider,
-                "",
-                existing_row_id=int(existing_row["id"]) if existing_row else None,
-            )
-            serialized = _serialize_row(row)
-            _write_accel_log(
-                "UPDATE",
-                "SUCCESS",
-                zone_name,
-                old_value=_serialize_row(existing_row) if existing_row else None,
-                new_value=serialized,
-            )
-            self._ok({"config": serialized}, "加速配置已更新")
-            return
-
-        if self.command == "POST" and sub == "/import-remote":
-            zone_name = norm_domain(body.get("zoneName"))
-            zone_id = str(body.get("zoneId") or "").strip()
-            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
-            plugin_credential_id = self._parse_credential_id(body.get("pluginCredentialId"))
-            remote_site_id = str(body.get("remoteSiteId") or "").strip()
-            auto_dns = bool(body.get("autoDnsRecord", True))
-            if not zone_name or not dns_credential_id or not plugin_credential_id:
-                self._err("缺少参数: zoneName, dnsCredentialId, pluginCredentialId", 400)
-                return
-
-            accel_config = _accel_config_from_source(body)
-            target_acceleration_domain = _normalize_acceleration_domain(zone_name, body)
-            old_row = _get_accel_row(
-                dns_credential_id,
-                zone_name,
-                acceleration_domain=target_acceleration_domain,
-                plugin_credential_id=plugin_credential_id,
-                remote_site_id=remote_site_id,
-                allow_fallback_single=not target_acceleration_domain,
-            )
-            plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-            if not accel_config and old_row:
-                accel_config = _accel_config_from_source(_serialize_row(old_row) or {})
-            state = plugin.get_site(zone_name, remote_site_id, accel_config or None) if remote_site_id else plugin.discover_site(zone_name)
-            if not state:
-                self._err("未找到可导入的远端站点", 404)
-                return
-
-            dns_records_added: list = []
-            dns_records_skipped: list = []
-            dns_errors: list = []
-            if auto_dns and state.get("verifyRecordName") and not state.get("verified"):
-                dns_records_added, dns_records_skipped, dns_errors = _auto_create_verify_record(dns_credential_id, zone_name, zone_id, state)
-                if dns_records_added and not dns_errors:
-                    try:
-                        import time as _time
-                        _time.sleep(2)
-                        state = plugin.verify_site(zone_name, state.get("remoteSiteId"), accel_config or None)
-                    except Exception:
-                        pass
-
-            row = _upsert_accel_row(
-                dns_credential_id,
-                zone_name,
-                int(plugin_cred_row["id"]),
-                state,
-                plugin_provider,
-                dns_errors[0]["error"] if dns_errors else "",
-                existing_row_id=int(old_row["id"]) if old_row else None,
-            )
-            payload = {
-                "config": _serialize_row(row),
-                "dnsRecordsAdded": dns_records_added,
-                "dnsRecordsSkipped": dns_records_skipped,
-                "dnsErrors": dns_errors,
-            }
-            _write_accel_log(
-                "IMPORT",
-                "SUCCESS",
-                zone_name,
-                old_value=_serialize_row(old_row) if old_row else None,
-                new_value=payload,
-            )
-            self._ok(payload, "远端站点已导入")
-            return
-
-        if self.command == "POST" and sub == "/create-verify-record":
-            zone_name = norm_domain(body.get("zoneName"))
-            zone_id = str(body.get("zoneId") or "").strip()
-            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
-            plugin_credential_id = self._parse_credential_id(body.get("pluginCredentialId"))
-            remote_site_id = str(body.get("remoteSiteId") or "").strip()
-            verify_after = True if body.get("verifyAfter", True) is True else self._parse_bool(body.get("verifyAfter"))
-            if not zone_name or not dns_credential_id:
-                self._err("缺少参数: zoneName, dnsCredentialId", 400)
-                return
-
-            target_acceleration_domain = _normalize_acceleration_domain(zone_name, body)
-            row = _get_accel_row(
-                dns_credential_id,
-                zone_name,
-                acceleration_domain=target_acceleration_domain,
-                plugin_credential_id=plugin_credential_id,
-                remote_site_id=remote_site_id,
-                allow_fallback_single=not target_acceleration_domain,
-            )
-            if row:
-                plugin_credential_id = int(row["pluginCredentialId"])
-                remote_site_id = remote_site_id or str(row["remoteSiteId"] or "")
-            if not plugin_credential_id:
-                self._err("缺少参数: pluginCredentialId", 400)
-                return
-
-            plugin_cred_row, plugin_provider, plugin = _build_plugin_by_credential(plugin_credential_id)
-            row_config = _accel_config_from_source(_serialize_row(row) or {}) if row else _accel_config_from_source(body)
-            state = plugin.get_site(zone_name, remote_site_id, row_config)
-            dns_records_added, dns_records_skipped, dns_errors = _auto_create_verify_record(dns_credential_id, zone_name, zone_id, state)
-            if verify_after and (dns_records_added or dns_records_skipped) and not dns_errors:
-                try:
-                    import time as _time
-                    _time.sleep(2)
-                    state = plugin.verify_site(zone_name, state.get("remoteSiteId"), row_config)
-                except Exception:
-                    pass
-
-            serialized = None
-            if row:
-                updated = _upsert_accel_row(
-                    dns_credential_id,
-                    zone_name,
-                    int(plugin_cred_row["id"]),
-                    state,
-                    plugin_provider,
-                    dns_errors[0]["error"] if dns_errors else "",
-                    existing_row_id=int(row["id"]) if row else None,
-                )
-                serialized = _serialize_row(updated)
-            payload = {
-                "config": serialized,
-                "site": state if not serialized else None,
-                "dnsRecordsAdded": dns_records_added,
-                "dnsRecordsSkipped": dns_records_skipped,
-                "dnsErrors": dns_errors,
-            }
-            _write_accel_log(
-                "UPDATE",
-                "SUCCESS" if not dns_errors else "FAILED",
-                zone_name,
-                old_value=_serialize_row(row) if row else None,
-                new_value=payload,
-                error_message=dns_errors[0]["error"] if dns_errors else None,
-            )
-            self._ok(payload, "验证记录处理完成")
-            return
-
-        if self.command == "POST" and sub == "/verify":
-            target = _resolve_site_target(body)
-            state = target["plugin"].verify_site(target["zone_name"], target["remote_site_id"], target["row_config"] or None)
-            serialized = _store_site_state(target, state)
-            payload = {"config": serialized, "site": state if not serialized else None}
-            _write_accel_log("VERIFY", "SUCCESS", target["zone_name"], old_value=target["previous"], new_value=payload)
-            self._ok(payload, "已提交加速验证")
-            return
-
-        if self.command == "POST" and sub == "/sync":
-            target = _resolve_site_target(body)
-            state = target["plugin"].get_site(target["zone_name"], target["remote_site_id"], target["row_config"] or None)
-            serialized = _store_site_state(target, state)
-            payload = {"config": serialized, "site": state if not serialized else None}
-            _write_accel_log("UPDATE", "SUCCESS", target["zone_name"], old_value=target["previous"], new_value=payload)
-            self._ok(payload, "加速状态已同步")
-            return
-
-        if self.command == "POST" and sub == "/check-cname":
-            target = _resolve_site_target(body)
-            state = target["plugin"].get_site(target["zone_name"], target["remote_site_id"], target["row_config"] or None)
-            serialized = _store_site_state(target, state)
-            site_data = serialized or state
-            effective = bool(site_data and (site_data.get("verified") or str(site_data.get("domainStatus") or "").strip().lower() in {"online", "active"}))
-            payload = {"config": serialized, "site": state if not serialized else None, "effective": effective}
-            _write_accel_log("VERIFY", "SUCCESS", target["zone_name"], old_value=target["previous"], new_value=payload)
-            self._ok(payload, "CNAME 生效状态已刷新")
-            return
-
-        if self.command == "POST" and sub == "/sync-all":
-            dns_credential_id = self._parse_credential_id(body.get("dnsCredentialId"))
-            plugin_credential_id = self._parse_credential_id(body.get("pluginCredentialId"))
-            rows: list[Dict[str, Any]] = []
-            errors = []
-            for item in _list_remote_site_items(plugin_credential_id):
-                site = item.get("site") if isinstance(item.get("site"), dict) else {}
-                target_body = {
-                    "zoneName": site.get("zoneName"),
-                    "pluginCredentialId": item.get("pluginCredentialId"),
-                    "remoteSiteId": site.get("remoteSiteId"),
-                    "accelerationDomain": site.get("accelerationDomain"),
-                    "subDomain": site.get("subDomain"),
-                }
-                try:
-                    target = _resolve_site_target(target_body)
-                    if dns_credential_id and target.get("dns_credential_id") != dns_credential_id:
-                        continue
-                    state = target["plugin"].get_site(target["zone_name"], target["remote_site_id"], target["row_config"] or None)
-                    serialized = _store_site_state(target, state)
-                    rows.append(serialized or state)
-                except Exception as exc:
-                    errors.append({
-                        "zoneName": str(site.get("zoneName") or ""),
-                        "dnsCredentialId": int(dns_credential_id or 0),
-                        "error": str(exc),
-                    })
-            _write_accel_log(
-                "UPDATE",
-                "SUCCESS" if not errors else "FAILED",
-                "*",
-                new_value={"synced": len(rows), "failed": len(errors), "dnsCredentialId": dns_credential_id, "pluginCredentialId": plugin_credential_id},
-                error_message=errors[0]["error"] if errors else None,
-            )
-            self._ok({"items": rows, "errors": errors, "synced": len(rows), "failed": len(errors)}, "远端加速站点批量同步完成")
-            return
-
-        if self.command == "POST" and sub == "/site-status":
-            target = _resolve_site_target(body)
-            enabled_raw = body.get("enabled")
-            if enabled_raw is None and "paused" in body:
-                enabled_raw = not self._parse_bool(body.get("paused"))
-            enabled = self._parse_bool(enabled_raw) if enabled_raw is not None else False
-            state = target["plugin"].set_site_status(target["zone_name"], target["remote_site_id"], enabled, target["row_config"] or None)
-            serialized = _store_site_state(target, state)
-            payload = {"config": serialized, "site": state if not serialized else None}
-            _write_accel_log("UPDATE", "SUCCESS", target["zone_name"], old_value=target["previous"], new_value=payload)
-            self._ok(payload, "加速站点状态已更新")
-            return
-
-        if self.command == "POST" and sub == "/delete-remote":
-            target = _resolve_site_target(body)
-            delete_local_raw = body.get("deleteLocalConfig", True)
-            delete_local = True if delete_local_raw is True else self._parse_bool(delete_local_raw)
-            target["plugin"].delete_site(target["zone_name"], target["remote_site_id"], target["row_config"] or None)
-            local_deleted = False
-            if target["row"] and delete_local and target.get("dns_credential_id"):
-                local_deleted = _delete_accel_row(
-                    int(target["dns_credential_id"]),
-                    target["zone_name"],
-                    acceleration_domain=str(target.get("acceleration_domain") or ""),
-                    plugin_credential_id=int(target["plugin_cred_row"]["id"]),
-                    remote_site_id=str(target.get("remote_site_id") or ""),
-                )
-            _write_accel_log(
-                "DELETE",
-                "SUCCESS",
-                target["zone_name"],
-                old_value=target["previous"],
-                new_value={"remoteDeleted": True, "localDeleted": local_deleted, "remoteSiteId": target["remote_site_id"]},
-            )
-            self._ok({"deleted": True, "localDeleted": local_deleted}, "远端加速站点已删除")
-            return
-
-        if self.command == "POST" and sub == "/disable":
-            target = _resolve_site_target(body)
-            if target["row"] and target.get("dns_credential_id"):
-                _delete_accel_row(
-                    int(target["dns_credential_id"]),
-                    target["zone_name"],
-                    acceleration_domain=str(target.get("acceleration_domain") or ""),
-                    plugin_credential_id=int(target["plugin_cred_row"]["id"]),
-                    remote_site_id=str(target.get("remote_site_id") or ""),
-                )
-            _write_accel_log("DELETE", "SUCCESS", target["zone_name"], old_value=target["previous"], new_value={"deleted": True, "remoteDeleted": False})
-            self._ok({"deleted": True}, "已移除本地缓存配置")
-            return
-    except (AccelerationPluginError, TencentEdgeOneApiError, ValueError) as exc:
-        zone_name_for_log = norm_domain(body.get("zoneName") or first_or_none(q, "zoneName"))
-        if zone_name_for_log:
-            _write_accel_log("UPDATE", "FAILED", zone_name_for_log, error_message=str(exc))
-        self._err(str(exc), int(getattr(exc, "status", 400)))
-        return
-    except Exception as exc:
-        zone_name_for_log = norm_domain(body.get("zoneName") or first_or_none(q, "zoneName"))
-        if zone_name_for_log:
-            _write_accel_log("UPDATE", "FAILED", zone_name_for_log, error_message=str(exc))
-        self._err(str(exc), 400)
-        return
-
-    self._err("接口不存在", 404)
 
 
 def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:

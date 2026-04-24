@@ -20,8 +20,7 @@ function readCache<T>(key: string): T[] {
 
 function isDnsCategory(provider: ProviderConfig): boolean {
   if (provider.category) return provider.category === 'dns';
-  const normalized = normalizeProviderType(provider.type);
-  return normalized !== 'tencent_ssl' && normalized !== 'tencent_edgeone';
+  return (provider.capabilities?.recordTypes?.length ?? 0) > 0;
 }
 
 export const useProviderStore = defineStore('provider', () => {
