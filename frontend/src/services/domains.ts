@@ -19,13 +19,11 @@ export const getDomains = async (credentialId?: number | 'all' | null): Promise<
   }
 
   const pageSize = 100;
-  let page = 1;
-  let total = 0;
   const zones: any[] = [];
   let firstResponse: any | undefined;
 
-  while (page <= 200) {
-    const response = await api.get('/dns-records/zones', {
+  const fetchPage = (page: number) =>
+    api.get('/dns-records/zones', {
       params: {
         ...params,
         page,
@@ -33,15 +31,33 @@ export const getDomains = async (credentialId?: number | 'all' | null): Promise<
       },
     });
 
-    if (!firstResponse) firstResponse = response;
+  // Fetch the first page to learn the total count.
+  const first = await fetchPage(1);
+  firstResponse = first;
+  const firstBatch = (first as any)?.data?.zones || [];
+  const total = Number((first as any)?.data?.total ?? 0);
+  zones.push(...firstBatch);
 
-    const batch = (response as any)?.data?.zones || [];
-    total = (response as any)?.data?.total ?? total;
-    zones.push(...batch);
-
-    if (batch.length === 0) break;
-    if (total > 0 && zones.length >= total) break;
-    page += 1;
+  if (firstBatch.length === pageSize && total > zones.length) {
+    // Total known: fan out the remaining pages in parallel instead of
+    // walking them one-by-one (each cold page is a live upstream round-trip).
+    const lastPage = Math.min(200, Math.ceil(total / pageSize));
+    const rest = await Promise.all(
+      Array.from({ length: lastPage - 1 }, (_, i) => fetchPage(i + 2)),
+    );
+    for (const response of rest) {
+      zones.push(...((response as any)?.data?.zones || []));
+    }
+  } else if (firstBatch.length === pageSize && total === 0) {
+    // Provider didn't report a total — fall back to sequential walking.
+    let page = 2;
+    while (page <= 200) {
+      const response = await fetchPage(page);
+      const batch = (response as any)?.data?.zones || [];
+      zones.push(...batch);
+      if (batch.length < pageSize) break;
+      page += 1;
+    }
   }
 
   const credId = toCredentialParam(credentialId);

@@ -27,13 +27,19 @@ const PROVIDER_ORDER_KEY = 'dns-panel.sidebar.providerOrder.v1';
 
 const sidebarProviders = computed(() => {
   const map = new Map<ProviderType, (typeof providerStore.providers)[number]>();
+  // A provider is "enabled" once the user has added at least one DNS credential
+  // for it; providers without credentials stay hidden from the sidebar.
+  const enabledTypes = new Set(
+    providerStore.credentials.map((c) => normalizeProviderType(c.provider))
+  );
   providerStore.providers
     .filter((p) => (p.capabilities?.recordTypes?.length ?? 1) > 0)
     .forEach((p) => {
-    const type = normalizeProviderType(p.type);
-    const item = p.type === type ? p : { ...p, type };
-    if (!map.has(type) || (type === 'dnspod' && p.type === 'dnspod')) {
-      map.set(type, item);
+      const type = normalizeProviderType(p.type);
+      if (!enabledTypes.has(type)) return;
+      const item = p.type === type ? p : { ...p, type };
+      if (!map.has(type) || (type === 'dnspod' && p.type === 'dnspod')) {
+        map.set(type, item);
     }
   });
   return Array.from(map.values());
@@ -237,14 +243,17 @@ async function navigate(path: string) {
       <div v-if="providerStore.isLoading" class="space-y-3 px-1">
         <div v-for="i in 4" :key="i" class="sidebar-skeleton" />
       </div>
-      <div
-        v-else
-        class="providers-list"
-        :style="{ touchAction: draggingType ? 'none' : 'pan-y' }"
-      >
-        <ProviderItem
-          v-for="provider in sortedProviders"
-          :key="provider.type"
+     <div
+       v-else
+       class="providers-list"
+       :style="{ touchAction: draggingType ? 'none' : 'pan-y' }"
+     >
+        <p v-if="!sortedProviders.length" class="empty-providers">
+          还没有启用的厂商，请到设置中添加凭证
+        </p>
+       <ProviderItem
+         v-for="provider in sortedProviders"
+         :key="provider.type"
           :provider="provider"
           :is-selected="providerStore.selectedProvider === provider.type"
           :count="providerStore.getCredentialCountByProvider(provider.type)"
@@ -290,6 +299,14 @@ async function navigate(path: string) {
   background-size: 200% 100%;
   animation: shimmer 1.4s ease-in-out infinite;
 }
+
+.empty-providers {
+  padding: 12px 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted, #94a3b8);
+  text-align: center;
+ }
 
 @keyframes shimmer {
   0% {

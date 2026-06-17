@@ -67,6 +67,7 @@ const mutation = useMutation({
     results.value = res.data?.results || [];
     resultPage.value = 1;
     queryClient.invalidateQueries({ queryKey: ['domains'] });
+    queryClient.invalidateQueries({ queryKey: ['domains-cred'] });
   },
   onError: (err: any) => { submitError.value = String(err); },
 });

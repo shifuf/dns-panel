@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, h, onUnmounted } from 'vue';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
+import { keepPreviousData } from '@tanstack/vue-query';
 import {
   NButton, NTag, NDataTable, NModal, NFormItem, NInput, NSelect, NAlert,
   NEmpty, NSpin, NPagination, NDrawer, NDrawerContent, NDescriptions,
@@ -13,6 +14,7 @@ import {
   completeSslCertificate, downloadSslCertificate, uploadSslCertificate,
   deleteSslCertificate, syncSslCertificates, renewExpiredCertificates,
   autoDnsSslCertificate, cleanupDnsSslCertificate,
+  getSslAutoRenew, setSslAutoRenew,
 } from '@/services/ssl';
 import { getDnsCredentials } from '@/services/dnsCredentials';
 import { getDomains } from '@/services/domains';
@@ -181,6 +183,7 @@ const hasActiveApplying = ref(false);
 const {
   data: certsResponse,
   isLoading,
+  isFetching: certsFetching,
   error: certsError,
 } = useQuery({
   queryKey: computed(() => [
@@ -207,6 +210,8 @@ const {
   },
   enabled: computed(() => !!selectedCredentialId.value),
   refetchInterval: computed(() => hasActiveApplying.value ? 15000 : false),
+  placeholderData: keepPreviousData,
+  staleTime: 5_000,
 });
 
 const certificates = computed(() => certsResponse.value?.data || []);
@@ -748,6 +753,30 @@ function openRenew() {
   showRenewModal.value = true;
 }
 
+// ── Auto-renew toggle (panel-side daily scheduler) ─────────────
+const { data: autoRenewData, refetch: refetchAutoRenew } = useQuery({
+  queryKey: ['ssl-auto-renew'],
+  queryFn: async () => {
+    const res = await getSslAutoRenew();
+    return res.data || { enabled: false, days: 7 };
+  },
+  staleTime: 60_000,
+});
+const autoRenewEnabled = computed(() => !!autoRenewData.value?.enabled);
+const autoRenewToggling = ref(false);
+async function toggleAutoRenew(val: boolean) {
+  autoRenewToggling.value = true;
+  try {
+    await setSslAutoRenew(val, autoRenewData.value?.days || 7);
+    await refetchAutoRenew();
+    message.success(val ? '已开启自动续期：每日检查，剩余 ≤7 天自动续期并清理过期证书' : '已关闭自动续期');
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    autoRenewToggling.value = false;
+  }
+}
+
 // ── Detail drawer ──────────────────────────────────────────────
 const showDetail = ref(false);
 const detailData = ref<SslCertificateDetail | null>(null);
@@ -1162,6 +1191,12 @@ const columns = computed(() => {
           <template #icon><RotateCw :size="14" /></template>
           自动续期
         </NButton>
+        <div class="flex items-center gap-1.5 pl-1" title="开启后后台每日自动检查，剩余 ≤7 天即续期并清理过期证书">
+          <NSwitch :value="autoRenewEnabled" :loading="autoRenewToggling" size="small" @update:value="toggleAutoRenew" />
+          <span class="text-xs" :class="autoRenewEnabled ? 'text-emerald-600 font-semibold' : 'text-slate-400'">
+            {{ autoRenewEnabled ? '自动续期已开启' : '自动续期未开启' }}
+          </span>
+        </div>
       </div>
     </section>
 
@@ -1379,12 +1414,13 @@ const columns = computed(() => {
 
       <!-- Pagination -->
       <div v-if="totalCount > pageSize" class="mt-4 flex justify-end">
-        <NPagination
-          v-model:page="page"
-          :page-size="pageSize"
-          :item-count="totalCount"
-          show-quick-jumper
-        />
+       <NPagination
+         v-model:page="page"
+         :page-size="pageSize"
+         :item-count="totalCount"
+          :disabled="certsFetching && !isLoading"
+         show-quick-jumper
+       />
       </div>
     </section>
 

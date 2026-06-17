@@ -224,6 +224,25 @@ const addInitialCredId = computed<number | undefined>(() => {
   return addDialogCredentials.value[0]?.id;
 });
 
+// Fetch one credential's domains under a stable, shared cache key so the
+// "全部账户" aggregate view and the single-provider view reuse the same data.
+// Switching scopes then renders from cache instead of re-hitting upstream APIs.
+function fetchCredentialDomains(cred: DnsCredential): Promise<Domain[]> {
+  return queryClient.ensureQueryData({
+    queryKey: ['domains-cred', cred.id],
+    queryFn: async () => {
+      const res = await getDomains(cred.id);
+      return (res.data?.domains || []).map((d) => ({
+        ...d,
+        credentialId: cred.id,
+        credentialName: cred.name,
+        provider: cred.provider,
+      }));
+    },
+    staleTime: 5 * 60_000,
+  });
+}
+
 // Domain data query
 const { data: domainsData, isLoading, refetch } = useQuery({
   queryKey: computed(() => ['domains', providerStore.selectedProvider, effectiveCredentialId.value, isEsaPanel.value]),
@@ -274,28 +293,19 @@ const { data: domainsData, isLoading, refetch } = useQuery({
     const credId = effectiveCredentialId.value;
     if (credId === 'all') {
       const creds = scopedCredentials.value;
-      const all: Domain[] = [];
-      for (const cred of creds) {
-        const res = await getDomains(cred.id);
-        const domains = (res.data?.domains || []).map(d => ({
-          ...d,
-          credentialId: cred.id,
-          credentialName: cred.name,
-          provider: cred.provider,
-        }));
-        all.push(...domains);
-      }
-      return all;
+      // Fan out across credentials in parallel, but cache each credential's
+      // domains under a stable shared key. The per-provider view below reuses
+      // the same cache, so switching from "全部账户" to a single provider
+      // renders instantly instead of re-fetching what was just loaded.
+      const batches = await Promise.all(
+        creds.map((cred) => fetchCredentialDomains(cred)),
+      );
+      return batches.flat();
     }
     if (typeof credId === 'number') {
       const cred = providerStore.credentials.find(c => c.id === credId);
-      const res = await getDomains(credId);
-      return (res.data?.domains || []).map(d => ({
-        ...d,
-        credentialId: credId,
-        credentialName: cred?.name,
-        provider: cred?.provider,
-      }));
+      if (!cred) return [];
+      return await fetchCredentialDomains(cred);
     }
     return [];
   },
@@ -916,6 +926,7 @@ async function handleBatchRefresh() {
     } else if (typeof effectiveCredentialId.value === 'number') {
       await refreshDomains(effectiveCredentialId.value);
     }
+    await queryClient.invalidateQueries({ queryKey: ['domains-cred'] });
     await refetch();
     finishLocalSyncTask(taskId, { status: 'success', durationMs: Date.now() - begin });
     message.success(`已同步 ${target.length} 个域名所属账户`);
@@ -951,6 +962,7 @@ function confirmBatchDelete() {
         }
       }
       selectedRowKeys.value = [];
+      await queryClient.invalidateQueries({ queryKey: ['domains-cred'] });
       await refetch();
       if (failed === 0) message.success(`已删除 ${success} 个域名`);
       else message.warning(`删除完成，成功 ${success}，失败 ${failed}`);
@@ -1077,6 +1089,8 @@ async function handleRefresh() {
     } else if (!isEsaPanel.value && effectiveCredentialId.value === 'all') {
       await Promise.all(scopedCredentials.value.map(c => refreshDomains(c.id)));
     }
+    // Drop the shared per-credential cache so refetch pulls fresh data.
+    await queryClient.invalidateQueries({ queryKey: ['domains-cred'] });
     await refetch();
     lastRefreshedAt.value = Date.now();
     finishLocalSyncTask(taskId, { status: 'success', durationMs: Date.now() - begin });
@@ -1093,6 +1107,7 @@ const deleteMutation = useMutation({
   mutationFn: (vars: { credentialId: number; zoneId: string }) => deleteZone(vars.credentialId, vars.zoneId),
   onSuccess: () => {
     queryClient.invalidateQueries({ queryKey: ['domains'] });
+    queryClient.invalidateQueries({ queryKey: ['domains-cred'] });
     message.success('域名已删除');
   },
   onError: (err: any) => message.error(String(err)),

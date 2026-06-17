@@ -22,6 +22,23 @@ export async function getSslCredentials(): Promise<ApiResponse<SslCredential[]>>
   return res as unknown as ApiResponse<SslCredential[]>;
 }
 
+export interface SslAutoRenew {
+  enabled: boolean;
+  days: number;
+  lastRunAt?: string;
+  lastResult?: string;
+}
+
+export async function getSslAutoRenew(): Promise<ApiResponse<SslAutoRenew>> {
+  const res = await api.get('/ssl/auto-renew');
+  return res as unknown as ApiResponse<SslAutoRenew>;
+}
+
+export async function setSslAutoRenew(enabled: boolean, days?: number): Promise<ApiResponse<SslAutoRenew>> {
+  const res = await api.post('/ssl/auto-renew', { enabled, days });
+  return res as unknown as ApiResponse<SslAutoRenew>;
+}
+
 export async function createSslCredential(data: {
   name: string;
   secretId: string;

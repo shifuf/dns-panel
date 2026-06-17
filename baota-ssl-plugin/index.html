@@ -1,0 +1,73 @@
+<style>
+    .dps-app { --dps-primary:#4f46e5; --dps-primary-d:#4338ca; --dps-bg:#f8fafc; --dps-card:#fff;
+        --dps-border:#e5e7eb; --dps-text:#1e293b; --dps-muted:#64748b;
+        color: var(--dps-text); font-size: 13px; }
+    .dps-app * { box-sizing: border-box; }
+    .dps-head { display:flex; align-items:center; gap:12px; padding:18px 22px; border-bottom:1px solid var(--dps-border);
+        background:linear-gradient(135deg,#eef2ff,#f5f3ff); }
+    .dps-head .dps-logo { width:38px; height:38px; border-radius:10px; background:var(--dps-primary);
+        color:#fff; display:flex; align-items:center; justify-content:center; font-size:18px; font-weight:700; }
+    .dps-head h2 { margin:0; font-size:16px; font-weight:700; }
+    .dps-head p { margin:2px 0 0; font-size:12px; color:var(--dps-muted); }
+    .dps-tabs { display:flex; gap:4px; padding:10px 18px 0; border-bottom:1px solid var(--dps-border); background:var(--dps-card); }
+    .dps-tab { padding:9px 16px; cursor:pointer; font-weight:600; color:var(--dps-muted);
+        border-bottom:2px solid transparent; transition:all .15s; user-select:none; }
+    .dps-tab:hover { color:var(--dps-primary); }
+    .dps-tab.active { color:var(--dps-primary); border-bottom-color:var(--dps-primary); }
+    .dps-content { padding:22px; min-height:380px; background:var(--dps-bg); }
+    .dps-card { background:var(--dps-card); border:1px solid var(--dps-border); border-radius:12px;
+        padding:18px 20px; margin-bottom:16px; box-shadow:0 1px 2px rgba(0,0,0,.04); }
+    .dps-card h3 { margin:0 0 14px; font-size:14px; font-weight:700; }
+    .dps-grid { display:grid; grid-template-columns:140px 1fr; gap:10px 16px; align-items:center; }
+    .dps-grid .k { color:var(--dps-muted); }
+    .dps-grid .v { font-weight:600; }
+    .dps-badge { display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px;
+        font-size:12px; font-weight:600; }
+    .dps-badge::before { content:""; width:7px; height:7px; border-radius:50%; background:currentColor; }
+    .dps-badge.ok { background:#dcfce7; color:#15803d; }
+    .dps-badge.err { background:#fee2e2; color:#b91c1c; }
+    .dps-badge.warn { background:#fef3c7; color:#b45309; }
+    .dps-field { margin-bottom:16px; }
+    .dps-field label { display:block; margin-bottom:6px; font-weight:600; }
+    .dps-field .hint { font-size:12px; color:var(--dps-muted); font-weight:400; margin-top:4px; }
+    .dps-input { width:100%; padding:9px 12px; border:1px solid var(--dps-border); border-radius:8px;
+        font-size:13px; transition:border .15s, box-shadow .15s; }
+    .dps-input:focus { outline:none; border-color:var(--dps-primary); box-shadow:0 0 0 3px rgba(79,70,229,.12); }
+    .dps-btn { display:inline-flex; align-items:center; gap:6px; padding:8px 16px; border:none; border-radius:8px;
+        font-size:13px; font-weight:600; cursor:pointer; transition:all .15s; }
+    .dps-btn-primary { background:var(--dps-primary); color:#fff; }
+    .dps-btn-primary:hover { background:var(--dps-primary-d); }
+    .dps-btn-ghost { background:#fff; color:var(--dps-text); border:1px solid var(--dps-border); }
+    .dps-btn-ghost:hover { border-color:var(--dps-primary); color:var(--dps-primary); }
+    .dps-btn-sm { padding:5px 12px; font-size:12px; }
+    .dps-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .dps-table { width:100%; border-collapse:collapse; }
+    .dps-table th { text-align:left; padding:10px 12px; font-size:12px; color:var(--dps-muted);
+        border-bottom:2px solid var(--dps-border); font-weight:600; }
+    .dps-table td { padding:10px 12px; border-bottom:1px solid #f1f5f9; }
+    .dps-table tr:hover td { background:#f8fafc; }
+    .dps-alert { padding:11px 14px; border-radius:8px; font-size:13px; margin-bottom:14px; }
+    .dps-alert.info { background:#eff6ff; color:#1d4ed8; }
+    .dps-alert.error { background:#fef2f2; color:#b91c1c; }
+    .dps-alert.warn { background:#fffbeb; color:#b45309; }
+    .dps-switch { display:inline-flex; align-items:center; gap:8px; cursor:pointer; }
+    .dps-loading { text-align:center; padding:48px; color:var(--dps-muted); }
+    .dps-empty { text-align:center; padding:40px; color:var(--dps-muted); }
+</style>
+<div class="dnspanel-ssl-wrap dps-app">
+    <div class="dps-head">
+        <div class="dps-logo">S</div>
+        <div>
+            <h2>DNS 面板 · SSL 同步</h2>
+            <p>从 DNS 面板拉取已签发证书并自动部署到宝塔站点</p>
+        </div>
+    </div>
+    <div class="dps-tabs">
+        <div class="dps-tab active" data-idx="0" onclick="dnspanel_ssl.show_overview()">概览</div>
+        <div class="dps-tab" data-idx="1" onclick="dnspanel_ssl.show_config()">连接配置</div>
+        <div class="dps-tab" data-idx="2" onclick="dnspanel_ssl.show_certs()">证书列表</div>
+        <div class="dps-tab" data-idx="3" onclick="dnspanel_ssl.show_deploy()">手动部署</div>
+    </div>
+    <div class="dps-content"></div>
+</div>
+<script type="text/javascript" src="/dnspanel_ssl/static/js/app.js"></script>

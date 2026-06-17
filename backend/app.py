@@ -9,10 +9,13 @@ import os
 import re
 import sqlite3
 import subprocess
+import threading
 import time
+import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
+import mimetypes
 import bcrypt
 import jwt as pyjwt
 from datetime import datetime, timedelta, timezone
@@ -36,7 +39,7 @@ from modules.dnspod_api import DnspodApi, DnspodApiError
 # ── Application version ─────────────────────────────────────────
 # Fallback version for local/offline environments. GitHub Releases are the
 # primary public version source and are created automatically by Actions.
-APP_VERSION = os.getenv("APP_VERSION", "0.02").strip() or "0.02"
+APP_VERSION = os.getenv("APP_VERSION", "0.21").strip() or "0.21"
 UPSTREAM_GITHUB_REPO = os.getenv("UPSTREAM_GITHUB_REPO", "shifuf/dns-panel").strip() or "shifuf/dns-panel"
 UPSTREAM_GITHUB_REPO_URL = f"https://github.com/{UPSTREAM_GITHUB_REPO}"
 VERSION_CACHE_TTL_SECONDS = 1800
@@ -67,8 +70,44 @@ from modules.route_handlers import attach_route_methods
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = (BASE_DIR / "db" / "database.db").resolve()
 DEFAULT_BACKUP_SNAPSHOT_DIR = (BASE_DIR / "backups").resolve()
+
+
+def _load_dotenv() -> None:
+    """Load cross-environment secrets from a local .env into os.environ.
+
+    Only secret/config keys that must be IDENTICAL across local and Docker are
+    loaded (e.g. ENCRYPTION_KEY, JWT_SECRET) — environment-specific keys like
+    DATABASE_URL, PORT and CORS_ORIGIN are intentionally ignored so a
+    Docker-oriented .env (whose DATABASE_URL points at the container path) does
+    not break local runs. Existing env vars are never overridden, so in Docker
+    the values compose injects always win.
+    """
+    allowed = {"ENCRYPTION_KEY", "JWT_SECRET", "JWT_EXPIRES_IN"}
+    for candidate in (BASE_DIR / ".env", BASE_DIR.parent / ".env"):
+        try:
+            if not candidate.is_file():
+                continue
+            for line in candidate.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                key, _, val = s.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key in allowed and key not in os.environ:
+                    os.environ[key] = val
+        except Exception:
+            pass
+
+
+_load_dotenv()
+
 PORT = int(os.getenv("PORT", "4001"))
 LEGACY = os.getenv("LEGACY_NODE_BASE_URL", "http://127.0.0.1:4101").rstrip("/")
+# Directory of the built frontend (vite `npm run build` output). When present,
+# the backend serves it directly so the panel can run from a single fast
+# process instead of the slow Vite dev server. Override with FRONTEND_DIST.
+FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", str((BASE_DIR.parent / "frontend" / "dist").resolve()))).resolve()
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-jwt-secret-key-min-32-char-123456")
 CJWT_EXPIRES_IN = os.getenv("JWT_EXPIRES_IN", "7d")
 CORS_ORIGIN = os.getenv("CORS_ORIGIN", "http://localhost:5174")
@@ -1129,6 +1168,32 @@ def verify_jwt(token: str) -> Dict[str, Any]:
     return payload
 
 
+def generate_api_token() -> tuple[str, str]:
+    """Generate a long-lived API token. Returns (raw_token, token_hash)."""
+    raw = "dpan_" + secrets.token_urlsafe(40)
+    h = hashlib.sha256(raw.encode()).hexdigest()
+    return raw, h
+
+
+def verify_api_token(token: str) -> Dict[str, Any] | None:
+    """Validate a long-lived API token against the api_tokens table.
+    Returns the user payload on success, None on failure."""
+    raw = (token or "").strip()
+    if not raw.startswith("dpan_"):
+        return None
+    h = hashlib.sha256(raw.encode()).hexdigest()
+    with conn() as c:
+        row = c.execute(
+            "SELECT t.id, t.userId, t.name, u.username, u.email FROM api_tokens t JOIN users u ON u.id = t.userId WHERE t.tokenHash = ?",
+            (h,),
+        ).fetchone()
+        if not row:
+            return None
+        c.execute("UPDATE api_tokens SET lastUsedAt = ? WHERE id = ?", (now_iso(), row["id"]))
+        c.commit()
+    return {"id": row["userId"], "username": row["username"], "email": row["email"], "_api_token": True}
+
+
 def dflt_rules() -> List[Dict[str, Any]]:
     t = now_iso()
     return [
@@ -1246,6 +1311,10 @@ class H(BaseHTTPRequestHandler):
         try:
             p = verify_jwt(tok)
         except Exception as e:
+            # Fall back to long-lived API tokens (e.g. for the BaoTa SSL plugin).
+            api_user = verify_api_token(tok)
+            if api_user:
+                return api_user
             self._err(f"无效或过期的令牌: {e}", 401)
             return None
         if p.get("type") == "2fa_pending":
@@ -1320,6 +1389,13 @@ class H(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/ssl"):
             self._ssl_routes(path, q, b)
+            return
+        if path.startswith("/api/api-tokens"):
+            self._api_tokens_routes(path, q, b)
+            return
+        # Non-API GET/HEAD: serve the built frontend (SPA) when available, so the
+        # panel runs from this single process instead of the Vite dev server.
+        if self.command in {"GET", "HEAD"} and not path.startswith("/api") and self._serve_static(path):
             return
         self._proxy(b)
 
@@ -1637,8 +1713,8 @@ class H(BaseHTTPRequestHandler):
                     "Accept": "application/rdap+json, application/json",
                     "User-Agent": "dns-panel-python/1.0",
                 },
-            )
-            with urllib.request.urlopen(req, timeout=20) as resp:
+           )
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             events = payload.get("events") if isinstance(payload, dict) else []
             expires_iso = None
@@ -2052,6 +2128,53 @@ class H(BaseHTTPRequestHandler):
             items.append({"id": str(r["id"]), "action": r["action"], "resourceType": r["resourceType"], "status": r["status"], "domain": r["domain"] or None, "recordName": r["recordName"] or None, "operator": user.get("username"), "timestamp": dt.isoformat().replace("+00:00", "Z") if dt else str(r["timestamp"])})
         self._ok({"items": items, "page": page, "limit": limit}, "获取审计记录成功")
 
+    def _serve_static(self, path: str) -> bool:
+        """Serve the built frontend from FRONTEND_DIST with SPA fallback.
+
+        Returns True if the request was handled (file or index.html sent),
+        False if no build exists so the caller can fall back to the proxy.
+        """
+        if not FRONTEND_DIST.is_dir():
+            return False
+
+        index_file = FRONTEND_DIST / "index.html"
+        rel = urllib.parse.unquote(path).lstrip("/")
+
+        target = index_file
+        is_asset = False
+        if rel:
+            candidate = (FRONTEND_DIST / rel).resolve()
+            # Guard against path traversal outside the dist directory.
+            if candidate.is_file() and (candidate == FRONTEND_DIST or FRONTEND_DIST in candidate.parents):
+                target = candidate
+                is_asset = True
+
+        if not target.is_file():
+            return False
+
+        try:
+            data = target.read_bytes()
+        except Exception:
+            return False
+
+        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        if ctype.startswith("text/") or ctype in ("application/javascript", "application/json"):
+            ctype += "; charset=utf-8"
+
+        self.send_response(200)
+        self._cors()
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        # Hashed build assets are immutable; index.html must always revalidate.
+        if is_asset and "/assets/" in path:
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        else:
+            self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+        return True
+
     def _proxy(self, body: bytes) -> None:
         url = f"{LEGACY}{self.path}"
         req = urllib.request.Request(url, data=body if self.command in {"POST", "PUT", "PATCH", "DELETE"} else None, method=self.command)
@@ -2084,12 +2207,57 @@ class H(BaseHTTPRequestHandler):
 attach_route_methods(H, globals())
 
 
+def _ssl_autorenew_worker() -> None:
+    """Background daily SSL auto-renewal.
+
+    When enabled (system setting sslAutoRenewEnabled), periodically renews certs
+    expiring within sslAutoRenewDays and prunes superseded certs + their stale
+    _dnsauth validation records. Reuses the tested HTTP endpoints via a locally
+    minted token so there is no duplicated renewal logic.
+    """
+    import urllib.request
+    time.sleep(20)  # let the server bind first
+    while True:
+        slept = 6 * 3600
+        try:
+            if get_system_setting("sslAutoRenewEnabled", "0") == "1":
+                days = int(get_system_setting("sslAutoRenewDays", "7") or 7)
+                with conn() as c:
+                    users = c.execute("SELECT id, username FROM users").fetchall()
+                done = []
+                for u in users:
+                    tok = sign_access_token({"id": u["id"], "sub": u["id"], "username": u["username"]})
+                    hdr = {"Authorization": "Bearer " + tok, "Content-Type": "application/json"}
+
+                    def _post(path, payload):
+                        req = urllib.request.Request(
+                            f"http://127.0.0.1:{PORT}{path}",
+                            data=json.dumps(payload).encode("utf-8"),
+                            headers=hdr, method="POST",
+                        )
+                        with urllib.request.urlopen(req, timeout=600) as r:
+                            return json.loads(r.read().decode("utf-8", errors="replace"))
+
+                    try:
+                        _post("/api/ssl/certificates/renew-expired", {"renewDays": days})
+                        _post("/api/ssl/certificates/prune-superseded", {"keepDays": days})
+                        done.append(str(u["username"]))
+                    except Exception:
+                        pass
+                set_system_setting("sslAutoRenewLastRunAt", now_iso())
+                set_system_setting("sslAutoRenewLastResult", "已执行: " + (", ".join(done) or "无"))
+        except Exception:
+            pass
+        time.sleep(slept)
+
+
 def main() -> None:
     init_db()
     from modules.cache import cache_ping
     redis_ok = cache_ping()
+    threading.Thread(target=_ssl_autorenew_worker, daemon=True).start()
     s = ThreadingHTTPServer(("0.0.0.0", PORT), H)
-    print(json.dumps({"message": "Python Backend V2 started", "port": PORT, "legacyProxy": LEGACY, "databasePath": str(DB), "redis": "connected" if redis_ok else "unavailable (degraded mode)"}, ensure_ascii=False))
+    print(json.dumps({"message": "Python Backend V2 started", "port": PORT, "legacyProxy": LEGACY, "databasePath": str(DB), "redis": "connected" if redis_ok else "unavailable (degraded mode)", "frontend": str(FRONTEND_DIST) if FRONTEND_DIST.is_dir() else "not built (dev server / proxy)"}, ensure_ascii=False))
     try:
         s.serve_forever()
     except KeyboardInterrupt:

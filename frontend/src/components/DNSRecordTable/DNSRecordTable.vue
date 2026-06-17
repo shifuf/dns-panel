@@ -33,10 +33,11 @@ const props = defineProps<{
   totalPages?: number;
   pageSizeOptions?: number[];
   lines?: DnsLine[];
-  minTtl?: number;
-  capabilities?: RecordsResponseCapabilities;
-  updateLoadingIds?: string[];
-  deleteLoadingIds?: string[];
+ minTtl?: number;
+ capabilities?: RecordsResponseCapabilities;
+ updateLoadingIds?: string[];
+  pageLoading?: boolean;
+ deleteLoadingIds?: string[];
   statusLoadingIds?: string[];
   accelerationLoadingIds?: string[];
   batchStatusLoading?: 'enable' | 'disable' | null;
@@ -556,9 +557,10 @@ const columns = computed(() => {
 <template>
   <NEmpty v-if="visibleRecords.length === 0" description="暂无 DNS 记录" class="py-10" />
 
-  <template v-else>
-    <div class="mb-3 flex flex-wrap items-center gap-4">
-      <span class="text-xs font-semibold text-slate-500">已选 {{ checkedRowKeys.length }} 条</span>
+ <template v-else>
+    <div v-if="props.pageLoading" class="records-loading-bar" />
+   <div class="mb-3 flex flex-wrap items-center gap-4">
+     <span class="text-xs font-semibold text-slate-500">已选 {{ checkedRowKeys.length }} 条</span>
       <NButton size="tiny" secondary :loading="batchStatusLoading === 'enable'" :disabled="checkedRowKeys.length === 0 || !!batchStatusLoading || !!batchDeleteLoading" @click="confirmBatchStatus(true)">批量启用</NButton>
       <NButton size="tiny" secondary :loading="batchStatusLoading === 'disable'" :disabled="checkedRowKeys.length === 0 || !!batchStatusLoading || !!batchDeleteLoading" @click="confirmBatchStatus(false)">批量禁用</NButton>
       <NButton size="tiny" type="error" secondary :loading="!!batchDeleteLoading" :disabled="checkedRowKeys.length === 0 || !!batchStatusLoading || !!batchDeleteLoading" @click="confirmBatchDelete">批量删除</NButton>
@@ -683,6 +685,7 @@ const columns = computed(() => {
       :data="visibleRecords"
       :row-key="(row: DNSRecord) => row.id"
       :checked-row-keys="checkedRowKeys"
+      :loading="props.pageLoading"
       :bordered="false"
       size="small"
       class="table-scrollable"
@@ -762,17 +765,34 @@ const columns = computed(() => {
       <div class="text-xs text-slate-500">
         共 {{ totalCount }} 条 · 当前第 {{ currentPage }} 页 · 共 {{ totalPages }} 页 · 每页 {{ currentPageSize }} 条
       </div>
-      <NPagination
-        :page="currentPage"
-        :page-size="currentPageSize"
-        :item-count="totalCount"
-        :page-sizes="resolvedPageSizeOptions"
-        show-quick-jumper
-        show-size-picker
-        size="small"
-        @update:page="handlePageChange"
-        @update:page-size="handlePageSizeChange"
-      />
+     <NPagination
+       :page="currentPage"
+       :page-size="currentPageSize"
+       :item-count="totalCount"
+       :page-sizes="resolvedPageSizeOptions"
+        :disabled="props.pageLoading"
+       show-quick-jumper
+       show-size-picker
+       size="small"
+       @update:page="handlePageChange"
+       @update:page-size="handlePageSizeChange"
+     />
     </div>
   </template>
 </template>
+
+<style scoped>
+.records-loading-bar {
+  height: 2px;
+  margin-bottom: 8px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #6366f1 0%, #a855f7 50%, #6366f1 100%);
+  background-size: 200% 100%;
+  animation: records-loading-slide 1s ease-in-out infinite;
+}
+
+@keyframes records-loading-slide {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+</style>

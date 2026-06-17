@@ -23,8 +23,10 @@ export const getSetupStatus = async (force = false): Promise<ApiResponse<SetupSt
     };
   }
   const res = await api.get('/auth/setup-status');
+  // Response interceptor already unwraps to ApiResponse.
+  const typed = res as unknown as ApiResponse<SetupStatus>;
   cachedSetupStatus = res.data;
-  return res;
+  return typed;
 };
 
 export const initializeSetup = async (params: {
@@ -33,8 +35,9 @@ export const initializeSetup = async (params: {
   password: string;
 }): Promise<LoginResponse> => {
   const res = await api.post('/auth/setup', params);
-  cachedSetupStatus = { ...(res.data || {}), setupComplete: true, hasUsers: true };
-  return res;
+  const typed = res as unknown as LoginResponse;
+  cachedSetupStatus = { ...(typed.data || {}), setupComplete: true, hasUsers: true } as SetupStatus;
+  return typed;
 };
 
 /**

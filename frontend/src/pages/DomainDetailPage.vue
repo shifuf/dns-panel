@@ -2,6 +2,7 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
+import { keepPreviousData } from '@tanstack/vue-query';
 import { NButton, NSpin, NTag, useMessage } from 'naive-ui';
 import { Plus, RefreshCw, Globe } from 'lucide-vue-next';
 import {
@@ -115,7 +116,7 @@ const accelerationDomainsQueryKey = computed(() => [
 ]);
 
 // DNS records
-const { data: recordsData, isLoading: recordsLoading, refetch: refetchRecords } = useQuery({
+const { data: recordsData, isLoading: recordsLoading, isFetching: recordsFetching, refetch: refetchRecords } = useQuery({
   queryKey: recordsQueryKey,
   queryFn: async () => {
     const res = await getDNSRecords(zoneId.value, {
@@ -126,11 +127,38 @@ const { data: recordsData, isLoading: recordsLoading, refetch: refetchRecords } 
     return res.data as DNSRecordsResponseData;
   },
   enabled: computed(() => !!zoneId.value),
+  // Keep the previous page visible (dimmed) while the next page loads, instead
+  // of flashing empty — fixes the "next page looks frozen / not responding" feel.
+  placeholderData: keepPreviousData,
+  staleTime: 5_000,
 });
 
 const records = computed(() => recordsData.value?.records || []);
 const totalRecords = computed(() => Math.max(0, Number(recordsData.value?.total || 0)));
 const totalPages = computed(() => Math.max(1, Math.ceil(totalRecords.value / currentPageSize.value)));
+
+// Prefetch the next page so forward pagination renders instantly from cache.
+function prefetchRecordsPage(page: number) {
+  if (page < 1 || page > totalPages.value || page === currentPage.value) return;
+  const key = ['dns-records', zoneId.value, credentialId.value, page, currentPageSize.value];
+  void queryClient.prefetchQuery({
+    queryKey: key,
+    queryFn: async () => {
+      const res = await getDNSRecords(zoneId.value, {
+        page,
+        pageSize: currentPageSize.value,
+        credentialId: credentialId.value,
+      });
+      return res.data as DNSRecordsResponseData;
+    },
+    staleTime: 5_000,
+  });
+}
+
+watch([recordsData, currentPage, totalPages], () => {
+  if (!recordsData.value) return;
+  prefetchRecordsPage(currentPage.value + 1);
+});
 const zoneName = computed(() =>
   domainData.value?.name || records.value[0]?.zoneName || ''
 );
@@ -963,6 +991,7 @@ onUnmounted(() => {
         :lines="lines"
         :min-ttl="minTTL"
         :capabilities="capabilities"
+        :page-loading="recordsFetching && !recordsLoading"
         :update-loading-ids="updatingRecordIds"
         :delete-loading-ids="deletingRecordIds"
         :status-loading-ids="statusChangingRecordIds"

@@ -195,8 +195,20 @@ MIGRATIONS: list[str] = [
       updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
     """,
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_dns_record_accel_record ON dns_record_acceleration_states(userId, dnsCredentialId, zoneId, recordId)",
-    "CREATE INDEX IF NOT EXISTS idx_dns_record_accel_zone ON dns_record_acceleration_states(userId, dnsCredentialId, zoneId)",
+   "CREATE UNIQUE INDEX IF NOT EXISTS idx_dns_record_accel_record ON dns_record_acceleration_states(userId, dnsCredentialId, zoneId, recordId)",
+   "CREATE INDEX IF NOT EXISTS idx_dns_record_accel_zone ON dns_record_acceleration_states(userId, dnsCredentialId, zoneId)",
+    """
+    CREATE TABLE IF NOT EXISTS api_tokens (
+      id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      tokenHash TEXT NOT NULL UNIQUE,
+      prefix TEXT NOT NULL DEFAULT '',
+      lastUsedAt TEXT,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(userId)",
 ]
 
 TABLE_NAME_RE = re.compile(r"CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)

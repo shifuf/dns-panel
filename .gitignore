@@ -9,6 +9,12 @@ backend/db/*.sqlite
 backend/db/*.sqlite-*
 backend/db/*.backup
 backend/db/*.bak
+backend/db/*.bak*
+
+# Runtime / build artifacts
+*.pid
+baota-ssl-plugin.zip
+btdemo.zip
 
 # Python artifacts
 __pycache__/

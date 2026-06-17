@@ -1,0 +1,9 @@
+{
+  "title": "DNS 面板 SSL 同步",
+  "name": "dnspanel_ssl",
+  "ps": "对接 DNS 面板，自动续期并部署 SSL 证书到宝塔站点：到期前自动续期、按域名取最新证书、清理过期证书与验证记录",
+  "versions": "1.1.0",
+  "checks": "/www/server/panel/plugin/dnspanel_ssl",
+  "author": "dns-panel",
+  "home": "https://github.com/shifuf/dns-panel"
+}

@@ -3,12 +3,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from concurrent.futures import ThreadPoolExecutor
+
 from modules.cache import (
     cache_get, cache_set, cache_delete_pattern,
     zones_key, records_key, lines_key, providers_key,
     esa_sites_key, esa_records_key,
     acceleration_sites_key, acceleration_domains_key,
-    ssl_certs_key, ssl_cert_detail_key,
+    ssl_certs_key, ssl_cert_detail_key, ssl_certs_all_key,
 )
 
 def attach_route_methods(handler_cls: type, env: Dict[str, Any]) -> None:
@@ -24,6 +26,7 @@ def attach_route_methods(handler_cls: type, env: Dict[str, Any]) -> None:
         '_aliyun_esa_routes',
         '_dashboard',
         '_ssl_routes',
+        '_api_tokens_routes',
     ]
     for name in method_names:
         fn = globals().get(name)
@@ -890,7 +893,14 @@ def _domain_expiry_routes(self, path: str, q: Dict[str, List[str]], b: bytes) ->
                 continue
             seen.add(d)
             unique.append(d)
-        results = [self._lookup_domain_expiry_single(d) for d in unique]
+        # RDAP lookups are network-bound (up to 20s each); fan out in parallel
+        # so N domains finish in ~max(latency) instead of sum(latency).
+        if unique:
+            workers = min(len(unique), 12)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(self._lookup_domain_expiry_single, unique))
+        else:
+            results = []
         self._ok({"results": results}, "获取域名到期信息成功")
         return
 
@@ -4422,6 +4432,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     def _invalidate(cred_id: int) -> None:
         cache_delete_pattern(f"ssl:*:cred:{cred_id}:*")
         cache_delete_pattern(f"ssl:*:{cred_id}:*")
+        cache_delete_pattern(f"ssl:certs:all:user:{uid}:*")
 
     def _sync_to_db(cred_id: int, provider: str, certs: list) -> None:
         """Upsert remote certificates into local ssl_certificates table."""
@@ -4486,6 +4497,31 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             c.commit()
 
     try:
+        # GET/POST /api/ssl/auto-renew — auto-renewal toggle + status
+        if sub in ("/auto-renew", "/auto-renew/"):
+            if self.command == "GET":
+                self._ok({
+                    "enabled": get_system_setting("sslAutoRenewEnabled", "0") == "1",
+                    "days": int(get_system_setting("sslAutoRenewDays", "7") or 7),
+                    "lastRunAt": get_system_setting("sslAutoRenewLastRunAt", ""),
+                    "lastResult": get_system_setting("sslAutoRenewLastResult", ""),
+                }, "获取自动续期设置成功")
+                return
+            if self.command == "POST":
+                enabled = bool(body.get("enabled"))
+                days = body.get("days")
+                set_system_setting("sslAutoRenewEnabled", "1" if enabled else "0")
+                if days is not None:
+                    try:
+                        set_system_setting("sslAutoRenewDays", str(max(1, min(60, int(days)))))
+                    except Exception:
+                        pass
+                self._ok({
+                    "enabled": enabled,
+                    "days": int(get_system_setting("sslAutoRenewDays", "7") or 7),
+                }, "自动续期已" + ("开启" if enabled else "关闭"))
+                return
+
         # GET /api/ssl/credentials — list credentials usable for SSL
         if self.command == "GET" and sub in ("/credentials", "/credentials/"):
             with conn() as c:
@@ -4595,39 +4631,64 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             search = first_or_none(q, "search") or ""
             filter_cred = first_or_none(q, "filterCredentialId") or ""
 
-            # ── Aggregated multi-credential view ──
+            # ── Aggregated multi-credential view (parallel fetch + short cache) ──
             if cred_id_raw == "all":
-                with conn() as c:
-                    cred_rows = c.execute(
-                        "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ? AND provider IN ('dnspod', 'tencent_ssl')",
-                        (uid,),
-                    ).fetchall()
-                all_certs: list = []
-                errors: list = []
-                for cr in cred_rows:
-                    cr_secrets = self._credential_secrets(cr)
-                    sid = str(cr_secrets.get("secretId") or "").strip()
-                    skey = str(cr_secrets.get("secretKey") or "").strip()
-                    if not sid or not skey:
-                        continue
-                    if filter_cred and str(cr["id"]) != filter_cred:
-                        continue
-                    try:
-                        cr_api = TencentSslApi(sid, skey)
-                        r = cr_api.list_certificates(offset=0, limit=100, search_key=search or None)
-                        for cert in r.get("certificates", []):
-                            cert["credentialId"] = cr["id"]
-                            cert["credentialName"] = cr["name"]
-                        all_certs.extend(r.get("certificates", []))
-                    except Exception as ex:
-                        errors.append({"credentialId": cr["id"], "name": cr["name"], "error": str(ex)})
+                # Cache the full aggregated set (pre-pagination) so different pages
+                # of the same query reuse a single round of upstream calls.
+                agg_cache_k = ssl_certs_all_key(uid, search=search, filter_cred=filter_cred)
+                agg_cached = cache_get(agg_cache_k)
+                if agg_cached is not None:
+                    all_certs = agg_cached.get("certs", [])
+                    errors = agg_cached.get("errors", [])
+                else:
+                    with conn() as c:
+                        cred_rows = c.execute(
+                            "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ? AND provider IN ('dnspod', 'tencent_ssl')",
+                            (uid,),
+                        ).fetchall()
+
+                    # Resolve target credentials and their decrypted secrets up front.
+                    fetch_rows: list = []
+                    for cr in cred_rows:
+                        cr_secrets = self._credential_secrets(cr)
+                        sid = str(cr_secrets.get("secretId") or "").strip()
+                        skey = str(cr_secrets.get("secretKey") or "").strip()
+                        if not sid or not skey:
+                            continue
+                        if filter_cred and str(cr["id"]) != filter_cred:
+                            continue
+                        fetch_rows.append((cr, sid, skey))
+
+                    def _fetch_one(args):
+                        cr, sid, skey = args
+                        try:
+                            cr_api = TencentSslApi(sid, skey)
+                            r = cr_api.list_certificates(offset=0, limit=100, search_key=search or None)
+                            for cert in r.get("certificates", []):
+                                cert["credentialId"] = cr["id"]
+                                cert["credentialName"] = cr["name"]
+                            return r.get("certificates", []), None
+                        except Exception as ex:
+                            return [], {"credentialId": cr["id"], "name": cr["name"], "error": str(ex)}
+
+                    all_certs = []
+                    errors = []
+                    if fetch_rows:
+                        workers = min(len(fetch_rows), 8)
+                        with ThreadPoolExecutor(max_workers=workers) as pool:
+                            for certs, err in pool.map(_fetch_one, fetch_rows):
+                                if err is not None:
+                                    errors.append(err)
+                                all_certs.extend(certs)
+                    cache_set(agg_cache_k, {"certs": all_certs, "errors": errors}, 60)
+
                 all_certs.sort(key=lambda x: x.get("remoteCreatedAt", ""), reverse=True)
                 total = len(all_certs)
                 offset = (page_num - 1) * limit
                 paged = all_certs[offset:offset + limit]
                 resp_body: Dict[str, Any] = {
                     "success": True,
-                    "message": "获取证书列表成功（聚合）",
+                    "message": "获取证书列表成功（聚合·缓存）" if agg_cached is not None else "获取证书列表成功（聚合）",
                     "data": paged,
                     "pagination": {
                         "total": total,
@@ -5122,6 +5183,69 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             self._binary(raw_bytes, f"{cert_id}.zip", "application/zip")
             return
 
+        # GET /api/ssl/certificates/<id>/pem — return PEM text (for BaoTa plugin)
+        m = re.fullmatch(r"/certificates/([^/]+)/pem", sub)
+        if self.command == "GET" and m:
+            cert_id = urllib.parse.unquote(m.group(1))
+            cred_id_raw = _get_cred_id(first_or_none(q, "credentialId"))
+            if not cred_id_raw:
+                self._err("缺少 credentialId 参数", 400)
+                return
+            cred_row, api = _ssl_api(cred_id_raw)
+            result = api.download_certificate(cert_id)
+            content_b64 = result.get("Content", "")
+            if not content_b64:
+                self._err("证书内容为空", 404)
+                return
+            import base64 as _b64
+            import zipfile as _zf
+            import io as _io
+            raw_bytes = _b64.b64decode(content_b64)
+            public_pem = ""
+            private_pem = ""
+            try:
+                with _zf.ZipFile(_io.BytesIO(raw_bytes)) as z:
+                    files = {}
+                    for name in z.namelist():
+                        if name.endswith("/"):
+                            continue
+                        files[name] = z.read(name).decode("utf-8", errors="replace")
+
+                    def _is_root(n: str) -> bool:
+                        return "/" not in n
+
+                    # Private key: a real *.key file. Exclude keystorePass.txt etc.
+                    # (their names contain "key" but are not PEM keys). Prefer the
+                    # root-level key, then the shortest path.
+                    key_files = [n for n in files if n.lower().endswith(".key")]
+                    key_files.sort(key=lambda n: (not _is_root(n), len(n)))
+                    if key_files:
+                        private_pem = files[key_files[0]]
+
+                    # Public cert: prefer the full chain. Tencent puts the fullchain
+                    # at the root *.pem; otherwise a *bundle* file; otherwise the
+                    # largest .crt/.pem (fullchain is bigger than a bare leaf cert).
+                    root_pem = [n for n in files if _is_root(n) and n.lower().endswith(".pem")]
+                    bundle = [n for n in files if n.lower().endswith((".crt", ".pem")) and "bundle" in n.lower()]
+                    any_cert = [
+                        n for n in files
+                        if n.lower().endswith((".crt", ".pem")) and not n.lower().endswith(".csr")
+                    ]
+                    if root_pem:
+                        public_pem = files[root_pem[0]]
+                    elif bundle:
+                        public_pem = files[max(bundle, key=lambda n: len(files[n]))]
+                    elif any_cert:
+                        public_pem = files[max(any_cert, key=lambda n: len(files[n]))]
+            except Exception:
+                # Not a zip — treat as raw PEM
+                public_pem = raw_bytes.decode("utf-8", errors="replace")
+            if not private_pem or not public_pem:
+                self._err("证书包中缺少有效的公钥或私钥文件", 502)
+                return
+            self._ok({"publicKey": public_pem, "privateKey": private_pem, "certId": cert_id}, "获取证书 PEM 成功")
+            return
+
         # POST /api/ssl/certificates/upload — upload third-party cert
         if self.command == "POST" and sub == "/certificates/upload":
             cred_id_raw = _get_cred_id()
@@ -5412,6 +5536,211 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             self._ok({"renewed": renewed, "failed": failed, "skipped": skipped}, msg)
             return
 
+        # POST /api/ssl/certificates/prune-superseded — delete expiring/expired
+        # certs that already have a NEWER healthy cert for the same domain, and
+        # clean up their leftover DV (_dnsauth) validation DNS records. This is
+        # what removes the duplicate _dnsauth.* records that pile up over time.
+        # Guard: never deletes a domain's only/best cert. Pass dryRun=true to
+        # preview. Used by the BaoTa plugin after a successful deploy.
+        if self.command == "POST" and sub == "/certificates/prune-superseded":
+            from datetime import datetime, timedelta
+            keep_days = int(body.get("keepDays") or 7)
+            dry_run = bool(body.get("dryRun"))
+            only_domain = str(body.get("domain") or "").strip().lower()
+            cleanup_validation = body.get("cleanupValidation", True)
+            now_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
+
+            with conn() as c:
+                cred_rows = c.execute(
+                    "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ? AND provider IN ('dnspod','tencent_ssl')",
+                    (uid,),
+                ).fetchall()
+                dns_rows = c.execute(
+                    "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ?",
+                    (uid,),
+                ).fetchall()
+
+            # DNS APIs for DV record cleanup
+            prune_dns_apis: list = []
+            for dcr in dns_rows:
+                dp = str(dcr["provider"] or "").strip().lower()
+                try:
+                    ds = self._credential_secrets(dcr)
+                    d_api = None
+                    if dp == "cloudflare":
+                        tk = str(ds.get("apiToken") or "").strip()
+                        if tk:
+                            d_api = CloudflareApi(tk)
+                    elif dp in ("dnspod", "dnspod_token"):
+                        d_api = DnspodApi(ds)
+                    if d_api:
+                        prune_dns_apis.append((d_api, dp, d_api.list_zones(1, 200).get("zones", [])))
+                except Exception:
+                    pass
+
+            def _prune_find_zone(check: str):
+                ck = (check or "").lower()
+                for (a, p, zs) in prune_dns_apis:
+                    for z in zs:
+                        zn = str(z.get("name") or "").lower()
+                        if ck == zn or ck.endswith("." + zn):
+                            return a, p, z
+                return None, None, None
+
+            def _remaining_days(not_after: str) -> int:
+                if not not_after:
+                    return -99999
+                na = not_after if " " in not_after else not_after + " 00:00:00"
+                try:
+                    dt = datetime.strptime(na[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    return (dt - now_dt).days
+                except Exception:
+                    return -99999
+
+            def _cleanup_dv(api_obj, cert_id: str, dry: bool = False) -> int:
+                """Old-cert path: remove DV records via the cert's dvAuths (used
+                when a cert is being deleted and may still expose them)."""
+                cleaned = 0
+                try:
+                    detail = api_obj.get_certificate(cert_id)
+                except Exception:
+                    return 0
+                for dv in (detail.get("dvAuths") or []):
+                    dv_key = str(dv.get("key") or "").strip().rstrip(".")
+                    dv_dom = str(dv.get("domain") or "").strip()
+                    rec_type = "CNAME" if "CNAME" in str(dv.get("type") or "").upper() else "TXT"
+                    if not dv_key:
+                        continue
+                    a, p, z = _prune_find_zone(dv_dom or detail.get("domain"))
+                    if not z:
+                        continue
+                    zid = str(z.get("id") or "")
+                    try:
+                        if p == "cloudflare":
+                            recs = a.list_records(zid, filters={"name": dv_key, "type": rec_type})
+                        else:
+                            recs = a.list_records(zid, filters={"subDomain": dv_key, "type": rec_type})
+                        for rec in (recs.get("records") or []):
+                            rid = str(rec.get("id") or "")
+                            if rid:
+                                if not dry:
+                                    a.delete_record(zid, rid)
+                                cleaned += 1
+                    except Exception:
+                        pass
+                return cleaned
+
+            def _cleanup_validation_records(domain: str, dry: bool = False) -> int:
+                """Issued certs no longer expose dvAuths, so scan the zone for the
+                deterministic validation host `_dnsauth.<domain>` and remove the
+                leftover TXT/CNAME records (matching FQDN or relative name)."""
+                base = (domain or "").lower().lstrip("*.").lstrip(".")
+                if not base:
+                    return 0
+                host = "_dnsauth." + base
+                a, p, z = _prune_find_zone(base)
+                if not z:
+                    return 0
+                zid = str(z.get("id") or "")
+                zname = str(z.get("name") or "").lower()
+                relative = host[: -(len(zname) + 1)] if host.endswith("." + zname) else host
+                removed = 0
+                try:
+                    recs = a.list_records(zid, 1, 500, {})
+                    for rec in (recs.get("records") or []):
+                        name = str(rec.get("name") or "").rstrip(".").lower()
+                        rtype = str(rec.get("type") or "").upper()
+                        if rtype in ("TXT", "CNAME") and name in (host, relative):
+                            rid = str(rec.get("id") or "")
+                            if rid:
+                                if not dry:
+                                    a.delete_record(zid, rid)
+                                removed += 1
+                except Exception:
+                    pass
+                return removed
+
+            pruned: list = []
+            kept: list = []
+            validation_cleaned: list = []
+            for cr in cred_rows:
+                s = self._credential_secrets(cr)
+                sid = str(s.get("secretId") or "").strip()
+                skey = str(s.get("secretKey") or "").strip()
+                if not sid or not skey:
+                    continue
+                api = TencentSslApi(sid, skey)
+                certs: list = []
+                off = 0
+                while True:
+                    r = api.list_certificates(offset=off, limit=100)
+                    batch = r.get("certificates") or []
+                    certs.extend(batch)
+                    if len(batch) < 100 or len(certs) >= r.get("totalCount", 0):
+                        break
+                    off += 100
+
+                by_domain: Dict[str, list] = {}
+                for c2 in certs:
+                    d = (c2.get("domain") or "").strip().lower()
+                    if not d or (only_domain and d != only_domain):
+                        continue
+                    by_domain.setdefault(d, []).append(c2)
+
+                for d, lst in by_domain.items():
+                    issued = [x for x in lst if x.get("status") == "issued"]
+                    if not issued:
+                        continue
+                    best = max(issued, key=lambda x: x.get("notAfter") or "")
+                    best_rem = _remaining_days(best.get("notAfter"))
+
+                    # Remove leftover _dnsauth validation records — but only when
+                    # the domain has no in-progress application that still needs them.
+                    in_progress = any(x.get("status") in ("applying", "validating") for x in lst)
+                    if cleanup_validation and not in_progress:
+                        n = _cleanup_validation_records(d, dry=dry_run)
+                        if n:
+                            validation_cleaned.append({"domain": d, "records": n, "dryRun": dry_run})
+
+                    # Safety: only prune sibling certs when this best cert is healthy.
+                    if best_rem <= keep_days:
+                        kept.append({"domain": d, "reason": f"最佳证书仅剩 {best_rem} 天，跳过"})
+                        continue
+                    for x in lst:
+                        if x.get("remoteCertId") == best.get("remoteCertId"):
+                            continue
+                        rem = _remaining_days(x.get("notAfter"))
+                        if rem >= keep_days:
+                            continue  # still healthy — keep it
+                        cid = str(x.get("remoteCertId") or "")
+                        if not cid:
+                            continue
+                        if dry_run:
+                            pruned.append({"domain": d, "certId": cid, "remaining": rem, "dryRun": True})
+                            continue
+                        cleaned = _cleanup_dv(api, cid)
+                        try:
+                            api.delete_certificate(cid)
+                            with conn() as c:
+                                c.execute(
+                                    "DELETE FROM ssl_certificates WHERE userId = ? AND credentialId = ? AND remoteCertId = ?",
+                                    (uid, int(cr["id"]), cid),
+                                )
+                                c.commit()
+                            _invalidate(int(cr["id"]))
+                            pruned.append({"domain": d, "certId": cid, "remaining": rem, "dvRecordsCleaned": cleaned})
+                        except Exception as ex:
+                            pruned.append({"domain": d, "certId": cid, "error": str(ex)})
+
+            ok_count = len([p for p in pruned if not p.get("error")])
+            val_total = sum(int(v.get("records") or 0) for v in validation_cleaned)
+            verb = "预览：将清理 " if dry_run else "已清理 "
+            self._ok(
+                {"pruned": pruned, "kept": kept, "validationCleaned": validation_cleaned, "dryRun": dry_run},
+                verb + f"{ok_count} 个过期证书，{val_total} 条验证记录",
+            )
+            return
+
         self._err("接口不存在", 404)
     except TencentSslApiError as e:
         self._err(str(e), int(e.status or 400))
@@ -5420,3 +5749,76 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     except Exception as e:
         self._err(str(e), 500)
 
+
+
+def _api_tokens_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
+    u = self._auth()
+    if not u:
+        return
+    uid = int(u.get("id") or 0)
+    if uid <= 0:
+        self._err("无效用户", 401)
+        return
+
+    sub = path[len("/api/api-tokens"):].strip()
+    body = self._json_body(b)
+
+    try:
+        # GET /api/api-tokens — list tokens (never expose the hash)
+        if self.command == "GET" and sub in ("", "/"):
+            with conn() as c:
+                rows = c.execute(
+                    "SELECT id, name, prefix, lastUsedAt, createdAt FROM api_tokens WHERE userId = ? ORDER BY id DESC",
+                    (uid,),
+                ).fetchall()
+            self._ok([dict(r) for r in rows], "获取 API Token 列表成功")
+            return
+
+        # POST /api/api-tokens — create a new long-lived token
+        if self.command == "POST" and sub in ("", "/"):
+            name = str(body.get("name") or "").strip()
+            if not name:
+                self._err("请填写 Token 名称", 400)
+                return
+            raw, token_hash = generate_api_token()
+            prefix = raw[:12]
+            with conn() as c:
+                c.execute(
+                    "INSERT INTO api_tokens (userId, name, tokenHash, prefix) VALUES (?, ?, ?, ?)",
+                    (uid, name, token_hash, prefix),
+                )
+                c.commit()
+                tid = c.execute(
+                    "SELECT id FROM api_tokens WHERE userId = ? AND tokenHash = ?",
+                    (uid, token_hash),
+                ).fetchone()
+            self._ok(
+                {"id": tid["id"] if tid else None, "name": name, "token": raw, "prefix": prefix},
+                "Token 已创建，请妥善保存（仅显示一次）",
+                201,
+            )
+            return
+
+        # DELETE /api/api-tokens/{id}
+        if self.command == "DELETE" and sub.startswith("/"):
+            try:
+                tid = int(sub.strip("/"))
+            except (ValueError, TypeError):
+                self._err("无效的 Token ID", 400)
+                return
+            with conn() as c:
+                row = c.execute(
+                    "SELECT id FROM api_tokens WHERE id = ? AND userId = ?",
+                    (tid, uid),
+                ).fetchone()
+                if not row:
+                    self._err("Token 不存在", 404)
+                    return
+                c.execute("DELETE FROM api_tokens WHERE id = ? AND userId = ?", (tid, uid))
+                c.commit()
+            self._ok(None, "Token 已删除")
+            return
+
+        self._err("接口不存在", 404)
+    except Exception as e:
+        self._err(str(e), 500)

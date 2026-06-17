@@ -9,6 +9,7 @@ import { isStrongPassword } from '@/utils/validators';
 import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import TwoFactorSettings from '@/components/Settings/TwoFactorSettings.vue';
 import DnsCredentialManagement from '@/components/Settings/DnsCredentialManagement.vue';
+import ApiTokenManagement from '@/components/Settings/ApiTokenManagement.vue';
 import api from '@/services/api';
 import { useProviderStore } from '@/stores/provider';
 
@@ -414,8 +415,9 @@ async function handleRestoreBackup() {
       <NTab name="general" label="常规" />
       <NTab name="retry" label="重试" />
       <NTab name="storage" label="存储" />
-      <NTab name="backup" label="备份" />
-      <NTab name="about" label="关于" />
+<NTab name="backup" label="备份" />
+<NTab name="api-token" label="API Token" />
+<NTab name="about" label="关于" />
     </NTabs>
 
     <div class="settings-content">
@@ -800,6 +802,13 @@ async function handleRestoreBackup() {
               </article>
             </div>
           </div>
+        </div>
+      </div>
+
+      <!-- API Token 选项卡 -->
+      <div v-if="activeTab === 'api-token'" class="settings-tab-content">
+        <div class="bento-card p-5">
+          <ApiTokenManagement />
         </div>
       </div>
 
