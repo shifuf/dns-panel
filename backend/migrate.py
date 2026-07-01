@@ -154,6 +154,12 @@ MIGRATIONS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_ssl_certs_user ON ssl_certificates(userId)",
     "CREATE INDEX IF NOT EXISTS idx_ssl_certs_cred ON ssl_certificates(credentialId)",
     "CREATE INDEX IF NOT EXISTS idx_ssl_certs_status ON ssl_certificates(status)",
+    # acme.sh auto-renew tracking. SQLite has no ADD COLUMN IF NOT EXISTS, so a
+    # re-run raises "duplicate column name" — an OperationalError the migrate
+    # loop already catches and logs harmlessly. (app.py init_db also guards.)
+    "ALTER TABLE ssl_certificates ADD COLUMN autoRenew INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE ssl_certificates ADD COLUMN lastRenewedAt TEXT",
+    "ALTER TABLE ssl_certificates ADD COLUMN renewError TEXT",
 
     # ── system_settings table (global config, not per-user) ──
     """
@@ -334,7 +340,13 @@ def cleanup_removed_features(conn: sqlite3.Connection) -> None:
             SUPPORTED_SSL_PROVIDER_TYPES,
         )
         conn.execute(
-            "DELETE FROM ssl_certificates WHERE credentialId NOT IN (SELECT id FROM dns_credentials WHERE provider = 'tencent_ssl')"
+            "DELETE FROM ssl_certificates WHERE provider = 'tencent_ssl' AND credentialId NOT IN (SELECT id FROM dns_credentials WHERE provider = 'tencent_ssl')"
+        )
+        # acme certs reference the DNS credential used for the DNS-01 challenge
+        # (cloudflare / dnspod / aliyun ...), not an SSL credential. Drop them
+        # only when that DNS credential no longer exists.
+        conn.execute(
+            "DELETE FROM ssl_certificates WHERE provider = 'acme' AND credentialId NOT IN (SELECT id FROM dns_credentials)"
         )
 
     if "cache" in tables:

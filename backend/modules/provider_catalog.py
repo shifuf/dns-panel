@@ -313,6 +313,31 @@ PROVIDER_CAPABILITIES: List[Dict[str, Any]] = [
         "retryableErrors": [],
         "maxRetries": 2,
     },
+    {
+        # acme.sh signing channel (Let's Encrypt via DNS-01). Unlike tencent_ssl
+        # this provider does NOT own credentials — it reuses an existing DNS
+        # credential (cloudflare / dnspod / aliyun ...) for the DNS-01 challenge.
+        # It is listed here so it counts as an SSL-category provider for the
+        # migrate cleanup guard and so the frontend can render it as a channel.
+        "provider": "acme",
+        "name": "Let's Encrypt (acme.sh)",
+        "category": "ssl",
+        "supportsWeight": False,
+        "supportsLine": False,
+        "supportsStatus": False,
+        "supportsRemark": False,
+        "supportsUrlForward": False,
+        "supportsLogs": False,
+        "remarkMode": "unsupported",
+        "paging": "client",
+        "requiresDomainId": False,
+        "recordTypes": [],
+        "authFields": [],
+        "domainCacheTtl": 0,
+        "recordCacheTtl": 0,
+        "retryableErrors": [],
+        "maxRetries": 2,
+    },
 ]
 
 

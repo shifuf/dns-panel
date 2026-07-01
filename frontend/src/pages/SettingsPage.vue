@@ -21,7 +21,7 @@ const queryClient = useQueryClient();
 const providerStore = useProviderStore();
 const user = getStoredUser();
 const isAdmin = computed(() => !user?.role || user.role === 'admin');
-const fallbackVersion = '0.02';
+const fallbackVersion = '0.22';
 const APP_VERSION = ref('...');
 const latestVersion = ref('');
 const versionCheckedAt = ref('');

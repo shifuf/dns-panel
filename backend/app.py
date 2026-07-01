@@ -39,7 +39,7 @@ from modules.dnspod_api import DnspodApi, DnspodApiError
 # ── Application version ─────────────────────────────────────────
 # Fallback version for local/offline environments. GitHub Releases are the
 # primary public version source and are created automatically by Actions.
-APP_VERSION = os.getenv("APP_VERSION", "0.21").strip() or "0.21"
+APP_VERSION = os.getenv("APP_VERSION", "0.22").strip() or "0.22"
 UPSTREAM_GITHUB_REPO = os.getenv("UPSTREAM_GITHUB_REPO", "shifuf/dns-panel").strip() or "shifuf/dns-panel"
 UPSTREAM_GITHUB_REPO_URL = f"https://github.com/{UPSTREAM_GITHUB_REPO}"
 VERSION_CACHE_TTL_SECONDS = 1800
@@ -693,6 +693,14 @@ def init_db() -> None:
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_certs_user ON ssl_certificates(userId)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_certs_cred ON ssl_certificates(credentialId)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_certs_status ON ssl_certificates(status)")
+        # acme.sh certificates: auto-renew tracking columns (idempotent ADD COLUMN).
+        ssl_cols = {str(row["name"]) for row in c.execute("PRAGMA table_info(ssl_certificates)").fetchall()}
+        if "autoRenew" not in ssl_cols:
+            c.execute("ALTER TABLE ssl_certificates ADD COLUMN autoRenew INTEGER NOT NULL DEFAULT 0")
+        if "lastRenewedAt" not in ssl_cols:
+            c.execute("ALTER TABLE ssl_certificates ADD COLUMN lastRenewedAt TEXT")
+        if "renewError" not in ssl_cols:
+            c.execute("ALTER TABLE ssl_certificates ADD COLUMN renewError TEXT")
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS system_settings (

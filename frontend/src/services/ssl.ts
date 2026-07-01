@@ -1,6 +1,6 @@
 import api from './api';
 import type { ApiResponse } from '@/types';
-import type { SslCertificate, SslCertificateDetail, ApplyCertificateParams, UploadCertificateParams } from '@/types/ssl';
+import type { SslCertificate, SslCertificateDetail, ApplyCertificateParams, IssueAcmeParams, UploadCertificateParams } from '@/types/ssl';
 
 interface PaginatedResponse<T> {
   success: boolean;
@@ -88,6 +88,13 @@ export async function applySslCertificate(
 ): Promise<ApiResponse<{ CertificateId: string; dnsRecordsAdded?: any[]; dnsErrors?: any[] }>> {
   const res = await api.post('/ssl/certificates/apply', params);
   return res as unknown as ApiResponse<{ CertificateId: string; dnsRecordsAdded?: any[]; dnsErrors?: any[] }>;
+}
+
+export async function issueAcmeCertificate(
+  params: IssueAcmeParams,
+): Promise<ApiResponse<{ id: number; domain: string; status: string; provider: string }>> {
+  const res = await api.post('/ssl/certificates/issue-acme', params);
+  return res as unknown as ApiResponse<{ id: number; domain: string; status: string; provider: string }>;
 }
 
 export async function completeSslCertificate(

@@ -153,7 +153,7 @@ cd frontend && npm run build           # 生成 dist/
 ### Docker 一键更新
 ```bash
 docker compose up -d --pull always                       # 跟随最新发布
-DNS_PANEL_VERSION=v0.21 docker compose up -d --pull always   # 固定到指定版本
+DNS_PANEL_VERSION=v0.22 docker compose up -d --pull always   # 固定到指定版本
 ```
 
 ### 脚本更新

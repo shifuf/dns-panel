@@ -12,6 +12,8 @@ from modules.cache import (
     acceleration_sites_key, acceleration_domains_key,
     ssl_certs_key, ssl_cert_detail_key, ssl_certs_all_key,
 )
+from modules import acme_api
+from modules.acme_api import AcmeService, AcmeApiError
 
 def attach_route_methods(handler_cls: type, env: Dict[str, Any]) -> None:
     method_names = [
@@ -4496,6 +4498,81 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     )
             c.commit()
 
+    def _acme_row_to_cert(row: Any) -> Dict[str, Any]:
+        """Shape a DB ssl_certificates(provider='acme') row like a tencent cert
+        so the frontend/plugin list rendering stays uniform."""
+        san_raw = row["san"] if "san" in row.keys() else None
+        try:
+            san_val = json.loads(san_raw) if san_raw else []
+        except Exception:
+            san_val = san_raw or []
+        return {
+            "id": row["id"],
+            "remoteCertId": row["remoteCertId"],
+            "credentialId": row["credentialId"],
+            "credentialName": row["credentialName"] if "credentialName" in row.keys() else "",
+            "provider": "acme",
+            "source": "letsencrypt",
+            "domain": row["domain"],
+            "san": san_val,
+            "certType": "DV",
+            "keyLength": row["certType"] or "2048",
+            "productName": row["productName"] or "Let's Encrypt",
+            "status": row["status"],
+            "statusMsg": row["statusMsg"] or "",
+            "issuer": row["issuer"] or "Let's Encrypt",
+            "notBefore": row["notBefore"] or "",
+            "notAfter": row["notAfter"] or "",
+            "isUploaded": False,
+            "remoteCreatedAt": row["remoteCreatedAt"] or row["createdAt"],
+            "syncedAt": row["syncedAt"] or "",
+            "autoRenew": bool(row["autoRenew"]) if "autoRenew" in row.keys() else True,
+            "lastRenewedAt": row["lastRenewedAt"] if "lastRenewedAt" in row.keys() else "",
+            "renewError": row["renewError"] if "renewError" in row.keys() else "",
+        }
+
+    def _list_acme_certs(search: str = "", filter_cred: str = "") -> list:
+        """Return acme certs from the DB, joined to their DNS credential name."""
+        with conn() as c:
+            rows = c.execute(
+                """SELECT s.*, d.name AS credentialName
+                   FROM ssl_certificates s
+                   LEFT JOIN dns_credentials d ON d.id = s.credentialId
+                   WHERE s.userId = ? AND s.provider = 'acme'
+                   ORDER BY s.createdAt DESC""",
+                (uid,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            if filter_cred and str(r["credentialId"]) != str(filter_cred):
+                continue
+            cert = _acme_row_to_cert(r)
+            if search:
+                hay = (cert["domain"] + " " + " ".join(cert["san"] if isinstance(cert["san"], list) else [])).lower()
+                if search.lower() not in hay:
+                    continue
+            out.append(cert)
+        return out
+
+    def _acme_dns_context(dns_cred_id_raw: str | None):
+        """Resolve a DNS credential usable for acme.sh DNS-01. Returns
+        (row, provider, secrets, accountId). Raises ValueError on problems."""
+        if not dns_cred_id_raw:
+            raise ValueError("缺少 dnsCredentialId 参数（acme 签发需选择 DNS 凭证）")
+        row = self._get_credential_row(uid, dns_cred_id_raw)
+        if not row:
+            raise ValueError("DNS 凭证不存在或无权访问")
+        provider = str(row["provider"] or "").strip().lower()
+        if provider not in acme_api.ACME_SUPPORTED_DNS_PROVIDERS:
+            raise ValueError(f"acme.sh 暂不支持使用 {provider} 凭证进行 DNS 验证")
+        secrets = self._credential_secrets(row)
+        account_id = ""
+        try:
+            account_id = str(row["accountId"] or "")
+        except Exception:
+            account_id = ""
+        return row, provider, secrets, account_id
+
     try:
         # GET/POST /api/ssl/auto-renew — auto-renewal toggle + status
         if sub in ("/auto-renew", "/auto-renew/"):
@@ -4681,6 +4758,12 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                                     errors.append(err)
                                 all_certs.extend(certs)
                     cache_set(agg_cache_k, {"certs": all_certs, "errors": errors}, 60)
+
+                # Merge locally-stored acme certs (not backed by a cloud list API).
+                try:
+                    all_certs = list(all_certs) + _list_acme_certs(search=search, filter_cred=filter_cred)
+                except Exception:
+                    pass
 
                 all_certs.sort(key=lambda x: x.get("remoteCreatedAt", ""), reverse=True)
                 total = len(all_certs)
@@ -4931,6 +5014,95 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             if dns_records_added:
                 msg += f"，已自动添加 {len(dns_records_added)} 条 DNS 验证记录"
             self._ok(resp_data, msg, 201)
+            return
+
+        # POST /api/ssl/certificates/issue-acme — issue a Let's Encrypt cert via
+        # acme.sh (DNS-01). Long-running (waits for DNS propagation), so we insert
+        # an 'applying' row, return immediately, and finish in a background thread.
+        if self.command == "POST" and sub == "/certificates/issue-acme":
+            if not acme_api.acme_available():
+                self._err("acme.sh 未安装，签发功能仅在 Docker 部署环境可用", 503)
+                return
+            domain = acme_api.normalize_domain(str(body.get("domain") or ""))
+            dns_cred_id_raw = _get_cred_id(body.get("dnsCredentialId"))
+            key_length = str(body.get("keyLength") or "2048").strip() or "2048"
+            extra = body.get("altNames") if isinstance(body.get("altNames"), list) else []
+            if not domain:
+                self._err("缺少 domain 参数", 400)
+                return
+            try:
+                dns_row, dns_provider, dns_secrets, account_id = _acme_dns_context(dns_cred_id_raw)
+            except ValueError as ve:
+                self._err(str(ve), 400)
+                return
+            dns_cred_id = int(dns_row["id"])
+            domains = [domain] + [acme_api.normalize_domain(str(d)) for d in extra if acme_api.normalize_domain(str(d))]
+            # De-dup while preserving order (primary first).
+            seen: set = set()
+            domains = [d for d in domains if not (d in seen or seen.add(d))]
+            san_json = json.dumps(domains, ensure_ascii=False)
+            ts = now_iso()
+
+            # Upsert an 'applying' placeholder row (remoteCertId = primary domain).
+            with conn() as c:
+                existing = c.execute(
+                    "SELECT id FROM ssl_certificates WHERE userId = ? AND provider = 'acme' AND remoteCertId = ?",
+                    (uid, domain),
+                ).fetchone()
+                if existing:
+                    c.execute(
+                        """UPDATE ssl_certificates SET credentialId = ?, domain = ?, san = ?,
+                             status = 'applying', statusMsg = '正在通过 acme.sh 签发', renewError = '',
+                             certType = ?, productName = 'Let''s Encrypt', issuer = 'Let''s Encrypt',
+                             autoRenew = 1, updatedAt = ? WHERE id = ?""",
+                        (dns_cred_id, domain, san_json, key_length, ts, existing["id"]),
+                    )
+                    cert_row_id = existing["id"]
+                else:
+                    c.execute(
+                        """INSERT INTO ssl_certificates
+                             (userId, credentialId, provider, remoteCertId, domain, san, certType,
+                              productName, status, statusMsg, issuer, dvAuthMethod, isUploaded,
+                              autoRenew, syncedAt, createdAt, updatedAt)
+                           VALUES (?, ?, 'acme', ?, ?, ?, ?, 'Let''s Encrypt', 'applying',
+                              '正在通过 acme.sh 签发', 'Let''s Encrypt', 'DNS', 0, 1, ?, ?, ?)""",
+                        (uid, dns_cred_id, domain, domain, san_json, key_length, ts, ts, ts),
+                    )
+                    cert_row_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+                c.commit()
+
+            def _issue_worker():
+                svc = acme_api.AcmeService(key_length=key_length)
+                try:
+                    meta = svc.issue(domains, dns_provider, dns_secrets, account_id)
+                    with conn() as c2:
+                        c2.execute(
+                            """UPDATE ssl_certificates SET status = 'issued', statusMsg = '',
+                                 notBefore = ?, notAfter = ?, san = ?, issuer = ?,
+                                 lastRenewedAt = ?, renewError = '', syncedAt = ?, updatedAt = ?
+                               WHERE id = ?""",
+                            (
+                                meta.get("notBefore", ""), meta.get("notAfter", ""),
+                                json.dumps(meta.get("san") or domains, ensure_ascii=False),
+                                meta.get("issuer", "Let's Encrypt"),
+                                now_iso(), now_iso(), now_iso(), cert_row_id,
+                            ),
+                        )
+                        c2.commit()
+                except Exception as ex:
+                    with conn() as c2:
+                        c2.execute(
+                            "UPDATE ssl_certificates SET status = 'failed', statusMsg = ?, renewError = ?, updatedAt = ? WHERE id = ?",
+                            (str(ex)[:500], str(ex)[:500], now_iso(), cert_row_id),
+                        )
+                        c2.commit()
+
+            threading.Thread(target=_issue_worker, daemon=True).start()
+            self._ok(
+                {"id": cert_row_id, "domain": domain, "status": "applying", "provider": "acme"},
+                "已开始通过 Let's Encrypt 签发，DNS 验证通常需要 1-3 分钟，请稍后刷新列表查看结果",
+                201,
+            )
             return
 
         # POST /api/ssl/certificates/<id>/complete — complete DV validation
@@ -5191,6 +5363,22 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             if not cred_id_raw:
                 self._err("缺少 credentialId 参数", 400)
                 return
+            # acme certs: identified by a DB row (remoteCertId = primary domain).
+            # Their PEM lives on disk, not on a cloud API, and their credentialId
+            # is a DNS credential — so short-circuit before the tencent path.
+            with conn() as c:
+                acme_row = c.execute(
+                    "SELECT domain FROM ssl_certificates WHERE userId = ? AND provider = 'acme' AND remoteCertId = ? LIMIT 1",
+                    (uid, cert_id),
+                ).fetchone()
+            if acme_row is not None:
+                try:
+                    pem = acme_api.AcmeService().read_pem(acme_row["domain"] or cert_id)
+                except acme_api.AcmeApiError as ae:
+                    self._err(str(ae), getattr(ae, "status", 502))
+                    return
+                self._ok({"publicKey": pem["publicKey"], "privateKey": pem["privateKey"], "certId": cert_id}, "获取证书 PEM 成功")
+                return
             cred_row, api = _ssl_api(cred_id_raw)
             result = api.download_certificate(cert_id)
             content_b64 = result.get("Content", "")
@@ -5272,6 +5460,30 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             if not cred_id_raw:
                 self._err("缺少 credentialId 参数", 400)
                 return
+
+            # acme certs live only in our DB; their credentialId is a DNS
+            # credential, so _ssl_api can't handle them. Match by remoteCertId
+            # and remove via acme.sh (--remove + delete local files) + DB row.
+            with conn() as c:
+                acme_row = c.execute(
+                    "SELECT id, credentialId FROM ssl_certificates WHERE userId = ? AND provider = 'acme' AND remoteCertId = ? LIMIT 1",
+                    (uid, cert_id),
+                ).fetchone()
+            if acme_row is not None:
+                try:
+                    acme_api.AcmeService().remove(cert_id)
+                except Exception:
+                    pass  # best effort — never block DB cleanup on acme.sh
+                with conn() as c:
+                    c.execute(
+                        "DELETE FROM ssl_certificates WHERE userId = ? AND provider = 'acme' AND remoteCertId = ?",
+                        (uid, cert_id),
+                    )
+                    c.commit()
+                cache_delete_pattern(f"ssl:certs:all:user:{uid}:*")
+                self._ok(None, "证书已删除")
+                return
+
             cred_row, api = _ssl_api(cred_id_raw)
             api.delete_certificate(cert_id)
             cred_id = int(cred_row["id"])
@@ -5526,6 +5738,69 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                             failed.append({"domain": domain, "credential": cr["name"], "error": str(ex)})
                 except Exception as ex:
                     failed.append({"domain": "*", "credential": cr["name"], "error": str(ex)})
+
+            # ── acme.sh certificates: renew those expiring within threshold ──
+            # These live only in the local DB (provider='acme'); acme.sh handles
+            # the DNS-01 challenge via the stored DNS credential. Force-renew,
+            # then re-parse the refreshed PEM and write metadata + lastRenewedAt
+            # back so the panel and BaoTa plugin can show renewal status.
+            if acme_api.acme_available():
+                with conn() as c:
+                    acme_rows = c.execute(
+                        """SELECT s.*, d.provider AS dnsProvider, d.secrets AS dnsSecrets,
+                                  d.accountId AS dnsAccountId, d.name AS dnsName
+                           FROM ssl_certificates s
+                           LEFT JOIN dns_credentials d ON d.id = s.credentialId
+                           WHERE s.userId = ? AND s.provider = 'acme'""",
+                        (uid,),
+                    ).fetchall()
+                for ar in acme_rows:
+                    domain = str(ar["domain"] or "").strip()
+                    if not ar["autoRenew"]:
+                        skipped.append({"domain": domain, "credential": ar["dnsName"] or "acme", "reason": "自动续期已关闭"})
+                        continue
+                    not_after = str(ar["notAfter"] or "")
+                    not_after_cmp = not_after if " " in not_after else (not_after + " 00:00:00" if not_after else "")
+                    # Skip certs that aren't expiring within the threshold yet.
+                    if not_after_cmp and not_after_cmp > threshold:
+                        continue
+                    if not ar["dnsProvider"]:
+                        failed.append({"domain": domain, "credential": "acme", "error": "关联的 DNS 凭证已不存在，无法续期"})
+                        continue
+                    try:
+                        dns_secrets = self._json_loads_safe(decrypt_text(ar["dnsSecrets"]))
+                        svc = acme_api.AcmeService(key_length=str(ar["certType"] or "2048"))
+                        meta = svc.renew(
+                            domain,
+                            provider=str(ar["dnsProvider"] or ""),
+                            secrets=dns_secrets,
+                            account_id=str(ar["dnsAccountId"] or ""),
+                        )
+                        ts = now_iso()
+                        with conn() as c:
+                            c.execute(
+                                """UPDATE ssl_certificates SET status = 'issued', statusMsg = '',
+                                    notBefore = ?, notAfter = ?, san = ?, issuer = ?,
+                                    lastRenewedAt = ?, renewError = '', syncedAt = ?, updatedAt = ?
+                                   WHERE id = ?""",
+                                (
+                                    meta.get("notBefore", ""), meta.get("notAfter", ""),
+                                    json.dumps(meta.get("san") or [], ensure_ascii=False),
+                                    meta.get("issuer", "Let's Encrypt"),
+                                    ts, ts, ts, ar["id"],
+                                ),
+                            )
+                            c.commit()
+                        renewed.append({"domain": domain, "credential": ar["dnsName"] or "acme", "newCertId": domain, "dnsRecordAdded": True, "source": "letsencrypt"})
+                        _invalidate(int(ar["credentialId"]))
+                    except Exception as ex:
+                        with conn() as c:
+                            c.execute(
+                                "UPDATE ssl_certificates SET renewError = ?, updatedAt = ? WHERE id = ?",
+                                (str(ex)[:500], now_iso(), ar["id"]),
+                            )
+                            c.commit()
+                        failed.append({"domain": domain, "credential": ar["dnsName"] or "acme", "error": str(ex), "source": "letsencrypt"})
 
             total_renewed = len(renewed)
             msg = f"续期检查完成：{total_renewed} 个已续期"

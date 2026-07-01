@@ -147,19 +147,46 @@ var dnspanel_ssl = {
 
     render_certs: function (certs) {
         if (!certs.length) { $('#cert_list_body').html('<div class="dps-empty">没有已签发的证书</div>'); return; }
+        var deployedCount = 0, matchedCount = 0;
         var rows = '';
         for (var i = 0; i < certs.length; i++) {
             var c = certs[i];
+            var site = c.matchedSite || '';
+            if (site) matchedCount++;
+            if (c.deployed) deployedCount++;
+            var siteCell = site
+                ? '<span class="font-mono">' + this.esc(site) + '</span>'
+                : '<span class="dps-badge warn">未匹配站点</span>';
+            var statusCell = c.deployed
+                ? '<span class="dps-badge ok">已部署</span>'
+                : (site ? '<span class="dps-badge warn">未部署</span>' : '<span style="color:#94a3b8">—</span>');
+            var actionCell = site
+                ? '<button class="dps-btn dps-btn-ghost dps-btn-sm" onclick="dnspanel_ssl.deploy_to(\''
+                    + this.esc(c.remoteCertId) + '\',' + (c.credentialId || 0) + ',\'' + this.esc(site) + '\')">'
+                    + (c.deployed ? '重新部署' : '部署') + '</button>'
+                : '<span style="color:#94a3b8;font-size:12px">无可部署站点</span>';
+            // Source badge: Let's Encrypt certs (acme.sh) vs Tencent/uploaded.
+            var srcLabel = c.sourceLabel || (c.provider === 'acme' ? "Let's Encrypt" : '腾讯云');
+            var isLE = c.provider === 'acme' || c.source === 'letsencrypt';
+            var sourceCell = '<span class="dps-badge ' + (isLE ? 'ok' : 'info') + '">' + this.esc(srcLabel) + '</span>';
+            // Auto-renew: acme certs carry a status; others renew via panel scheduler.
+            var renewLabel = c.autoRenewLabel || (c.provider === 'acme' ? '自动续期' : '面板托管');
+            var renewCell = '<span style="font-size:12px;color:#64748b">' + this.esc(renewLabel) + '</span>';
             rows += '<tr>'
                 + '<td><strong>' + this.esc(c.domain || '-') + '</strong></td>'
-                + '<td>' + this.esc(c.issuer || '-') + '</td>'
+                + '<td>' + sourceCell + '</td>'
                 + '<td>' + this.esc(c.notAfter || '-') + '</td>'
-                + '<td><button class="dps-btn dps-btn-ghost dps-btn-sm" onclick="dnspanel_ssl.quick_deploy(\''
-                    + this.esc(c.remoteCertId) + '\',' + (c.credentialId || 0) + ',\'' + this.esc(c.domain) + '\')">部署</button></td>'
+                + '<td>' + renewCell + '</td>'
+                + '<td>' + siteCell + '</td>'
+                + '<td>' + statusCell + '</td>'
+                + '<td>' + actionCell + '</td>'
                 + '</tr>';
         }
+        var summary = '<div class="dps-alert info" style="margin-bottom:12px;">共 ' + certs.length
+            + ' 张证书 · 匹配到站点 <b>' + matchedCount + '</b> · 已部署 <b>' + deployedCount + '</b></div>';
         $('#cert_list_body').html(
-            '<table class="dps-table"><thead><tr><th>域名</th><th>颁发者</th><th>过期时间</th><th>操作</th></tr></thead>'
+            summary
+            + '<table class="dps-table"><thead><tr><th>域名</th><th>来源</th><th>过期时间</th><th>自动续期</th><th>匹配站点</th><th>部署状态</th><th>操作</th></tr></thead>'
             + '<tbody>' + rows + '</tbody></table>');
     },
 
@@ -174,6 +201,7 @@ var dnspanel_ssl = {
             + '    <select id="deploy_cert" class="dps-input"><option value="">加载中…</option></select></div>'
             + '  <div class="dps-field"><label>选择站点</label>'
             + '    <select id="deploy_site" class="dps-input"><option value="">加载中…</option></select></div>'
+            + '  <div id="deploy_site_diag"></div>'
             + '  <button class="dps-btn dps-btn-primary" onclick="dnspanel_ssl.do_deploy()">部署证书</button>'
             + '</div>';
         this.setContent(html);
@@ -193,9 +221,19 @@ var dnspanel_ssl = {
         this.request('get_sites', {}, function (rdata) {
             that.handle(rdata, function (d) {
                 that.currentSites = d.data || [];
+                if (!that.currentSites.length) {
+                    var dbg = d.debug ? '<pre style="white-space:pre-wrap;font-size:11px;background:#f8fafc;padding:8px;border-radius:6px;margin-top:8px;">'
+                        + that.esc(JSON.stringify(d.debug, null, 2)) + '</pre>' : '';
+                    $('#deploy_site').html('<option value="">未读取到站点</option>');
+                    $('#deploy_site_diag').html('<div class="dps-alert warn">未读取到宝塔站点。请确认插件 Python 已更新并重启面板（见下方诊断）。' + dbg + '</div>');
+                    return;
+                }
+                $('#deploy_site_diag').html('');
                 var opts = '<option value="">-- 选择站点 --</option>';
                 for (var i = 0; i < that.currentSites.length; i++) {
-                    opts += '<option value="' + that.esc(that.currentSites[i].name) + '">' + that.esc(that.currentSites[i].name) + '</option>';
+                    var s = that.currentSites[i];
+                    var doms = (s.domains && s.domains.length) ? '（' + that.esc(s.domains.slice(0, 2).join(', ')) + '）' : '';
+                    opts += '<option value="' + that.esc(s.name) + '">' + that.esc(s.name) + doms + '</option>';
                 }
                 $('#deploy_site').html(opts);
             }, function (err) { $('#deploy_site').html('<option value="">' + that.esc(err) + '</option>'); });
@@ -215,25 +253,40 @@ var dnspanel_ssl = {
         });
     },
 
+    // Deploy directly to a known site (matched server-side), then refresh list.
+    deploy_to: function (certId, credentialId, siteName) {
+        var that = this;
+        layer.confirm('将证书部署到站点「' + siteName + '」并重载 Web 服务？', { btn: ['确定', '取消'] }, function (index) {
+            layer.close(index);
+            var loadIdx = layer.load(1, { shade: [0.1, '#fff'] });
+            that.request('deploy', { certId: certId, credentialId: credentialId, siteName: siteName }, function (rdata) {
+                layer.close(loadIdx);
+                that.handle(rdata,
+                    function () { that.showMsg('已部署到 ' + siteName, 1); that.show_certs(); },
+                    function (err) { that.showMsg(err, 2); });
+            });
+        });
+    },
+
     quick_deploy: function (certId, credentialId, domain) {
         var that = this;
         this.request('get_sites', {}, function (rdata) {
             that.handle(rdata, function (d) {
                 var sites = d.data || [];
+                var dl = String(domain).toLowerCase().replace(/^\*\./, '');
                 var matched = null;
                 for (var i = 0; i < sites.length; i++) {
-                    var sn = String(sites[i].name).toLowerCase();
-                    if (domain.toLowerCase() === sn || domain.toLowerCase().endsWith('.' + sn)) { matched = sites[i].name; break; }
+                    var cands = [String(sites[i].name || '').toLowerCase()];
+                    var doms = sites[i].domains || [];
+                    for (var k = 0; k < doms.length; k++) cands.push(String(doms[k]).toLowerCase().replace(/^\*\./, ''));
+                    for (var j = 0; j < cands.length; j++) {
+                        var sn = cands[j];
+                        if (sn && (dl === sn || dl.endsWith('.' + sn) || sn.endsWith('.' + dl))) { matched = sites[i].name; break; }
+                    }
+                    if (matched) break;
                 }
                 if (!matched) { that.showMsg('未找到匹配 ' + domain + ' 的站点，请用「手动部署」选择站点', 2); return; }
-                layer.confirm('将证书部署到站点「' + matched + '」？', { btn: ['确定', '取消'] }, function (index) {
-                    layer.close(index);
-                    var loadIdx = layer.load(1, { shade: [0.1, '#fff'] });
-                    that.request('deploy', { certId: certId, credentialId: credentialId, siteName: matched }, function (rdata) {
-                        layer.close(loadIdx);
-                        that.handle(rdata, function () { that.showMsg('已部署到 ' + matched, 1); }, function (err) { that.showMsg(err, 2); });
-                    });
-                });
+                that.deploy_to(certId, credentialId, matched);
             }, function (err) { that.showMsg(err, 2); });
         });
     },

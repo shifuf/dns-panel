@@ -14,6 +14,8 @@ export interface SslCertificate {
   credentialId?: number;
   credentialName?: string;
   provider?: string;
+  /** Issuance source: 'tencent' (default) or 'letsencrypt' (acme.sh). */
+  source?: string;
   domain: string;
   san?: string | string[];
   certType: string;
@@ -26,6 +28,11 @@ export interface SslCertificate {
   isUploaded?: boolean;
   remoteCreatedAt?: string;
   syncedAt?: string;
+  /** acme.sh certs only — auto-renew tracking. */
+  autoRenew?: boolean;
+  lastRenewedAt?: string;
+  renewError?: string;
+  keyLength?: string;
 }
 
 export interface SslCertificateDetail extends SslCertificate {
@@ -54,6 +61,16 @@ export interface ApplyCertificateParams {
   autoDnsRecord?: boolean;
   autoMatchDns?: boolean;
   oldCertificateId?: string;
+}
+
+export interface IssueAcmeParams {
+  /** DNS credential (cloudflare / dnspod / aliyun) used for the DNS-01 challenge. */
+  dnsCredentialId: number;
+  domain: string;
+  /** Additional SANs beyond the primary domain. */
+  altNames?: string[];
+  /** Key type/length: '2048' | '4096' | 'ec-256' | 'ec-384'. */
+  keyLength?: string;
 }
 
 export interface UploadCertificateParams {

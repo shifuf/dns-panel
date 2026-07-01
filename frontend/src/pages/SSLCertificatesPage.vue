@@ -14,7 +14,7 @@ import {
   completeSslCertificate, downloadSslCertificate, uploadSslCertificate,
   deleteSslCertificate, syncSslCertificates, renewExpiredCertificates,
   autoDnsSslCertificate, cleanupDnsSslCertificate,
-  getSslAutoRenew, setSslAutoRenew,
+  getSslAutoRenew, setSslAutoRenew, issueAcmeCertificate,
 } from '@/services/ssl';
 import { getDnsCredentials } from '@/services/dnsCredentials';
 import { getDomains } from '@/services/domains';
@@ -527,6 +527,8 @@ function openAddZoneForDomain(domain: string) {
 
 // ── Apply modal ────────────────────────────────────────────────
 const showApply = ref(false);
+// Issuance channel: 'tencent' = 腾讯云 DV, 'acme' = Let's Encrypt (acme.sh).
+const applyChannel = ref<'tencent' | 'acme'>('tencent');
 const applyDomain = ref('');
 const applyDomainMode = ref<'managed' | 'manual'>('managed');
 const applyManagedRoot = ref<string | null>(null);
@@ -538,6 +540,34 @@ const applyAutoDns = ref(true);
 const applyDnsCredTouched = ref(false);
 const applyOldCertId = ref<string | null>(null);
 const _settingApplyDnsCredId = ref(false);
+// acme-specific: key type and the DNS credential used for the DNS-01 challenge.
+const applyAcmeKeyLength = ref<string>('2048');
+const applyAcmeDnsCredId = ref<number | null>(null);
+
+const channelOptions = [
+  { label: '腾讯云 DV（TrustAsia 免费证书）', value: 'tencent' },
+  { label: "Let's Encrypt（acme.sh，DNS-01 自动验证）", value: 'acme' },
+];
+
+const acmeKeyLengthOptions = [
+  { label: 'RSA 2048', value: '2048' },
+  { label: 'RSA 4096', value: '4096' },
+  { label: 'ECC 256（ec-256）', value: 'ec-256' },
+  { label: 'ECC 384（ec-384）', value: 'ec-384' },
+];
+
+// acme.sh can drive Cloudflare / DNSPod / 阿里云 for the DNS-01 challenge.
+const acmeDnsCredentials = computed(() =>
+  (dnsCredentials.value || []).filter(c =>
+    ['cloudflare', 'dnspod', 'dnspod_token', 'aliyun'].includes(String(c.provider))),
+);
+
+const acmeDnsCredentialOptions = computed(() =>
+  (acmeDnsCredentials.value || []).map(c => ({
+    label: `${c.name} (${c.provider})`,
+    value: c.id,
+  })),
+);
 
 function setApplyDnsCredId(val: number | null) {
   _settingApplyDnsCredId.value = true;
@@ -643,6 +673,37 @@ const applyMutation = useMutation({
   onError: (err: any) => message.error(String(err)),
 });
 
+// acme.sh (Let's Encrypt) issuance — async on the backend: it returns an
+// 'applying' cert immediately, then finishes in a worker after DNS-01 validates.
+const acmeMutation = useMutation({
+  mutationFn: () => {
+    const finalDomain = applyFinalDomain.value;
+    if (!finalDomain) throw new Error('请选择或输入域名');
+    if (!applyAcmeDnsCredId.value) throw new Error('请选择用于 DNS 验证的 DNS 凭证（Cloudflare / DNSPod / 阿里云）');
+    return issueAcmeCertificate({
+      dnsCredentialId: applyAcmeDnsCredId.value,
+      domain: finalDomain,
+      keyLength: applyAcmeKeyLength.value,
+    });
+  },
+  onSuccess: (res) => {
+    message.success(res.message || "已开始通过 Let's Encrypt 签发，请稍后刷新列表查看结果");
+    showApply.value = false;
+    applyDomain.value = '';
+    queryClient.invalidateQueries({ queryKey: ['ssl-certificates'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+// Dispatch apply to the right channel.
+function submitApply() {
+  if (applyChannel.value === 'acme') {
+    acmeMutation.mutate();
+  } else {
+    applyMutation.mutate();
+  }
+}
+
 // ── Quick re-apply for expired/expiring certs ──────────────────
 function quickReapply(cert: SslCertificate) {
   const credId = getCredIdForCert(cert);
@@ -651,6 +712,8 @@ function quickReapply(cert: SslCertificate) {
     return;
   }
   selectedCredentialId.value = credId;
+  // Re-apply keeps the cert's original channel so renewal flows stay consistent.
+  applyChannel.value = cert.provider === 'acme' ? 'acme' : 'tencent';
   applyDomain.value = cert.domain || '';
   applyDomainMode.value = 'manual';
   applyManagedRoot.value = null;
@@ -660,12 +723,18 @@ function quickReapply(cert: SslCertificate) {
   applyAutoDns.value = true;
   applyDnsCredTouched.value = false;
   setApplyDnsCredId(null);
-  // Pass old cert ID for Tencent renewal flow (only for issued certs, not expired)
-  applyOldCertId.value = cert.status === 'issued' ? cert.remoteCertId : null;
+  // For acme re-issue, preselect the DNS credential the cert was issued with.
+  applyAcmeDnsCredId.value = cert.provider === 'acme' && typeof cert.credentialId === 'number'
+    ? cert.credentialId : (acmeDnsCredentialOptions.value[0]?.value ?? null);
+  applyAcmeKeyLength.value = cert.provider === 'acme' && cert.keyLength ? cert.keyLength : '2048';
+  // Pass old cert ID for Tencent renewal flow (only for issued tencent certs).
+  // acme re-issue ignores it, so never set it for acme certs.
+  applyOldCertId.value = cert.provider !== 'acme' && cert.status === 'issued' ? cert.remoteCertId : null;
   showApply.value = true;
 }
 
 function openApply() {
+  applyChannel.value = 'tencent';
   applyDomain.value = '';
   applyDomainMode.value = managedDomainOptions.value.length > 0 ? 'managed' : 'manual';
   applyManagedRoot.value = managedDomainOptions.value.length > 0 ? managedDomainOptions.value[0].value : null;
@@ -676,6 +745,8 @@ function openApply() {
   applyDnsCredTouched.value = false;
   setApplyDnsCredId(null);
   applyOldCertId.value = null;
+  applyAcmeKeyLength.value = '2048';
+  applyAcmeDnsCredId.value = acmeDnsCredentialOptions.value[0]?.value ?? null;
   showApply.value = true;
 }
 
@@ -1072,6 +1143,35 @@ const columns = computed(() => {
       },
     },
     {
+      title: '来源',
+      key: 'source',
+      width: 130,
+      render: (row: SslCertificate) => {
+        const isAcme = row.provider === 'acme' || row.source === 'letsencrypt';
+        const srcTag = h(NTag, { size: 'tiny', bordered: false, type: isAcme ? 'success' : 'default' },
+          () => isAcme ? "Let's Encrypt" : '腾讯云');
+        const children: any[] = [srcTag];
+        // acme certs carry auto-renew state; show a badge + last renewal / error.
+        if (isAcme) {
+          const renew = row.autoRenew !== false
+            ? h(NTag, { size: 'tiny', bordered: false, type: 'info' }, () => '自动续期')
+            : h(NTag, { size: 'tiny', bordered: false, type: 'default' }, () => '手动');
+          let sub: any = null;
+          if (row.renewError) {
+            sub = h(NTooltip, { trigger: 'hover' }, {
+              trigger: () => h('span', { class: 'text-xs text-red-500 cursor-help' }, '续期失败'),
+              default: () => row.renewError,
+            });
+          } else if (row.lastRenewedAt) {
+            sub = h('span', { class: 'text-xs text-slate-400' }, `续期于 ${formatDate(row.lastRenewedAt)}`);
+          }
+          children.push(h('div', { class: 'flex items-center gap-1 mt-0.5' }, [renew]));
+          if (sub) children.push(h('div', { class: 'mt-0.5' }, [sub]));
+        }
+        return h('div', { class: 'space-y-0.5' }, children);
+      },
+    },
+    {
       title: '有效期',
       key: 'validity',
       width: 220,
@@ -1131,7 +1231,7 @@ const columns = computed(() => {
         <div>
           <h1 class="page-title">SSL 证书管理</h1>
           <p class="page-subtitle">
-            腾讯云免费 DV 证书申请、查看、下载与上传
+            腾讯云 DV / Let's Encrypt 证书申请、自动续期、查看、下载与上传
             <span v-if="hasActiveApplying" class="inline-flex items-center gap-1 ml-2 text-blue-500">
               <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
               <span class="text-xs">自动刷新中</span>
@@ -1486,11 +1586,14 @@ const columns = computed(() => {
     </NModal>
 
     <!-- Apply Modal -->
-    <NModal v-model:show="showApply" preset="dialog" :title="applyOldCertId ? '续期证书' : '申请免费 DV 证书'" :mask-closable="false" style="max-width: 520px;">
+    <NModal v-model:show="showApply" preset="dialog" :title="applyOldCertId ? '续期证书' : '申请免费证书'" :mask-closable="false" style="max-width: 520px;">
       <div class="space-y-4 pt-2">
         <NAlert v-if="applyOldCertId" type="info" :bordered="false">
           正在续期证书 {{ applyOldCertId }}，将使用腾讯云官方续期流程。
         </NAlert>
+        <NFormItem v-if="!applyOldCertId" label="签发渠道">
+          <NSelect v-model:value="applyChannel" :options="channelOptions" />
+        </NFormItem>
         <NFormItem label="域名" required>
           <div class="space-y-2 w-full">
             <div class="flex items-center gap-2">
@@ -1552,11 +1655,11 @@ const columns = computed(() => {
             </template>
           </div>
         </NFormItem>
-        <NFormItem label="验证方式">
+        <NFormItem v-if="applyChannel === 'tencent'" label="验证方式">
           <NSelect v-model:value="applyDvMethod" :options="dvMethodOptions" />
         </NFormItem>
 
-        <template v-if="applyDvMethod === 'DNS'">
+        <template v-if="applyChannel === 'tencent' && applyDvMethod === 'DNS'">
           <NFormItem label="自动添加 DNS 验证记录">
             <div class="flex items-center gap-2">
               <NSwitch v-model:value="applyAutoDns" />
@@ -1583,17 +1686,38 @@ const columns = computed(() => {
           </NAlert>
         </template>
 
-        <NAlert v-if="applyDvMethod === 'DNS_AUTO'" type="info" :bordered="false">
+        <NAlert v-if="applyChannel === 'tencent' && applyDvMethod === 'DNS_AUTO'" type="info" :bordered="false">
           DNS 自动验证要求域名的 NS 记录已指向 DNSPod（腾讯云）。如果域名使用 Cloudflare、阿里云或其他 DNS 服务商解析，请选择「DNS 验证」并开启自动添加记录——只需在下方选择对应的 DNS 凭证即可自动完成验证。
         </NAlert>
+
+        <!-- acme.sh (Let's Encrypt) channel fields -->
+        <template v-if="applyChannel === 'acme'">
+          <NFormItem label="DNS 凭证" required>
+            <NSelect
+              v-model:value="applyAcmeDnsCredId"
+              :options="acmeDnsCredentialOptions"
+              placeholder="选择用于 DNS-01 验证的凭证（Cloudflare / DNSPod / 阿里云）"
+              filterable
+            />
+          </NFormItem>
+          <NFormItem label="密钥类型">
+            <NSelect v-model:value="applyAcmeKeyLength" :options="acmeKeyLengthOptions" />
+          </NFormItem>
+          <NAlert v-if="acmeDnsCredentialOptions.length === 0" type="warning" :bordered="false">
+            暂无可用于 DNS 验证的凭证。请先在设置中添加 Cloudflare、DNSPod 或阿里云凭证。
+          </NAlert>
+          <NAlert type="info" :bordered="false">
+            由 acme.sh 通过 Let's Encrypt 签发，全程自动完成 DNS 验证（加记录 → 验证 → 清理），签发后默认开启自动续期。DNS 传播通常需要 1-3 分钟，提交后请稍后刷新列表查看结果。支持通配符域名（如 *.example.com）。
+          </NAlert>
+        </template>
       </div>
       <template #action>
         <NButton @click="showApply = false">取消</NButton>
         <NButton
           type="primary"
-          :loading="applyMutation.isPending.value"
-          :disabled="!applyFinalDomain"
-          @click="applyMutation.mutate()"
+          :loading="applyMutation.isPending.value || acmeMutation.isPending.value"
+          :disabled="!applyFinalDomain || (applyChannel === 'acme' && !applyAcmeDnsCredId)"
+          @click="submitApply()"
         >
           提交申请
         </NButton>
