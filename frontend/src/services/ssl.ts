@@ -134,6 +134,36 @@ export interface SslDeploymentEvent {
   updatedAt: string;
 }
 
+export interface SslNotificationSettings {
+  enabled: boolean;
+  emailEnabled: boolean;
+  emailTo: string;
+  webhookEnabled: boolean;
+  webhookUrl: string;
+  wecomEnabled: boolean;
+  wecomWebhookUrl: string;
+  retentionDays: number;
+}
+
+export interface SslTaskLog {
+  id: number;
+  taskType: 'acme' | 'deployment' | 'renewal';
+  taskId?: number;
+  domain?: string;
+  source?: string;
+  status: string;
+  attempt: number;
+  targetName?: string;
+  message?: string;
+  createdAt: string;
+}
+
+export interface SslTaskStats {
+  byStatus: Record<string, number>;
+  bySource: Record<string, number>;
+  failureReasons: Array<{ reason: string; count: number }>;
+}
+
 export async function getSslAcmeJobs(): Promise<ApiResponse<SslAcmeJob[]>> {
   const res = await api.get('/ssl/acme-jobs');
   return res as unknown as ApiResponse<SslAcmeJob[]>;
@@ -149,9 +179,54 @@ export async function cancelSslAcmeJob(id: number): Promise<ApiResponse> {
   return res as unknown as ApiResponse;
 }
 
-export async function getSslDeploymentEvents(): Promise<ApiResponse<SslDeploymentEvent[]>> {
-  const res = await api.get('/ssl/deployment-events');
+export async function getSslDeploymentEvents(params?: {
+  status?: string; source?: string; domain?: string; page?: number; limit?: number;
+}): Promise<ApiResponse<SslDeploymentEvent[]> & { pagination?: { total: number; page: number; limit: number; pages: number } }> {
+  const res = await api.get('/ssl/deployment-events', { params });
   return res as unknown as ApiResponse<SslDeploymentEvent[]>;
+}
+
+export async function getSslNotificationSettings(): Promise<ApiResponse<SslNotificationSettings>> {
+  const res = await api.get('/ssl/notification-settings');
+  return res as unknown as ApiResponse<SslNotificationSettings>;
+}
+
+export async function saveSslNotificationSettings(settings: SslNotificationSettings): Promise<ApiResponse<SslNotificationSettings>> {
+  const res = await api.post('/ssl/notification-settings', settings);
+  return res as unknown as ApiResponse<SslNotificationSettings>;
+}
+
+export async function testSslNotification(): Promise<ApiResponse<{ deliveries: Array<{ channel: string; success: boolean; error?: string }> }>> {
+  const res = await api.post('/ssl/notification-settings/test', {});
+  return res as unknown as ApiResponse<{ deliveries: Array<{ channel: string; success: boolean; error?: string }> }>;
+}
+
+export async function getSslTaskLogs(params?: { page?: number; limit?: number }): Promise<ApiResponse<SslTaskLog[]>> {
+  const res = await api.get('/ssl/task-logs', { params });
+  return res as unknown as ApiResponse<SslTaskLog[]>;
+}
+
+export async function getSslTaskStats(): Promise<ApiResponse<SslTaskStats>> {
+  const res = await api.get('/ssl/task-stats');
+  return res as unknown as ApiResponse<SslTaskStats>;
+}
+
+export async function downloadSslTaskLogs(params?: { status?: string; source?: string; domain?: string }): Promise<void> {
+  const res = await api.get('/ssl/task-logs/download', { params, responseType: 'blob' });
+  const blob = new Blob([res as unknown as BlobPart], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'ssl-task-logs.csv';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+export async function retrySslDeploymentEvent(id: number): Promise<ApiResponse> {
+  const res = await api.post(`/ssl/deployment-events/${id}/retry`, {});
+  return res as unknown as ApiResponse;
 }
 
 export async function setCertificateAutoRenew(

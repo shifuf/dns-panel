@@ -40,7 +40,7 @@ from modules.dnspod_api import DnspodApi, DnspodApiError
 # ── Application version ─────────────────────────────────────────
 # Fallback version for local/offline environments. GitHub Releases are the
 # primary public version source and are created automatically by Actions.
-APP_VERSION = os.getenv("APP_VERSION", "0.22").strip() or "0.22"
+APP_VERSION = os.getenv("APP_VERSION", "0.24").strip() or "0.24"
 UPSTREAM_GITHUB_REPO = os.getenv("UPSTREAM_GITHUB_REPO", "shifuf/dns-panel").strip() or "shifuf/dns-panel"
 UPSTREAM_GITHUB_REPO_URL = f"https://github.com/{UPSTREAM_GITHUB_REPO}"
 VERSION_CACHE_TTL_SECONDS = 1800
@@ -758,6 +758,25 @@ def init_db() -> None:
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_acme_jobs_status ON ssl_acme_jobs(status, updatedAt)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_acme_jobs_user ON ssl_acme_jobs(userId, status)")
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ssl_task_logs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              userId INTEGER NOT NULL,
+              taskType TEXT NOT NULL,
+              taskId INTEGER,
+              domain TEXT,
+              source TEXT,
+              status TEXT NOT NULL,
+              attempt INTEGER NOT NULL DEFAULT 0,
+              targetName TEXT,
+              message TEXT,
+              createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_task_logs_user_time ON ssl_task_logs(userId, createdAt)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_task_logs_filters ON ssl_task_logs(userId, taskType, status, source)")
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS system_settings (
@@ -2565,12 +2584,40 @@ def _ssl_acme_job_worker() -> None:
         time.sleep(5)
 
 
+def _ssl_task_cleanup_worker() -> None:
+    """Periodically remove expired successful SSL jobs and task logs."""
+    import urllib.request
+    time.sleep(60)
+    while True:
+        try:
+            with conn() as c:
+                users = c.execute("SELECT id, username FROM users").fetchall()
+            for user in users:
+                token = sign_access_token({
+                    "id": user["id"], "sub": user["id"], "username": user["username"], "_internal": True,
+                }, expires_seconds=900)
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{PORT}/api/ssl/tasks/cleanup",
+                    data=b"{}",
+                    headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(request, timeout=30).read()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(24 * 3600)
+
+
 def main() -> None:
     init_db()
     from modules.cache import cache_ping
     redis_ok = cache_ping()
     threading.Thread(target=_ssl_autorenew_worker, daemon=True).start()
     threading.Thread(target=_ssl_acme_job_worker, daemon=True).start()
+    threading.Thread(target=_ssl_task_cleanup_worker, daemon=True).start()
     s = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     print(json.dumps({"message": "Python Backend V2 started", "port": PORT, "legacyProxy": LEGACY, "databasePath": str(DB), "redis": "connected" if redis_ok else "unavailable (degraded mode)", "frontend": str(FRONTEND_DIST) if FRONTEND_DIST.is_dir() else "not built (dev server / proxy)"}, ensure_ascii=False))
     try:

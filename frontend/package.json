@@ -1,6 +1,6 @@
 {
   "name": "dns-panel-vue",
-  "version": "1.0.0",
+  "version": "0.24.0",
   "description": "DNS Panel - Vue 3 Frontend",
   "type": "module",
   "scripts": {

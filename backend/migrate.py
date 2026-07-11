@@ -228,6 +228,23 @@ MIGRATIONS: list[str] = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_ssl_deploy_events_queue ON ssl_deployment_events(userId, status, nextAttemptAt)",
+    """
+    CREATE TABLE IF NOT EXISTS ssl_task_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      taskType TEXT NOT NULL,
+      taskId INTEGER,
+      domain TEXT,
+      source TEXT,
+      status TEXT NOT NULL,
+      attempt INTEGER NOT NULL DEFAULT 0,
+      targetName TEXT,
+      message TEXT,
+      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ssl_task_logs_user_time ON ssl_task_logs(userId, createdAt)",
+    "CREATE INDEX IF NOT EXISTS idx_ssl_task_logs_filters ON ssl_task_logs(userId, taskType, status, source)",
 
     # ── system_settings table (global config, not per-user) ──
     """

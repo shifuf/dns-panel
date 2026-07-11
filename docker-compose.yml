@@ -14,7 +14,12 @@ services:
 
   backend:
     image: ghcr.io/shifuf/dns-panel-backend:${DNS_PANEL_VERSION:-latest}
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        # 网络较慢时可在 .env 中切换为可信镜像，例如：
+        # https://pypi.tuna.tsinghua.edu.cn/simple
+        PIP_INDEX_URL: ${DNS_PANEL_PIP_INDEX_URL:-https://pypi.org/simple}
     pull_policy: always
     restart: unless-stopped
     ports:

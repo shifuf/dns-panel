@@ -14,7 +14,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from modules import acme_api  # noqa: E402
-from modules.route_handlers import _ssl_filter_and_summarize  # noqa: E402
+from modules.route_handlers import _ssl_filter_and_summarize, _validate_ssl_notification_url  # noqa: E402
 import migrate as db_migrate  # noqa: E402
 
 
@@ -87,6 +87,18 @@ class AcmeApplyTests(unittest.TestCase):
         self.assertIn("超时", str(ctx.exception))
 
 
+class SslNotificationSecurityTests(unittest.TestCase):
+    @patch("modules.route_handlers.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("127.0.0.1", 443))])
+    def test_webhook_rejects_private_or_loopback_targets(self, _resolve) -> None:
+        with self.assertRaisesRegex(ValueError, "不能指向"):
+            _validate_ssl_notification_url("https://hooks.example.test/ssl")
+
+    @patch("modules.route_handlers.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("1.1.1.1", 443))])
+    def test_wecom_webhook_requires_official_hostname(self, _resolve) -> None:
+        with self.assertRaisesRegex(ValueError, "qyapi.weixin.qq.com"):
+            _validate_ssl_notification_url("https://example.com/wecom", wecom=True)
+
+
 class SslRouteContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -114,9 +126,11 @@ class SslRouteContractTests(unittest.TestCase):
     def test_deployment_queue_is_atomic_retriable_and_rejects_stale_results(self) -> None:
         self.assertIn('sub == "/deployment-events/claim"', self.source)
         self.assertIn('r"/deployment-events/(\\d+)/result"', self.source)
+        self.assertIn('r"/deployment-events/(\\d+)/retry"', self.source)
         self.assertIn("attempts < 5", self.source)
         self.assertIn("60 * (2 ** max(0, attempts - 1))", self.source)
         self.assertIn("部署事件未处于执行中，拒绝重复或过期回执", self.source)
+        self.assertIn("当前部署事件已在等待或执行中，无需重复排队", self.source)
 
     def test_acme_job_management_has_state_guards(self) -> None:
         self.assertIn('sub == "/acme-jobs"', self.source)
@@ -152,6 +166,28 @@ class SslRouteContractTests(unittest.TestCase):
         self.assertIn("def _find_executable", plugin)
         self.assertNotIn('public.ExecShell("nginx -t', plugin)
         self.assertNotIn('public.ExecShell("httpd -t', plugin)
+        self.assertIn("def _match_sites_for_domain", plugin)
+        self.assertIn("for site in allowed_matches", plugin)
+        self.assertIn("部分站点部署失败", plugin)
+
+    def test_task_logs_notifications_filters_and_download_routes_exist(self) -> None:
+        for route in (
+            'sub == "/notification-settings"',
+            'sub == "/notification-settings/test"',
+            'sub in ("/task-logs", "/task-logs/download")',
+            'sub == "/task-stats"',
+            'sub == "/tasks/cleanup"',
+        ):
+            self.assertIn(route, self.source)
+        self.assertIn("status_filter", self.source)
+        self.assertIn("source_filter", self.source)
+        self.assertIn("domain_filter", self.source)
+        self.assertIn("_send_ssl_failure_notifications", self.source)
+        self.assertIn("_write_ssl_task_log", self.source)
+
+    def test_cloudflare_verify_reports_visible_zones(self) -> None:
+        self.assertIn('verify_details = {"zoneCount": zone_count, "visibleZones": visible_zones}', self.source)
+        self.assertIn("Zone Resources", self.source)
 
     def test_scoped_tokens_are_guarded_outside_ssl_modules(self) -> None:
         app_source = (BACKEND_DIR / "app.py").read_text(encoding="utf-8")
@@ -172,6 +208,8 @@ class SslMigrationTests(unittest.TestCase):
                 connection.close()
             self.assertIn("ssl_deployment_events", tables)
             self.assertIn("idx_ssl_deploy_events_queue", indexes)
+            self.assertIn("ssl_task_logs", tables)
+            self.assertIn("idx_ssl_task_logs_user_time", indexes)
 
 
 if __name__ == "__main__":

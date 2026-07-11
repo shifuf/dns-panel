@@ -142,7 +142,13 @@ export async function deleteDnsCredential(id: number): Promise<ApiResponse> {
 /**
  * 验证凭证
  */
-export async function verifyDnsCredential(id: number): Promise<ApiResponse<{ valid: boolean; error?: string }>> {
+export async function verifyDnsCredential(id: number): Promise<ApiResponse<{
+  valid: boolean;
+  error?: string;
+  zoneCount?: number;
+  visibleZones?: string[];
+  warning?: string;
+}>> {
   const response = await api.post(`/dns-credentials/${id}/verify`);
   return response as unknown as ApiResponse<{ valid: boolean; error?: string }>;
 }

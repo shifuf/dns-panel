@@ -5,7 +5,7 @@ import { keepPreviousData } from '@tanstack/vue-query';
 import {
   NButton, NTag, NDataTable, NModal, NFormItem, NInput, NSelect, NAlert,
   NEmpty, NSpin, NPagination, NDrawer, NDrawerContent, NDescriptions,
-  NDescriptionsItem, NSwitch, NTooltip, NTabs, NTabPane, useMessage, useDialog,
+  NDescriptionsItem, NSwitch, NTooltip, NTabs, NTabPane, NInputNumber, useMessage, useDialog,
 } from 'naive-ui';
 import { RefreshCw, Search, Plus, Upload, Download, Trash2, Eye, CheckCircle, KeyRound, Pencil, AlertTriangle, RotateCw, ArrowUpDown, FileDown, ListChecks } from 'lucide-vue-next';
 import {
@@ -16,11 +16,13 @@ import {
   autoDnsSslCertificate, cleanupDnsSslCertificate,
   getSslAutoRenew, setSslAutoRenew, issueAcmeCertificate, setCertificateAutoRenew,
   getSslAcmeJobs, retrySslAcmeJob, cancelSslAcmeJob, getSslDeploymentEvents,
+  retrySslDeploymentEvent, getSslNotificationSettings, saveSslNotificationSettings,
+  testSslNotification, getSslTaskLogs, getSslTaskStats, downloadSslTaskLogs,
 } from '@/services/ssl';
 import { getDnsCredentials } from '@/services/dnsCredentials';
 import { getDomains } from '@/services/domains';
 import AddZoneDialog from '@/components/Dashboard/AddZoneDialog.vue';
-import type { SslCredential, RenewResult, SslAcmeJob, SslDeploymentEvent } from '@/services/ssl';
+import type { SslCredential, RenewResult, SslAcmeJob, SslDeploymentEvent, SslNotificationSettings } from '@/services/ssl';
 import { useResponsive } from '@/composables/useResponsive';
 import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import type { SslCertificate, SslCertificateDetail, SslCertificateStatus } from '@/types/ssl';
@@ -232,6 +234,9 @@ watch(certificates, (list) => {
 
 // ── Persistent ACME jobs and incremental deployment events ─────
 const showTaskDrawer = ref(false);
+const deploymentStatusFilter = ref<string | null>(null);
+const deploymentSourceFilter = ref<string | null>(null);
+const deploymentDomainFilter = ref('');
 const { data: acmeJobs, isFetching: acmeJobsFetching } = useQuery({
   queryKey: ['ssl-acme-jobs'],
   queryFn: async () => (await getSslAcmeJobs()).data || [],
@@ -239,11 +244,73 @@ const { data: acmeJobs, isFetching: acmeJobsFetching } = useQuery({
   refetchInterval: computed(() => showTaskDrawer.value ? 5000 : false),
 });
 const { data: deploymentEvents, isFetching: deploymentEventsFetching } = useQuery({
-  queryKey: ['ssl-deployment-events'],
-  queryFn: async () => (await getSslDeploymentEvents()).data || [],
+  queryKey: computed(() => ['ssl-deployment-events', deploymentStatusFilter.value, deploymentSourceFilter.value, deploymentDomainFilter.value]),
+  queryFn: async () => (await getSslDeploymentEvents({
+    status: deploymentStatusFilter.value || undefined,
+    source: deploymentSourceFilter.value || undefined,
+    domain: deploymentDomainFilter.value.trim() || undefined,
+    limit: 100,
+  })).data || [],
   enabled: computed(() => showTaskDrawer.value || certificates.value.length > 0),
   refetchInterval: computed(() => showTaskDrawer.value || hasActiveApplying.value ? 5000 : false),
 });
+
+const { data: taskLogs, isFetching: taskLogsFetching } = useQuery({
+  queryKey: ['ssl-task-logs'],
+  queryFn: async () => (await getSslTaskLogs({ page: 1, limit: 50 })).data || [],
+  enabled: computed(() => showTaskDrawer.value),
+  refetchInterval: computed(() => showTaskDrawer.value ? 10000 : false),
+});
+const { data: taskStats } = useQuery({
+  queryKey: ['ssl-task-stats'],
+  queryFn: async () => (await getSslTaskStats()).data,
+  enabled: computed(() => showTaskDrawer.value),
+  refetchInterval: computed(() => showTaskDrawer.value ? 10000 : false),
+});
+
+const showNotificationSettings = ref(false);
+const notificationLoading = ref(false);
+const notificationForm = ref<SslNotificationSettings>({
+  enabled: false, emailEnabled: false, emailTo: '', webhookEnabled: false,
+  webhookUrl: '', wecomEnabled: false, wecomWebhookUrl: '', retentionDays: 30,
+});
+async function openNotificationSettings() {
+  showNotificationSettings.value = true;
+  notificationLoading.value = true;
+  try {
+    const res = await getSslNotificationSettings();
+    if (res.data) notificationForm.value = { ...res.data };
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    notificationLoading.value = false;
+  }
+}
+const saveNotificationMutation = useMutation({
+  mutationFn: () => saveSslNotificationSettings(notificationForm.value),
+  onSuccess: () => { message.success('SSL 通知和任务清理设置已保存'); showNotificationSettings.value = false; },
+  onError: (err: any) => message.error(String(err)),
+});
+const testNotificationMutation = useMutation({
+  mutationFn: () => testSslNotification(),
+  onSuccess: (res) => {
+    const failed = (res.data?.deliveries || []).filter(item => !item.success);
+    if (failed.length) message.warning(`测试完成，${failed.length} 个通道发送失败`);
+    else message.success('所有已启用通知通道测试成功');
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+async function handleDownloadTaskLogs() {
+  try {
+    await downloadSslTaskLogs({
+      status: deploymentStatusFilter.value || undefined,
+      source: deploymentSourceFilter.value || undefined,
+      domain: deploymentDomainFilter.value.trim() || undefined,
+    });
+  } catch (err: any) {
+    message.error(String(err));
+  }
+}
 
 const deploymentByCertificate = computed(() => {
   const result = new Map<string, SslDeploymentEvent>();
@@ -264,6 +331,15 @@ const taskActionMutation = useMutation({
     message.success(variables.action === 'retry' ? '任务已重新排队' : '任务已取消');
     queryClient.invalidateQueries({ queryKey: ['ssl-acme-jobs'] });
     queryClient.invalidateQueries({ queryKey: ['ssl-certificates'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+const deploymentRetryMutation = useMutation({
+  mutationFn: (id: number) => retrySslDeploymentEvent(id),
+  onSuccess: () => {
+    message.success('部署事件已重新排队，宝塔插件下次同步时会立即处理');
+    queryClient.invalidateQueries({ queryKey: ['ssl-deployment-events'] });
   },
   onError: (err: any) => message.error(String(err)),
 });
@@ -2007,7 +2083,16 @@ const columns = computed(() => {
 
     <!-- Detail Drawer -->
     <NDrawer v-model:show="showTaskDrawer" :width="isMobile ? '100%' : 760" placement="right">
-      <NDrawerContent title="SSL 自动化任务" closable>
+      <NDrawerContent closable>
+        <template #header>
+          <div class="flex w-full items-center justify-between gap-3 pr-2">
+            <span>SSL 自动化任务</span>
+            <div class="flex gap-2">
+            <NButton size="small" secondary @click="handleDownloadTaskLogs"><template #icon><FileDown :size="14" /></template>下载日志</NButton>
+            <NButton size="small" secondary @click="openNotificationSettings">通知设置</NButton>
+            </div>
+          </div>
+        </template>
         <NTabs type="line" animated>
           <NTabPane name="acme" tab="签发任务">
             <div v-if="acmeJobsFetching && !(acmeJobs || []).length" class="flex justify-center py-12"><NSpin /></div>
@@ -2035,29 +2120,113 @@ const columns = computed(() => {
             </div>
           </NTabPane>
           <NTabPane name="deployment" tab="部署事件">
+            <div class="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <NSelect v-model:value="deploymentStatusFilter" clearable placeholder="按状态筛选" :options="[
+                { label: '待部署', value: 'queued' }, { label: '部署中', value: 'running' },
+                { label: '已部署', value: 'success' }, { label: '部署失败', value: 'failed' },
+                { label: '已跳过', value: 'skipped' },
+              ]" />
+              <NSelect v-model:value="deploymentSourceFilter" clearable placeholder="按来源筛选" :options="[
+                { label: '腾讯云', value: 'tencent' }, { label: `Let's Encrypt`, value: 'letsencrypt' },
+              ]" />
+              <NInput v-model:value="deploymentDomainFilter" clearable placeholder="按域名筛选" />
+            </div>
             <div v-if="deploymentEventsFetching && !(deploymentEvents || []).length" class="flex justify-center py-12"><NSpin /></div>
             <NEmpty v-else-if="!(deploymentEvents || []).length" description="暂无证书部署事件" class="py-12" />
             <div v-else class="space-y-3">
               <div v-for="event in deploymentEvents" :key="event.id" class="rounded-xl border border-panel-border p-3">
-                <div class="flex flex-wrap items-center gap-2">
-                  <span class="font-medium text-slate-700">{{ event.domain }}</span>
-                  <NTag size="tiny" :bordered="false">{{ event.source === 'letsencrypt' ? "Let's Encrypt" : '腾讯云' }}</NTag>
-                  <NTag size="tiny" :bordered="false" :type="event.status === 'success' ? 'success' : event.status === 'failed' ? 'error' : event.status === 'running' ? 'info' : event.status === 'skipped' ? 'default' : 'warning'">
-                    {{ deploymentStatusLabel[event.status] }}
-                  </NTag>
-                  <span class="text-xs text-slate-400">尝试 {{ event.attempts }}/5</span>
+                <div class="flex items-start gap-3">
+                  <div class="min-w-0 flex-1">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="font-medium text-slate-700">{{ event.domain }}</span>
+                      <NTag size="tiny" :bordered="false">{{ event.source === 'letsencrypt' ? "Let's Encrypt" : '腾讯云' }}</NTag>
+                      <NTag size="tiny" :bordered="false" :type="event.status === 'success' ? 'success' : event.status === 'failed' ? 'error' : event.status === 'running' ? 'info' : event.status === 'skipped' ? 'default' : 'warning'">
+                        {{ deploymentStatusLabel[event.status] }}
+                      </NTag>
+                      <span class="text-xs text-slate-400">尝试 {{ event.attempts }}/5</span>
+                    </div>
+                    <p class="mt-1 text-xs text-slate-500">
+                      目标：{{ event.targetName || '待匹配' }} · 更新于 {{ formatDateTime(event.updatedAt) }}
+                      <span v-if="event.nextAttemptAt"> · 下次重试 {{ formatDateTime(event.nextAttemptAt) }}</span>
+                    </p>
+                    <p v-if="event.error" class="mt-1 break-all text-xs text-red-500">{{ event.error }}</p>
+                  </div>
+                  <NButton
+                    v-if="event.status === 'failed' || event.status === 'skipped' || event.status === 'success'"
+                    size="tiny"
+                    secondary
+                    :type="event.status === 'success' ? 'default' : 'warning'"
+                    :loading="deploymentRetryMutation.isPending.value && deploymentRetryMutation.variables.value === event.id"
+                    @click="deploymentRetryMutation.mutate(event.id)"
+                  >
+                    {{ event.status === 'success' ? '重新部署' : '立即重试' }}
+                  </NButton>
                 </div>
-                <p class="mt-1 text-xs text-slate-500">
-                  目标：{{ event.targetName || '待匹配' }} · 更新于 {{ formatDateTime(event.updatedAt) }}
-                  <span v-if="event.nextAttemptAt"> · 下次重试 {{ formatDateTime(event.nextAttemptAt) }}</span>
-                </p>
-                <p v-if="event.error" class="mt-1 break-all text-xs text-red-500">{{ event.error }}</p>
+              </div>
+            </div>
+          </NTabPane>
+          <NTabPane name="logs" tab="执行日志与统计">
+            <div class="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <div class="rounded-xl border border-panel-border p-3"><p class="text-xs text-slate-500">成功</p><p class="mt-1 text-xl font-semibold text-green-600">{{ taskStats?.byStatus?.success || 0 }}</p></div>
+              <div class="rounded-xl border border-panel-border p-3"><p class="text-xs text-slate-500">失败</p><p class="mt-1 text-xl font-semibold text-red-600">{{ taskStats?.byStatus?.failed || 0 }}</p></div>
+              <div class="rounded-xl border border-panel-border p-3"><p class="text-xs text-slate-500">腾讯云</p><p class="mt-1 text-xl font-semibold text-slate-700">{{ taskStats?.bySource?.tencent || 0 }}</p></div>
+              <div class="rounded-xl border border-panel-border p-3"><p class="text-xs text-slate-500">Let's Encrypt</p><p class="mt-1 text-xl font-semibold text-slate-700">{{ (taskStats?.bySource?.letsencrypt || 0) + (taskStats?.bySource?.acme || 0) }}</p></div>
+            </div>
+            <div v-if="taskStats?.failureReasons?.length" class="mb-4 rounded-xl border border-panel-border p-3">
+              <p class="mb-2 text-sm font-semibold text-slate-700">失败原因统计</p>
+              <div v-for="item in taskStats.failureReasons" :key="item.reason" class="flex items-start justify-between gap-3 border-t border-panel-border py-2 first:border-0">
+                <span class="break-all text-xs text-slate-600">{{ item.reason }}</span><NTag size="tiny" type="error" :bordered="false">{{ item.count }}</NTag>
+              </div>
+            </div>
+            <div v-if="taskLogsFetching && !(taskLogs || []).length" class="flex justify-center py-12"><NSpin /></div>
+            <NEmpty v-else-if="!(taskLogs || []).length" description="暂无任务执行日志" class="py-12" />
+            <div v-else class="space-y-2">
+              <div v-for="log in taskLogs" :key="log.id" class="rounded-xl border border-panel-border p-3">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="font-medium text-slate-700">{{ log.domain || '-' }}</span>
+                  <NTag size="tiny" :bordered="false">{{ log.taskType }}</NTag>
+                  <NTag size="tiny" :bordered="false" :type="log.status === 'success' ? 'success' : log.status === 'failed' ? 'error' : log.status === 'running' ? 'info' : 'default'">{{ log.status }}</NTag>
+                  <span class="ml-auto text-xs text-slate-400">{{ formatDateTime(log.createdAt) }}</span>
+                </div>
+                <p v-if="log.targetName" class="mt-1 text-xs text-slate-500">目标：{{ log.targetName }}</p>
+                <p v-if="log.message" class="mt-1 break-all text-xs" :class="log.status === 'failed' ? 'text-red-500' : 'text-slate-500'">{{ log.message }}</p>
               </div>
             </div>
           </NTabPane>
         </NTabs>
       </NDrawerContent>
     </NDrawer>
+
+    <NModal v-model:show="showNotificationSettings" preset="card" title="SSL 失败通知与任务清理" :style="{ width: isMobile ? '94vw' : '620px' }">
+      <div v-if="notificationLoading" class="flex justify-center py-12"><NSpin /></div>
+      <div v-else class="space-y-4">
+        <NAlert type="info" :bordered="false">仅在签发最终失败、续期失败或部署连续失败 5 次时发送，避免重试过程重复告警。SMTP 参数复用“设置 → 域名到期提醒”中的邮件配置。</NAlert>
+        <div class="flex items-center justify-between rounded-xl border border-panel-border p-3"><div><p class="text-sm font-medium text-slate-700">启用 SSL 失败通知</p><p class="text-xs text-slate-500">所有通道的总开关</p></div><NSwitch v-model:value="notificationForm.enabled" /></div>
+        <div class="rounded-xl border border-panel-border p-3">
+          <div class="mb-3 flex items-center justify-between"><span class="text-sm font-medium text-slate-700">邮件通知</span><NSwitch v-model:value="notificationForm.emailEnabled" /></div>
+          <NInput v-model:value="notificationForm.emailTo" placeholder="收件邮箱，多个可用逗号分隔" />
+        </div>
+        <div class="rounded-xl border border-panel-border p-3">
+          <div class="mb-3 flex items-center justify-between"><span class="text-sm font-medium text-slate-700">Webhook</span><NSwitch v-model:value="notificationForm.webhookEnabled" /></div>
+          <NInput v-model:value="notificationForm.webhookUrl" type="password" show-password-on="click" placeholder="https://example.com/hooks/ssl" />
+          <p class="mt-2 text-xs text-slate-500">出于 SSRF 防护，仅允许解析到公网地址的 HTTPS URL。</p>
+        </div>
+        <div class="rounded-xl border border-panel-border p-3">
+          <div class="mb-3 flex items-center justify-between"><span class="text-sm font-medium text-slate-700">企业微信机器人</span><NSwitch v-model:value="notificationForm.wecomEnabled" /></div>
+          <NInput v-model:value="notificationForm.wecomWebhookUrl" type="password" show-password-on="click" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." />
+        </div>
+        <NFormItem label="成功任务与执行日志保留天数">
+          <NInputNumber v-model:value="notificationForm.retentionDays" :min="1" :max="365" class="w-full" />
+        </NFormItem>
+      </div>
+      <template #action>
+        <div class="flex justify-end gap-2">
+          <NButton :loading="testNotificationMutation.isPending.value" @click="testNotificationMutation.mutate()">测试通知</NButton>
+          <NButton @click="showNotificationSettings = false">取消</NButton>
+          <NButton type="primary" :loading="saveNotificationMutation.isPending.value" @click="saveNotificationMutation.mutate()">保存</NButton>
+        </div>
+      </template>
+    </NModal>
 
     <NDrawer v-model:show="showDetail" :width="isMobile ? '100%' : 560" placement="right">
       <NDrawerContent title="证书详情" closable>

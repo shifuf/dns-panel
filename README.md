@@ -13,7 +13,7 @@
 | 🌍 多服务商 DNS | 统一管理 Cloudflare / DNSPod / 阿里云 等账户，支持记录的批量启用/禁用、批量删除、线路、备注、权重 |
 | 📅 域名到期监控 | 基于 RDAP 自动查询到期时间（结果缓存），支持邮件 / Webhook 告警与到期窗口预警 |
 | 🔒 SSL 证书管理 | 腾讯云 DV 证书申请、DNS 自动验证、续期、下载、上传第三方证书 |
-| ♻️ SSL 自动续期 | 剩余 ≤ 7 天自动续期，并清理被取代的过期证书与残留验证记录（面板内置定时 + 宝塔插件双通道） |
+| ♻️ SSL 自动续期 | 剩余 ≤ 7 天自动续期，失败支持邮件 / Webhook / 企业微信告警，并自动清理过期成功任务与执行日志 |
 | ⚡ 边缘加速 | 腾讯云 EdgeOne 加速域名管理、阿里云 ESA 站点管理 |
 | 🔗 Cloudflare Tunnel | Tunnel 与自定义主机名（Custom Hostnames）管理 |
 | 🧩 宝塔 SSL 同步插件 | 通过 API Token 将证书同步部署到宝塔站点（见 `baota-ssl-plugin/`） |
@@ -134,7 +134,7 @@ cd frontend && npm run build           # 生成 dist/
 
 ## 宝塔 SSL 同步插件
 
-`baota-ssl-plugin/` 是配套的宝塔面板插件，通过 **API Token** 对接本面板，自动将已签发证书部署到宝塔站点，并支持每日自动续期、按域名取最新证书、清理过期证书与验证记录。
+`baota-ssl-plugin/` 是配套的宝塔面板插件，通过 **API Token** 对接本面板，自动将已签发证书部署到一个或多个匹配的宝塔站点，并支持每日自动续期、按域名取最新证书、清理过期证书与验证记录。
 
 详见 [`baota-ssl-plugin/README.md`](baota-ssl-plugin/README.md)。
 
@@ -153,7 +153,7 @@ cd frontend && npm run build           # 生成 dist/
 ### Docker 一键更新
 ```bash
 docker compose up -d --pull always                       # 跟随最新发布
-DNS_PANEL_VERSION=v0.22 docker compose up -d --pull always   # 固定到指定版本
+DNS_PANEL_VERSION=v0.24 docker compose up -d --pull always   # 固定到指定版本
 ```
 
 ### 脚本更新

@@ -4,6 +4,13 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from concurrent.futures import ThreadPoolExecutor
+import csv
+import io
+import ipaddress
+import socket
+import urllib.parse
+import urllib.request
+import urllib.error
 
 from modules.cache import (
     cache_get, cache_set, cache_delete_pattern,
@@ -1578,13 +1585,28 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
         provider = str(row["provider"] or "").strip()
         valid = False
         err_msg = None
+        verify_details: Dict[str, Any] = {}
         try:
             secrets = self._json_loads_safe(decrypt_text(row["secrets"]))
             if provider == "cloudflare":
                 token = str(secrets.get("apiToken") or "").strip()
                 if not token:
                     raise ValueError("缺少 Cloudflare API Token")
-                valid = CloudflareApi(token).verify_token()
+                cf_api = CloudflareApi(token)
+                valid = cf_api.verify_token()
+                if valid:
+                    zone_result = cf_api.list_zones(1, 100)
+                    visible_zones = [
+                        str(item.get("name") or "").strip()
+                        for item in (zone_result.get("zones") or []) if str(item.get("name") or "").strip()
+                    ]
+                    zone_count = int(zone_result.get("total") or len(visible_zones))
+                    verify_details = {"zoneCount": zone_count, "visibleZones": visible_zones}
+                    if zone_count == 0:
+                        verify_details["warning"] = "Token 验证成功，但没有任何可见域名。请检查 Zone Resources 授权范围。"
+                    elif zone_count == 1:
+                        verify_details["warning"] = "当前 Token 仅能看到 1 个域名，可能只授权了单个 Zone。请在 Cloudflare API Token 的 Zone Resources 中选择 Include → All zones，或勾选全部需要管理的域名。"
+                    cache_delete_pattern(f"dns:*:cred:{cid}:*")
             elif provider in ("dnspod", "dnspod_token"):
                 has_tc3 = str(secrets.get("secretId") or "").strip() and str(secrets.get("secretKey") or "").strip()
                 has_token = str(secrets.get("tokenId") or "").strip() and str(secrets.get("token") or "").strip()
@@ -1624,13 +1646,13 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
                 record_name=str(row["name"] or str(cid)),
                 status="SUCCESS" if valid else "FAILED",
                 ip_address=ip,
-                new_value=json.dumps({"id": cid, "provider": provider, "valid": valid}, ensure_ascii=False),
+                new_value=json.dumps({"id": cid, "provider": provider, "valid": valid, "zoneCount": verify_details.get("zoneCount")}, ensure_ascii=False),
                 error_message=None if valid else (err_msg or "凭证无效"),
             )
         except Exception:
             pass
         if valid:
-            self._ok({"valid": True}, "凭证验证成功")
+            self._ok({"valid": True, **verify_details}, "凭证验证成功")
         else:
             self._ok({"valid": False, "error": err_msg} if err_msg else {"valid": False}, "凭证验证失败")
         return
@@ -4746,6 +4768,205 @@ def _ssl_filter_and_summarize(certs: list, status_filter: str = "", source_filte
     return {"certs": filtered, "statusSummary": status_summary, "sourceSummary": source_summary}
 
 
+def _ssl_notification_settings(uid: int) -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "enabled": False,
+        "emailEnabled": False,
+        "emailTo": "",
+        "webhookEnabled": False,
+        "webhookUrl": "",
+        "wecomEnabled": False,
+        "wecomWebhookUrl": "",
+        "retentionDays": 30,
+    }
+    raw = get_system_setting(f"sslNotificationSettings:{uid}", "")
+    if not raw:
+        return defaults
+    try:
+        saved = json.loads(decrypt_text(raw))
+        if isinstance(saved, dict):
+            defaults.update(saved)
+    except Exception:
+        pass
+    try:
+        defaults["retentionDays"] = max(1, min(365, int(defaults.get("retentionDays") or 30)))
+    except Exception:
+        defaults["retentionDays"] = 30
+    return defaults
+
+
+def _save_ssl_notification_settings(uid: int, settings: Dict[str, Any]) -> None:
+    set_system_setting(
+        f"sslNotificationSettings:{uid}",
+        encrypt_text(json.dumps(settings, ensure_ascii=False)),
+    )
+
+
+def _validate_ssl_notification_url(value: Any, *, wecom: bool = False) -> str:
+    target = str(value or "").strip()
+    if not target:
+        return ""
+    parsed = urllib.parse.urlparse(target)
+    if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("通知地址必须是无用户信息的 HTTPS URL")
+    hostname = parsed.hostname.lower().rstrip(".")
+    if wecom and hostname != "qyapi.weixin.qq.com":
+        raise ValueError("企业微信机器人地址必须使用 qyapi.weixin.qq.com")
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)}
+    except Exception as ex:
+        raise ValueError(f"通知地址无法解析: {ex}")
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if not ip.is_global:
+            raise ValueError("通知地址不能指向本机、内网、保留或链路本地地址")
+    return target
+
+
+class _SslNotificationNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("通知地址不允许 HTTP 重定向")
+
+
+def _write_ssl_task_log(
+    uid: int, task_type: str, task_id: Any, domain: Any, source: Any,
+    status: str, attempt: int = 0, target_name: Any = None, message: Any = None,
+) -> None:
+    try:
+        with conn() as c:
+            c.execute(
+                """INSERT INTO ssl_task_logs
+                   (userId, taskType, taskId, domain, source, status, attempt, targetName, message, createdAt)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    uid, str(task_type)[:32], int(task_id) if task_id is not None else None,
+                    str(domain or "")[:253], str(source or "")[:32], str(status)[:32],
+                    max(0, int(attempt or 0)), str(target_name or "")[:1000],
+                    str(message or "")[:2000], now_iso(),
+                ),
+            )
+            c.commit()
+    except Exception:
+        pass
+
+
+def _cleanup_ssl_task_history(uid: int) -> int:
+    days = int(_ssl_notification_settings(uid).get("retentionDays") or 30)
+    modifier = f"-{days} days"
+    with conn() as c:
+        log_count = c.execute(
+            "DELETE FROM ssl_task_logs WHERE userId = ? AND datetime(createdAt) < datetime('now', ?)",
+            (uid, modifier),
+        ).rowcount
+        job_count = c.execute(
+            """DELETE FROM ssl_acme_jobs WHERE userId = ? AND status = 'success'
+               AND completedAt IS NOT NULL AND datetime(completedAt) < datetime('now', ?)""",
+            (uid, modifier),
+        ).rowcount
+        c.commit()
+    return max(0, int(log_count or 0)) + max(0, int(job_count or 0))
+
+
+def _send_ssl_failure_notifications(uid: int, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    settings = _ssl_notification_settings(uid)
+    if not bool(settings.get("enabled")):
+        return []
+    with conn() as c:
+        user_row = c.execute(
+            """SELECT username, email, smtpHost, smtpPort, smtpSecure, smtpUser, smtpPass, smtpFrom
+               FROM users WHERE id = ? LIMIT 1""",
+            (uid,),
+        ).fetchone()
+    if not user_row:
+        return []
+
+    deliveries: List[Dict[str, Any]] = []
+    event_name = str(payload.get("event") or "ssl_failure")
+    domain = str(payload.get("domain") or "-")
+    reason = str(payload.get("reason") or "未知错误")
+    title = "DNS Panel SSL 续期失败" if event_name == "ssl_renewal_failed" else "DNS Panel SSL 部署失败"
+    if event_name == "ssl_issue_failed":
+        title = "DNS Panel SSL 签发失败"
+    elif event_name == "ssl_notification_test":
+        title = "DNS Panel SSL 通知测试"
+
+    if bool(settings.get("emailEnabled")):
+        try:
+            import smtplib
+            from email.message import EmailMessage
+            host = str(user_row["smtpHost"] or "").strip()
+            secure = bool(user_row["smtpSecure"])
+            port = int(user_row["smtpPort"] or (465 if secure else 587))
+            username = str(user_row["smtpUser"] or "").strip()
+            password = decrypt_text(user_row["smtpPass"]) if user_row["smtpPass"] else ""
+            sender = str(user_row["smtpFrom"] or username or "").strip()
+            recipients = _split_email_recipients(settings.get("emailTo"))
+            if not host or not sender or not recipients:
+                raise ValueError("SMTP、发件人或 SSL 告警收件人未完整配置")
+            msg = EmailMessage()
+            msg["Subject"] = f"{title}：{domain}"
+            msg["From"] = sender
+            msg["To"] = ", ".join(recipients)
+            msg.set_content(f"{title}\n\n域名：{domain}\n来源：{payload.get('source') or '-'}\n原因：{reason}\n时间：{payload.get('generatedAt') or now_iso()}")
+            if secure or port == 465:
+                with smtplib.SMTP_SSL(host, port, timeout=10) as smtp:
+                    if username:
+                        smtp.login(username, password)
+                    smtp.send_message(msg)
+            else:
+                with smtplib.SMTP(host, port, timeout=10) as smtp:
+                    if port == 587:
+                        smtp.starttls()
+                    if username:
+                        smtp.login(username, password)
+                    smtp.send_message(msg)
+            deliveries.append({"channel": "email", "success": True})
+        except Exception as ex:
+            deliveries.append({"channel": "email", "success": False, "error": str(ex)[:500]})
+
+    for channel, enabled_key, url_key, wecom in (
+        ("webhook", "webhookEnabled", "webhookUrl", False),
+        ("wecom", "wecomEnabled", "wecomWebhookUrl", True),
+    ):
+        if not bool(settings.get(enabled_key)):
+            continue
+        try:
+            target = _validate_ssl_notification_url(settings.get(url_key), wecom=wecom)
+            data_payload: Dict[str, Any] = payload
+            if wecom:
+                data_payload = {
+                    "msgtype": "markdown",
+                    "markdown": {"content": f"**{title}**\n> 域名：{domain}\n> 来源：{payload.get('source') or '-'}\n> 原因：{reason}"},
+                }
+            request = urllib.request.Request(
+                target, method="POST", data=json.dumps(data_payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8", "User-Agent": "dns-panel-ssl-notify/1.0"},
+            )
+            with urllib.request.build_opener(_SslNotificationNoRedirect()).open(request, timeout=10) as response:
+                status_code = int(getattr(response, "status", 200))
+                raw = response.read(4096).decode("utf-8", errors="replace")
+                if status_code < 200 or status_code >= 300:
+                    raise ValueError(f"HTTP {status_code}: {raw[:200]}")
+                if wecom:
+                    result = json.loads(raw or "{}")
+                    if int(result.get("errcode") or 0) != 0:
+                        raise ValueError(str(result.get("errmsg") or "企业微信通知失败"))
+            deliveries.append({"channel": channel, "success": True})
+        except Exception as ex:
+            deliveries.append({"channel": channel, "success": False, "error": str(ex)[:500]})
+
+    try:
+        create_log(
+            user_id=uid, action="NOTIFY", resource_type="SSL_AUTOMATION", domain=domain,
+            record_name=event_name, status="SUCCESS" if deliveries and all(x.get("success") for x in deliveries) else "FAILED",
+            new_value=json.dumps(deliveries, ensure_ascii=False),
+            error_message="; ".join(str(x.get("error")) for x in deliveries if x.get("error")) or None,
+        )
+    except Exception:
+        pass
+    return deliveries
+
+
 def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     u = self._auth()
     if not u:
@@ -5066,16 +5287,168 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             c.commit()
 
     try:
+        if self.command == "GET" and sub == "/notification-settings":
+            settings = _ssl_notification_settings(uid)
+            self._ok(settings, "获取 SSL 通知设置成功")
+            return
+
+        if self.command == "POST" and sub == "/notification-settings":
+            current = _ssl_notification_settings(uid)
+            settings = {
+                "enabled": bool(body.get("enabled", current.get("enabled"))),
+                "emailEnabled": bool(body.get("emailEnabled", current.get("emailEnabled"))),
+                "emailTo": str(body.get("emailTo", current.get("emailTo") or "")).strip(),
+                "webhookEnabled": bool(body.get("webhookEnabled", current.get("webhookEnabled"))),
+                "webhookUrl": str(body.get("webhookUrl", current.get("webhookUrl") or "")).strip(),
+                "wecomEnabled": bool(body.get("wecomEnabled", current.get("wecomEnabled"))),
+                "wecomWebhookUrl": str(body.get("wecomWebhookUrl", current.get("wecomWebhookUrl") or "")).strip(),
+                "retentionDays": body.get("retentionDays", current.get("retentionDays") or 30),
+            }
+            try:
+                settings["retentionDays"] = max(1, min(365, int(settings["retentionDays"])))
+            except Exception:
+                self._err("任务保留天数应为 1-365 的整数", 400)
+                return
+            if settings["emailTo"]:
+                recipients = _split_email_recipients(settings["emailTo"])
+                if not recipients or any(not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", item) for item in recipients):
+                    self._err("SSL 告警收件邮箱格式不正确", 400)
+                    return
+                settings["emailTo"] = ", ".join(recipients)
+            try:
+                if settings["webhookEnabled"] and settings["webhookUrl"]:
+                    settings["webhookUrl"] = _validate_ssl_notification_url(settings["webhookUrl"])
+                if settings["wecomEnabled"] and settings["wecomWebhookUrl"]:
+                    settings["wecomWebhookUrl"] = _validate_ssl_notification_url(settings["wecomWebhookUrl"], wecom=True)
+            except ValueError as ex:
+                self._err(str(ex), 400)
+                return
+            _save_ssl_notification_settings(uid, settings)
+            self._ok(settings, "SSL 通知与任务清理设置已保存")
+            return
+
+        if self.command == "POST" and sub == "/notification-settings/test":
+            payload = {
+                "event": "ssl_notification_test", "domain": "example.com", "source": "test",
+                "reason": "这是一条测试消息，用于确认通知通道可用。", "generatedAt": now_iso(),
+            }
+            deliveries = _send_ssl_failure_notifications(uid, payload)
+            if not deliveries:
+                self._err("通知总开关未开启或没有启用任何通知通道", 400)
+                return
+            self._ok({"deliveries": deliveries}, "通知测试已执行")
+            return
+
+        if self.command == "POST" and sub == "/tasks/cleanup":
+            count = _cleanup_ssl_task_history(uid)
+            self._ok({"deleted": count}, f"已清理 {count} 条过期成功任务和日志")
+            return
+
+        if self.command == "GET" and sub in ("/task-logs", "/task-logs/download"):
+            _cleanup_ssl_task_history(uid)
+            task_type = str(first_or_none(q, "taskType") or "").strip().lower()
+            status_filter = str(first_or_none(q, "status") or "").strip().lower()
+            source_filter = str(first_or_none(q, "source") or "").strip().lower()
+            domain_filter = str(first_or_none(q, "domain") or "").strip()
+            if task_type and task_type not in ("acme", "deployment", "renewal"):
+                self._err("无效任务类型", 400)
+                return
+            if status_filter and status_filter not in ("queued", "running", "success", "failed", "skipped", "cancelled", "retry"):
+                self._err("无效任务状态", 400)
+                return
+            if source_filter and source_filter not in ("tencent", "letsencrypt", "acme"):
+                self._err("无效任务来源", 400)
+                return
+            wheres = ["userId = ?"]
+            params: List[Any] = [uid]
+            for column, value in (("taskType", task_type), ("status", status_filter), ("source", source_filter)):
+                if value:
+                    wheres.append(f"{column} = ?")
+                    params.append(value)
+            if domain_filter:
+                wheres.append("domain LIKE ?")
+                params.append(f"%{domain_filter}%")
+            where_sql = " AND ".join(wheres)
+            with conn() as c:
+                if sub.endswith("/download"):
+                    rows = c.execute(
+                        f"SELECT * FROM ssl_task_logs WHERE {where_sql} ORDER BY createdAt DESC LIMIT 10000", params,
+                    ).fetchall()
+                else:
+                    page_no = p_int(first_or_none(q, "page") or "1", 1, 100000)
+                    page_limit = p_int(first_or_none(q, "limit") or "50", 50, 500)
+                    total = int(c.execute(f"SELECT COUNT(*) c FROM ssl_task_logs WHERE {where_sql}", params).fetchone()["c"])
+                    rows = c.execute(
+                        f"SELECT * FROM ssl_task_logs WHERE {where_sql} ORDER BY createdAt DESC LIMIT ? OFFSET ?",
+                        params + [page_limit, (page_no - 1) * page_limit],
+                    ).fetchall()
+            if sub.endswith("/download"):
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(["ID", "任务类型", "任务ID", "域名", "来源", "状态", "尝试次数", "目标", "消息", "时间"])
+                for row in rows:
+                    writer.writerow([row["id"], row["taskType"], row["taskId"], row["domain"], row["source"], row["status"], row["attempt"], row["targetName"], row["message"], row["createdAt"]])
+                self._binary(("\ufeff" + output.getvalue()).encode("utf-8"), "ssl-task-logs.csv", "text/csv; charset=utf-8")
+                return
+            self._paged([dict(row) for row in rows], total, page_no, page_limit, "获取 SSL 任务日志成功")
+            return
+
+        if self.command == "GET" and sub == "/task-stats":
+            _cleanup_ssl_task_history(uid)
+            with conn() as c:
+                status_rows = c.execute(
+                    "SELECT status, COUNT(*) count FROM ssl_task_logs WHERE userId = ? GROUP BY status", (uid,),
+                ).fetchall()
+                source_rows = c.execute(
+                    "SELECT source, COUNT(*) count FROM ssl_task_logs WHERE userId = ? GROUP BY source", (uid,),
+                ).fetchall()
+                reason_rows = c.execute(
+                    """SELECT COALESCE(NULLIF(TRIM(message), ''), '未知原因') reason, COUNT(*) count
+                       FROM ssl_task_logs WHERE userId = ? AND status = 'failed'
+                       GROUP BY reason ORDER BY count DESC LIMIT 10""",
+                    (uid,),
+                ).fetchall()
+            self._ok({
+                "byStatus": {str(row["status"]): int(row["count"]) for row in status_rows},
+                "bySource": {str(row["source"] or "unknown"): int(row["count"]) for row in source_rows},
+                "failureReasons": [{"reason": row["reason"], "count": int(row["count"])} for row in reason_rows],
+            }, "获取 SSL 任务统计成功")
+            return
+
         # Deployment event queue consumed by site deployment plugins.
         if self.command == "GET" and sub == "/deployment-events":
             _ensure_deployment_events()
+            status_filter = str(first_or_none(q, "status") or "").strip().lower()
+            source_filter = str(first_or_none(q, "source") or "").strip().lower()
+            domain_filter = str(first_or_none(q, "domain") or "").strip()
+            if status_filter and status_filter not in ("queued", "running", "success", "failed", "skipped"):
+                self._err("无效部署状态", 400)
+                return
+            if source_filter and source_filter not in ("tencent", "letsencrypt"):
+                self._err("无效证书来源", 400)
+                return
+            page_no = p_int(first_or_none(q, "page") or "1", 1, 100000)
+            page_limit = p_int(first_or_none(q, "limit") or "100", 100, 500)
+            wheres = ["userId = ?"]
+            params: List[Any] = [uid]
+            if status_filter:
+                wheres.append("status = ?")
+                params.append(status_filter)
+            if source_filter:
+                wheres.append("source = ?")
+                params.append(source_filter)
+            if domain_filter:
+                wheres.append("domain LIKE ?")
+                params.append(f"%{domain_filter}%")
+            where_sql = " AND ".join(wheres)
             with conn() as c:
+                total = int(c.execute(f"SELECT COUNT(*) c FROM ssl_deployment_events WHERE {where_sql}", params).fetchone()["c"])
                 rows = c.execute(
-                    """SELECT * FROM ssl_deployment_events WHERE userId = ?
-                       ORDER BY createdAt DESC LIMIT 100""",
-                    (uid,),
+                    f"""SELECT * FROM ssl_deployment_events WHERE {where_sql}
+                       ORDER BY createdAt DESC LIMIT ? OFFSET ?""",
+                    params + [page_limit, (page_no - 1) * page_limit],
                 ).fetchall()
-            self._ok([dict(row) for row in rows], "获取证书部署事件成功")
+            self._paged([dict(row) for row in rows], total, page_no, page_limit, "获取证书部署事件成功")
             return
 
         if self.command == "POST" and sub == "/deployment-events/claim":
@@ -5113,7 +5486,35 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 c.commit()
             payload = dict(row)
             payload["attempts"] = int(row["attempts"] or 0) + 1
+            _write_ssl_task_log(uid, "deployment", row["id"], row["domain"], row["source"], "running", payload["attempts"], message="部署事件已领取")
             self._ok(payload, "已领取证书部署事件")
+            return
+
+        m_deploy_retry = re.fullmatch(r"/deployment-events/(\d+)/retry", sub)
+        if self.command == "POST" and m_deploy_retry:
+            event_id = int(m_deploy_retry.group(1))
+            with conn() as c:
+                event = c.execute(
+                    "SELECT id, status, domain, source FROM ssl_deployment_events WHERE id = ? AND userId = ?",
+                    (event_id, uid),
+                ).fetchone()
+                if event is None:
+                    self._err("部署事件不存在", 404)
+                    return
+                c.execute(
+                    """UPDATE ssl_deployment_events SET status = 'queued', attempts = 0,
+                         nextAttemptAt = NULL, targetName = NULL, fingerprint = NULL,
+                         error = NULL, startedAt = NULL, completedAt = NULL, updatedAt = ?
+                       WHERE id = ? AND userId = ? AND status IN ('failed', 'skipped', 'success')""",
+                    (now_iso(), event_id, uid),
+                )
+                if c.execute("SELECT changes()").fetchone()[0] != 1:
+                    c.rollback()
+                    self._err("当前部署事件已在等待或执行中，无需重复排队", 409)
+                    return
+                c.commit()
+            _write_ssl_task_log(uid, "deployment", event_id, event["domain"], event["source"], "retry", message="用户手动重新排队")
+            self._ok({"id": event_id, "status": "queued"}, "部署事件已重新排队")
             return
 
         m_deploy_result = re.fullmatch(r"/deployment-events/(\d+)/result", sub)
@@ -5145,18 +5546,30 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     """UPDATE ssl_deployment_events SET status = ?, targetName = ?, fingerprint = ?,
                          error = ?, nextAttemptAt = ?, completedAt = ?, updatedAt = ? WHERE id = ?""",
                     (
-                        stored_status, str(body.get("targetName") or "")[:253],
-                        str(body.get("fingerprint") or "")[:128], error, next_attempt,
+                        stored_status, str(body.get("targetName") or "")[:1000],
+                        str(body.get("fingerprint") or "")[:1000], error, next_attempt,
                         now_iso() if result_status in ("success", "skipped") or attempts >= 5 else None,
                         now_iso(), event_id,
                     ),
                 )
                 c.commit()
+            _write_ssl_task_log(
+                uid, "deployment", event_id, event["domain"], event["source"], result_status,
+                attempts, body.get("targetName"), error or ("部署完成" if result_status == "success" else "部署已跳过"),
+            )
+            if result_status == "failed" and attempts >= 5:
+                _send_ssl_failure_notifications(uid, {
+                    "event": "ssl_deployment_failed", "taskId": event_id,
+                    "domain": event["domain"], "source": event["source"],
+                    "reason": error or "部署连续失败 5 次", "targetName": body.get("targetName"),
+                    "generatedAt": now_iso(),
+                })
             self._ok({"id": event_id, "status": stored_status, "nextAttemptAt": next_attempt}, "部署结果已记录")
             return
 
         # ACME task management for visibility and manual recovery.
         if self.command == "GET" and sub == "/acme-jobs":
+            _cleanup_ssl_task_history(uid)
             with conn() as c:
                 rows = c.execute(
                     "SELECT * FROM ssl_acme_jobs WHERE userId = ? ORDER BY createdAt DESC LIMIT 100",
@@ -5170,7 +5583,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             job_id = int(m_job_action.group(1))
             action = m_job_action.group(2)
             with conn() as c:
-                job = c.execute("SELECT id, certificateId, operation, status FROM ssl_acme_jobs WHERE id = ? AND userId = ?", (job_id, uid)).fetchone()
+                job = c.execute("SELECT id, certificateId, operation, status, domain FROM ssl_acme_jobs WHERE id = ? AND userId = ?", (job_id, uid)).fetchone()
                 if job is None:
                     self._err("ACME 任务不存在", 404)
                     return
@@ -5199,6 +5612,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         (now_iso(), job["certificateId"], uid, str(job["operation"] or "issue")),
                     )
                 c.commit()
+            _write_ssl_task_log(uid, "acme", job_id, job["domain"], "letsencrypt", "retry" if action == "retry" else "cancelled", message="用户手动操作")
             self._ok({"id": job_id, "status": "queued" if action == "retry" else "cancelled"}, "ACME 任务已" + ("重新排队" if action == "retry" else "取消"))
             return
 
@@ -5240,6 +5654,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 c.commit()
 
             attempts = int(job["attempts"] or 0) + 1
+            _write_ssl_task_log(uid, "acme", job["id"], job["domain"], "letsencrypt", "running", attempts, message="ACME 任务开始执行")
             try:
                 dns_row, dns_provider, dns_secrets, account_id = _acme_dns_context(str(job["dnsCredentialId"]))
                 domains = json.loads(job["domains"] or "[]")
@@ -5272,6 +5687,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         (ts, uid, job["domain"]),
                     )
                     c.commit()
+                _write_ssl_task_log(uid, "acme", job["id"], job["domain"], "letsencrypt", "success", attempts, message="证书签发成功")
                 cache_delete_pattern(f"ssl:certs:all:user:{uid}:*")
                 self._ok({"jobId": job["id"], "certificateId": job["certificateId"]}, "ACME 任务处理成功")
                 return
@@ -5290,6 +5706,13 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         (cert_status, (msg if final else f"签发失败，等待自动重试（{attempts}/3）：{msg}"), msg, now_iso(), job["certificateId"]),
                     )
                     c.commit()
+                _write_ssl_task_log(uid, "acme", job["id"], job["domain"], "letsencrypt", "failed" if final else "retry", attempts, message=msg)
+                if final:
+                    _send_ssl_failure_notifications(uid, {
+                        "event": "ssl_issue_failed" if str(job["operation"] or "issue") == "issue" else "ssl_renewal_failed",
+                        "taskId": job["id"], "domain": job["domain"], "source": "letsencrypt",
+                        "reason": msg, "generatedAt": now_iso(),
+                    })
                 self._ok({"jobId": job["id"], "retrying": not final}, "ACME 任务失败，已重试排队" if not final else "ACME 任务失败")
                 return
 
@@ -6613,6 +7036,17 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         failed.append({"domain": domain, "credential": ar["dnsName"] or "acme", "error": str(ex), "source": "letsencrypt"})
 
             total_renewed = len(renewed)
+            for item in renewed:
+                _write_ssl_task_log(uid, "renewal", None, item.get("domain"), item.get("source") or "tencent", "success", message="证书续期已提交或完成")
+            for item in failed:
+                failure_source = str(item.get("source") or "tencent")
+                failure_domain = str(item.get("domain") or "*")
+                failure_reason = str(item.get("error") or "续期失败")
+                _write_ssl_task_log(uid, "renewal", None, failure_domain, failure_source, "failed", message=failure_reason)
+                _send_ssl_failure_notifications(uid, {
+                    "event": "ssl_renewal_failed", "domain": failure_domain,
+                    "source": failure_source, "reason": failure_reason, "generatedAt": now_iso(),
+                })
             msg = f"续期检查完成：{total_renewed} 个已续期"
             if failed:
                 msg += f"，{len(failed)} 个失败"

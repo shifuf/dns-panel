@@ -62,6 +62,7 @@ const showSecretFields = ref<Record<string, boolean>>({});
 // Verify state
 const verifying = ref<number | null>(null);
 const verifyResults = ref<Record<number, boolean>>({});
+const verifyDetails = ref<Record<number, { zoneCount?: number; visibleZones?: string[]; warning?: string }>>({});
 
 const EDGEONE_FALLBACK_PROVIDER: ProviderConfig = {
   type: 'edgeone',
@@ -483,8 +484,18 @@ async function handleVerify(id: number) {
   try {
     const res = await verifyDnsCredential(id);
     verifyResults.value[id] = !!res.data?.valid;
+    verifyDetails.value[id] = {
+      zoneCount: res.data?.zoneCount,
+      visibleZones: res.data?.visibleZones,
+      warning: res.data?.warning,
+    };
+    if (res.data?.warning) message.warning(res.data.warning, { duration: 8000 });
+    else if (res.data?.valid && typeof res.data?.zoneCount === 'number') {
+      message.success(`凭证有效，可见 ${res.data.zoneCount} 个 Cloudflare 域名`);
+    }
   } catch {
     verifyResults.value[id] = false;
+    delete verifyDetails.value[id];
   } finally {
     verifying.value = null;
   }
@@ -550,6 +561,13 @@ const currentGuide = computed(() => PROVIDER_CREDENTIAL_GUIDE[formProvider.value
           </div>
           <p class="text-xs text-slate-500">
             ID: {{ cred.id }} &middot; 创建于 {{ formatDateSafe(cred.createdAt) }}
+          </p>
+          <p v-if="verifyDetails[cred.id]?.zoneCount !== undefined" class="mt-1 text-xs text-slate-500">
+            Cloudflare 可见域名（{{ verifyDetails[cred.id].zoneCount }}）：
+            {{ verifyDetails[cred.id].visibleZones?.join('、') || '无' }}
+          </p>
+          <p v-if="verifyDetails[cred.id]?.warning" class="mt-1 text-xs text-amber-600">
+            {{ verifyDetails[cred.id].warning }}
           </p>
         </div>
 

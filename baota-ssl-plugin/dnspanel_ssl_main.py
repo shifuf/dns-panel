@@ -392,6 +392,24 @@ def _match_site_for_domain(domain, sites):
     return None
 
 
+def _match_sites_for_domain(domain, sites):
+    """Return every BaoTa site that can use the certificate domain."""
+    d = (domain or "").strip().lower().lstrip("*.")
+    if not d:
+        return []
+    matched = []
+    seen = set()
+    for site in sites:
+        site_name = str(site.get("name") or "").strip()
+        candidates = [site_name.lower()]
+        candidates += [str(x).strip().lower().lstrip("*.") for x in (site.get("domains") or [])]
+        if any(c and (d == c or d.endswith("." + c) or c.endswith("." + d)) for c in candidates):
+            if site_name and site_name not in seen:
+                seen.add(site_name)
+                matched.append(site)
+    return matched
+
+
 def _cert_deployed(site_name):
     """True if a certificate file already exists in the site's BaoTa cert dir."""
     if not site_name:
@@ -1053,32 +1071,47 @@ server {
             event_id = event.get("id")
             domain = str(event.get("domain") or "").strip().lower()
             source = str(event.get("source") or "").strip().lower()
-            site = _match_site_for_domain(domain, sites)
-            matched = site.get("name") if site else ""
-            result_payload = {"status": "failed", "targetName": matched, "error": "未找到匹配站点"}
+            matched_sites = _match_sites_for_domain(domain, sites)
+            matched_names = [str(site.get("name") or "") for site in matched_sites if site.get("name")]
+            allowed_matches = [site for site in matched_sites if not allowed_sites or str(site.get("name") or "") in allowed_sites]
+            result_payload = {"status": "failed", "targetName": ", ".join(matched_names), "error": "未找到匹配站点"}
             if source not in allowed_sources:
                 result_payload = {"status": "skipped", "error": "证书来源不在部署白名单"}
                 event_skipped += 1
-            elif matched and allowed_sites and matched not in allowed_sites:
-                result_payload = {"status": "skipped", "targetName": matched, "error": "站点不在部署白名单"}
+            elif matched_sites and not allowed_matches:
+                result_payload = {"status": "skipped", "targetName": ", ".join(matched_names), "error": "匹配站点均不在部署白名单"}
                 event_skipped += 1
-            elif matched:
-                try:
-                    deploy_args = type("A", (), {})()
-                    deploy_args.certId = event.get("remoteCertId", "")
-                    deploy_args.credentialId = str(event.get("credentialId", ""))
-                    deploy_args.siteName = matched
-                    deployed_result = self.deploy(deploy_args)
-                    if deployed_result.get("status"):
-                        fingerprint = ((_get_config() or {}).get("deployedFingerprints") or {}).get(matched, "")
-                        result_payload = {"status": "success", "targetName": matched, "fingerprint": fingerprint}
-                        event_deployed += 1
-                    else:
-                        result_payload["error"] = deployed_result.get("msg") or "部署失败"
+            elif allowed_matches:
+                successes = []
+                failures = []
+                fingerprints = {}
+                for site in allowed_matches:
+                    matched = str(site.get("name") or "")
+                    try:
+                        deploy_args = type("A", (), {})()
+                        deploy_args.certId = event.get("remoteCertId", "")
+                        deploy_args.credentialId = str(event.get("credentialId", ""))
+                        deploy_args.siteName = matched
+                        deployed_result = self.deploy(deploy_args)
+                        if deployed_result.get("status"):
+                            fingerprint = ((_get_config() or {}).get("deployedFingerprints") or {}).get(matched, "")
+                            fingerprints[matched] = fingerprint
+                            successes.append(matched)
+                            event_deployed += 1
+                        else:
+                            failures.append(matched + ": " + str(deployed_result.get("msg") or "部署失败"))
+                            event_failed += 1
+                    except Exception as e:
+                        failures.append(matched + ": " + str(e))
                         event_failed += 1
-                except Exception as e:
-                    result_payload["error"] = str(e)
-                    event_failed += 1
+                result_payload = {
+                    "status": "failed" if failures else "success",
+                    "targetName": ", ".join([str(site.get("name") or "") for site in allowed_matches]),
+                    "fingerprint": json.dumps(fingerprints, ensure_ascii=False, separators=(",", ":")),
+                    "error": "; ".join(failures),
+                }
+                if failures and successes:
+                    result_payload["error"] = "部分站点部署失败（成功: " + ", ".join(successes) + "）：" + result_payload["error"]
             else:
                 event_failed += 1
             _panel_post("/ssl/deployment-events/" + str(event_id) + "/result", result_payload, timeout=30)
@@ -1119,28 +1152,30 @@ server {
                 skipped += 1
                 continue
             # Match cert domain to a site by name or bound domain.
-            site = _match_site_for_domain(domain, sites)
-            matched = site["name"] if site else None
-            if not matched:
+            matched_sites = _match_sites_for_domain(domain, sites)
+            if not matched_sites:
                 skipped += 1
                 continue
-            if fallback_allowed_sites and matched not in fallback_allowed_sites:
+            deployable_sites = [site for site in matched_sites if not fallback_allowed_sites or str(site.get("name") or "") in fallback_allowed_sites]
+            if not deployable_sites:
                 skipped += 1
                 continue
 
-            # Auto-deploy
-            try:
-                args_deploy = type("A", (), {})()
-                args_deploy.certId = cert.get("remoteCertId", "")
-                args_deploy.credentialId = str(cert.get("credentialId", ""))
-                args_deploy.siteName = matched
-                result = self.deploy(args_deploy)
-                if result.get("status"):
-                    deployed += 1
-                else:
+            # Auto-deploy to every matching whitelisted site.
+            for site in deployable_sites:
+                matched = str(site.get("name") or "")
+                try:
+                    args_deploy = type("A", (), {})()
+                    args_deploy.certId = cert.get("remoteCertId", "")
+                    args_deploy.credentialId = str(cert.get("credentialId", ""))
+                    args_deploy.siteName = matched
+                    result = self.deploy(args_deploy)
+                    if result.get("status"):
+                        deployed += 1
+                    else:
+                        skipped += 1
+                except Exception:
                     skipped += 1
-            except Exception:
-                skipped += 1
 
         # After deploying the fresh certs, ask the panel to prune superseded
         # certs (< keepDays remaining when a healthy newer one exists) and clean
