@@ -86,13 +86,37 @@ def normalize_domain(domain: str) -> str:
     return d
 
 
+def validate_domain(domain: str) -> str:
+    """Return a canonical DNS name and reject filesystem/argument abuse."""
+    d = normalize_domain(domain)
+    if not d or len(d) > 253 or any(ch in d for ch in ("/", "\\", "\x00")) or ".." in d:
+        raise AcmeApiError(f"无效域名: {domain}", 400)
+    wildcard = d.startswith("*.")
+    host = d[2:] if wildcard else d
+    try:
+        ascii_host = host.encode("idna").decode("ascii").lower()
+    except Exception:
+        raise AcmeApiError(f"无效域名: {domain}", 400)
+    labels = ascii_host.split(".")
+    if len(labels) < 2 or any(
+        not label or len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+        for label in labels
+    ):
+        raise AcmeApiError(f"无效域名: {domain}", 400)
+    return ("*." if wildcard else "") + ascii_host
+
+
 def _safe_dir_name(domain: str) -> str:
     """Filesystem-safe name for our managed cert dir (wildcards contain '*')."""
-    return normalize_domain(domain).replace("*", "_wildcard_")
+    return validate_domain(domain).replace("*", "_wildcard_")
 
 
 def _deployed_dir(primary: str) -> Path:
-    return Path(ACME_HOME) / "deployed" / _safe_dir_name(primary)
+    root = (Path(ACME_HOME) / "deployed").resolve()
+    target = (root / _safe_dir_name(primary)).resolve()
+    if target.parent != root:
+        raise AcmeApiError("证书目录越界", 400)
+    return target
 
 
 def _tail(text: str, lines: int = 12) -> str:
@@ -252,7 +276,9 @@ class AcmeService:
         account_id: str = "",
     ) -> Dict[str, Any]:
         """Issue (or re-issue) a cert for ``domains`` (domains[0] = primary)."""
-        norm = [normalize_domain(d) for d in domains if normalize_domain(d)]
+        if len(domains or []) > 100:
+            raise AcmeApiError("单张证书最多支持 100 个域名", 400)
+        norm = [validate_domain(d) for d in domains]
         if not norm:
             raise AcmeApiError("缺少有效域名", 400)
         primary = norm[0]
@@ -277,7 +303,7 @@ class AcmeService:
         account_id: str = "",
     ) -> Dict[str, Any]:
         """Force-renew an existing cert and re-read the refreshed PEM."""
-        p = normalize_domain(primary)
+        p = validate_domain(primary)
         if not p:
             raise AcmeApiError("缺少域名", 400)
         env: Dict[str, str] = {}
@@ -315,7 +341,7 @@ class AcmeService:
 
     def read_pem(self, primary: str) -> Dict[str, str]:
         """Return {publicKey, privateKey} for a previously issued cert."""
-        p = normalize_domain(primary)
+        p = validate_domain(primary)
         out_dir = _deployed_dir(p)
         fullchain = out_dir / "fullchain.pem"
         privkey = out_dir / "privkey.pem"
@@ -328,7 +354,7 @@ class AcmeService:
 
     def remove(self, primary: str) -> None:
         """Unregister from acme.sh auto-renew and delete local cert files."""
-        p = normalize_domain(primary)
+        p = validate_domain(primary)
         # Best effort — never block deletion of the DB row on acme.sh errors.
         if acme_available():
             try:

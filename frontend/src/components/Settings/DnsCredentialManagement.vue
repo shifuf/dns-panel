@@ -625,7 +625,7 @@ const currentGuide = computed(() => PROVIDER_CREDENTIAL_GUIDE[formProvider.value
           </p>
 
           <div class="space-y-4">
-            <template v-for="(field, idx) in selectedProviderConfig.authFields" :key="field.key">
+            <template v-for="field in selectedProviderConfig.authFields" :key="field.key">
               <NDivider
                 v-if="formProvider === 'dnspod' && field.key === 'tokenId'"
                 title-placement="left"

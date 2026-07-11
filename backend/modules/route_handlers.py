@@ -11,6 +11,7 @@ from modules.cache import (
     esa_sites_key, esa_records_key,
     acceleration_sites_key, acceleration_domains_key,
     ssl_certs_key, ssl_cert_detail_key, ssl_certs_all_key,
+    dashboard_summary_key,
 )
 from modules import acme_api
 from modules.acme_api import AcmeService, AcmeApiError
@@ -871,6 +872,314 @@ def _logs_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     self._err("接口不存在", 404)
 
 
+def _domain_expiry_days_remaining(expires_at: Any) -> int | None:
+    exp = parse_dt(expires_at)
+    if not exp:
+        return None
+    seconds = (exp - now()).total_seconds()
+    if seconds < 0:
+        return None
+    return int((seconds + 86399) // 86400)
+
+
+def _split_email_recipients(value: Any) -> List[str]:
+    recipients: List[str] = []
+    seen = set()
+    for item in re.split(r"[,;\s]+", str(value or "").strip()):
+        email = item.strip()
+        if not email or "@" not in email or email.lower() in seen:
+            continue
+        seen.add(email.lower())
+        recipients.append(email)
+    return recipients
+
+
+def _domain_expiry_payload(user_row: Any, due_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    domains = []
+    for item in due_results:
+        expires_at = str(item.get("expiresAt") or "")
+        domains.append(
+            {
+                "domain": item["domain"],
+                "expiresAt": expires_at,
+                "daysRemaining": item.get("daysRemaining"),
+                "source": item.get("source") or "unknown",
+                "checkedAt": item.get("checkedAt") or now_iso(),
+            }
+        )
+    threshold = int(user_row["domainExpiryThresholdDays"] or 7)
+    return {
+        "event": "domain_expiry_warning",
+        "thresholdDays": threshold,
+        "count": len(domains),
+        "domains": domains,
+        "generatedAt": now_iso(),
+    }
+
+
+def _send_domain_expiry_webhook(url: str, payload: Dict[str, Any]) -> None:
+    target = str(url or "").strip()
+    if not target:
+        raise ValueError("Webhook URL 未配置")
+    if not re.match(r"^https?://", target, re.IGNORECASE):
+        raise ValueError("Webhook URL 必须以 http:// 或 https:// 开头")
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        target,
+        method="POST",
+        data=data,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": "dns-panel-domain-expiry/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if int(getattr(resp, "status", 200)) < 200 or int(getattr(resp, "status", 200)) >= 300:
+                raise ValueError(f"Webhook 返回 HTTP {getattr(resp, 'status', 0)}")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+        raise ValueError(f"Webhook 返回 HTTP {exc.code}: {raw[:200]}")
+
+
+def _send_domain_expiry_email(user_row: Any, payload: Dict[str, Any]) -> None:
+    import smtplib
+    from email.message import EmailMessage
+
+    host = str(user_row["smtpHost"] or "").strip()
+    port = int(user_row["smtpPort"] or (465 if bool(user_row["smtpSecure"]) else 587))
+    secure = bool(user_row["smtpSecure"])
+    username = str(user_row["smtpUser"] or "").strip()
+    password = decrypt_text(user_row["smtpPass"]) if user_row["smtpPass"] else ""
+    sender = str(user_row["smtpFrom"] or username or "").strip()
+    recipients = _split_email_recipients(user_row["domainExpiryNotifyEmailTo"])
+    if not host:
+        raise ValueError("SMTP 服务器未配置")
+    if not sender:
+        raise ValueError("发件人未配置")
+    if not recipients:
+        raise ValueError("收件邮箱未配置")
+
+    domains = payload.get("domains") if isinstance(payload.get("domains"), list) else []
+    lines = [
+        f"DNS Panel 检测到 {len(domains)} 个域名即将到期。",
+        "",
+    ]
+    for item in domains:
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"- {item.get('domain')}：{item.get('expiresAt')}（剩余 {item.get('daysRemaining')} 天）")
+    lines.extend(["", f"检查时间：{payload.get('generatedAt')}"])
+
+    msg = EmailMessage()
+    msg["Subject"] = f"DNS Panel 域名到期提醒（{len(domains)} 个）"
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg.set_content("\n".join(lines))
+
+    if secure or port == 465:
+        with smtplib.SMTP_SSL(host, port, timeout=10) as smtp:
+            if username:
+                smtp.login(username, password)
+            smtp.send_message(msg)
+        return
+
+    with smtplib.SMTP(host, port, timeout=10) as smtp:
+        if port == 587:
+            smtp.starttls()
+        if username:
+            smtp.login(username, password)
+        smtp.send_message(msg)
+
+
+def _upsert_domain_expiry_tracking(uid: int, item: Dict[str, Any], days_remaining: int) -> None:
+    domain = norm_domain(item.get("domain"))
+    expires_at = str(item.get("expiresAt") or "").strip()
+    if not domain or not expires_at:
+        return
+    with conn() as c:
+        c.execute(
+            """
+            INSERT INTO domain_expiry_notifications (
+              userId, domain, expiresAt, daysRemaining, channels, status,
+              createdAt, updatedAt
+            )
+            VALUES (?, ?, ?, ?, ?, 'tracked', ?, ?)
+            ON CONFLICT(userId, domain, expiresAt) DO UPDATE SET
+              daysRemaining = excluded.daysRemaining,
+              updatedAt = excluded.updatedAt
+            """,
+            (
+                uid,
+                domain,
+                expires_at,
+                days_remaining,
+                json.dumps([], ensure_ascii=False),
+                now_iso(),
+                now_iso(),
+            ),
+        )
+        c.commit()
+
+
+def _delete_stale_domain_expiry_tracking(uid: int, item: Dict[str, Any]) -> None:
+    domain = norm_domain(item.get("domain"))
+    expires_at = str(item.get("expiresAt") or "").strip()
+    if not domain or not expires_at:
+        return
+    with conn() as c:
+        c.execute(
+            """
+            DELETE FROM domain_expiry_notifications
+            WHERE userId = ? AND domain = ? AND expiresAt != ?
+            """,
+            (uid, domain, expires_at),
+        )
+        c.commit()
+
+
+def _select_domain_expiry_tracking(uid: int, item: Dict[str, Any]) -> Any:
+    domain = norm_domain(item.get("domain"))
+    expires_at = str(item.get("expiresAt") or "").strip()
+    if not domain or not expires_at:
+        return None
+    with conn() as c:
+        return c.execute(
+            """
+            SELECT id, status, lastNotifiedAt
+            FROM domain_expiry_notifications
+            WHERE userId = ? AND domain = ? AND expiresAt = ?
+            LIMIT 1
+            """,
+            (uid, domain, expires_at),
+        ).fetchone()
+
+
+def _mark_domain_expiry_delivery(uid: int, due_results: List[Dict[str, Any]], status: str, deliveries: List[Dict[str, Any]]) -> None:
+    channels = json.dumps(deliveries, ensure_ascii=False)
+    errors = "; ".join(str(item.get("error") or "") for item in deliveries if item.get("error")) or None
+    notified_at = now_iso() if status in {"sent", "partial"} else None
+    with conn() as c:
+        for item in due_results:
+            domain = norm_domain(item.get("domain"))
+            expires_at = str(item.get("expiresAt") or "").strip()
+            if not domain or not expires_at:
+                continue
+            c.execute(
+                """
+                UPDATE domain_expiry_notifications
+                SET status = ?, channels = ?, errorMessage = ?, lastNotifiedAt = COALESCE(?, lastNotifiedAt),
+                    updatedAt = ?
+                WHERE userId = ? AND domain = ? AND expiresAt = ?
+                """,
+                (status, channels, errors, notified_at, now_iso(), uid, domain, expires_at),
+            )
+        c.commit()
+
+
+def _process_domain_expiry_notifications(uid: int, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    with conn() as c:
+        user_row = c.execute(
+            """
+            SELECT id, username, email,
+                   domainExpiryThresholdDays, domainExpiryNotifyEnabled,
+                   domainExpiryNotifyWebhookUrl, domainExpiryNotifyEmailEnabled,
+                   domainExpiryNotifyEmailTo, smtpHost, smtpPort, smtpSecure,
+                   smtpUser, smtpPass, smtpFrom
+            FROM users
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (uid,),
+        ).fetchone()
+    if not user_row:
+        return {"tracked": 0, "notified": 0}
+
+    threshold = int(user_row["domainExpiryThresholdDays"] or 7)
+    track_window = max(30, threshold)
+    tracked = 0
+    due: List[Dict[str, Any]] = []
+
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        expires_at = str(item.get("expiresAt") or "").strip()
+        if not expires_at:
+            continue
+        days = _domain_expiry_days_remaining(expires_at)
+        if days is None:
+            continue
+        normalized = {
+            **item,
+            "domain": norm_domain(item.get("domain")),
+            "expiresAt": expires_at,
+            "daysRemaining": days,
+        }
+        _delete_stale_domain_expiry_tracking(uid, normalized)
+        if days <= track_window:
+            _upsert_domain_expiry_tracking(uid, normalized, days)
+            tracked += 1
+        if days <= threshold:
+            row = _select_domain_expiry_tracking(uid, normalized)
+            if row and str(row["status"] or "") in {"sent", "partial"} and row["lastNotifiedAt"]:
+                continue
+            due.append(normalized)
+
+    cache_delete_pattern(dashboard_summary_key(uid))
+
+    deliveries: List[Dict[str, Any]] = []
+    if not due:
+        return {"tracked": tracked, "notified": 0}
+
+    webhook_url = str(user_row["domainExpiryNotifyWebhookUrl"] or "").strip()
+    if bool(user_row["domainExpiryNotifyEnabled"]) and webhook_url:
+        try:
+            _send_domain_expiry_webhook(webhook_url, _domain_expiry_payload(user_row, due))
+            deliveries.append({"channel": "webhook", "status": "success"})
+        except Exception as exc:
+            deliveries.append({"channel": "webhook", "status": "failed", "error": str(exc)})
+
+    if bool(user_row["domainExpiryNotifyEmailEnabled"]):
+        try:
+            _send_domain_expiry_email(user_row, _domain_expiry_payload(user_row, due))
+            deliveries.append({"channel": "email", "status": "success"})
+        except Exception as exc:
+            deliveries.append({"channel": "email", "status": "failed", "error": str(exc)})
+
+    if not deliveries:
+        return {"tracked": tracked, "notified": 0}
+
+    success_count = sum(1 for item in deliveries if item.get("status") == "success")
+    if success_count == len(deliveries):
+        delivery_status = "sent"
+    elif success_count > 0:
+        delivery_status = "partial"
+    else:
+        delivery_status = "failed"
+    _mark_domain_expiry_delivery(uid, due, delivery_status, deliveries)
+
+    try:
+        create_log(
+            user_id=uid,
+            action="NOTIFY",
+            resource_type="DOMAIN_EXPIRY",
+            status="SUCCESS" if success_count > 0 else "FAILED",
+            record_name="domain_expiry_warning",
+            new_value=json.dumps(
+                {
+                    "count": len(due),
+                    "channels": deliveries,
+                    "thresholdDays": threshold,
+                },
+                ensure_ascii=False,
+            ),
+            error_message="; ".join(str(item.get("error") or "") for item in deliveries if item.get("error")) or None,
+        )
+    except Exception:
+        pass
+    return {"tracked": tracked, "notified": len(due), "deliveryStatus": delivery_status}
+
+
 def _domain_expiry_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     sub = path[len("/api/domain-expiry") :] or "/"
     auth_user = self._auth()
@@ -903,6 +1212,12 @@ def _domain_expiry_routes(self, path: str, q: Dict[str, List[str]], b: bytes) ->
                 results = list(pool.map(self._lookup_domain_expiry_single, unique))
         else:
             results = []
+        try:
+            uid = int(auth_user.get("id") or 0)
+            if uid > 0:
+                _process_domain_expiry_notifications(uid, results)
+        except Exception:
+            pass
         self._ok({"results": results}, "获取域名到期信息成功")
         return
 
@@ -4409,6 +4724,26 @@ def _dashboard(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         self._err(str(e), 500); return
     self._err("接口不存在", 404)
 
+def _ssl_filter_and_summarize(certs: list, status_filter: str = "", source_filter: str = "") -> Dict[str, Any]:
+    """Return full-set summaries plus server-side source/status filtered rows."""
+    normalized = []
+    for item in certs or []:
+        cert = dict(item)
+        source = str(cert.get("source") or "").strip().lower()
+        if not source:
+            source = "letsencrypt" if str(cert.get("provider") or "").lower() == "acme" else "tencent"
+        cert["source"] = source
+        normalized.append(cert)
+    source_summary: Dict[str, int] = {}
+    for cert in normalized:
+        source_summary[cert["source"]] = source_summary.get(cert["source"], 0) + 1
+    by_source = [c for c in normalized if not source_filter or c["source"] == source_filter]
+    status_summary: Dict[str, int] = {}
+    for cert in by_source:
+        status = str(cert.get("status") or "applying")
+        status_summary[status] = status_summary.get(status, 0) + 1
+    filtered = [c for c in by_source if not status_filter or str(c.get("status") or "") == status_filter]
+    return {"certs": filtered, "statusSummary": status_summary, "sourceSummary": source_summary}
 
 
 def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
@@ -4420,8 +4755,37 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         self._err("无效用户", 401)
         return
 
+    def _require_api_scope(required: str) -> bool:
+        if not u.get("_api_token"):
+            return True
+        scopes = set(u.get("_api_scopes") or [])
+        if "*" in scopes or required in scopes:
+            return True
+        self._err(f"当前 API Token 缺少权限: {required}", 403)
+        return False
+
     sub = path[len("/api/ssl"):]
     body = self._json_body(b)
+
+    if u.get("_api_token"):
+        if self.command == "GET" and not _require_api_scope("ssl:read"):
+            return
+        if self.command == "POST":
+            required = None
+            if sub in ("/certificates/issue-acme", "/certificates/apply"):
+                required = "ssl:issue"
+            elif sub in ("/auto-renew", "/auto-renew/", "/certificates/renew-expired", "/certificates/prune-superseded") or sub.endswith("/auto-renew"):
+                required = "ssl:renew"
+            elif sub == "/certificates/sync" or sub.startswith("/deployment-events"):
+                required = "ssl:deploy"
+            if required and not _require_api_scope(required):
+                return
+            if required is None:
+                self._err("当前 API Token 不允许执行该 SSL 写操作", 403)
+                return
+        elif self.command not in ("GET", "POST"):
+            self._err("当前 API Token 不允许执行该 SSL 写操作", 403)
+            return
 
     def _get_cred_id(source: Any = None) -> str | None:
         v = source if source is not None else (body.get("credentialId") or first_or_none(q, "credentialId"))
@@ -4445,7 +4809,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 if not remote_id:
                     continue
                 existing = c.execute(
-                    "SELECT id FROM ssl_certificates WHERE userId = ? AND provider = ? AND remoteCertId = ?",
+                    "SELECT id, notAfter, status FROM ssl_certificates WHERE userId = ? AND provider = ? AND remoteCertId = ?",
                     (uid, provider, remote_id),
                 ).fetchone()
                 if existing:
@@ -4473,6 +4837,14 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                             existing["id"],
                         ),
                     )
+                    if cert.get("status") == "issued" and str(existing["notAfter"] or "") != str(cert.get("notAfter") or ""):
+                        c.execute(
+                            """UPDATE ssl_deployment_events SET status = 'queued', attempts = 0, error = NULL,
+                                 nextAttemptAt = NULL, targetName = NULL, fingerprint = NULL,
+                                 startedAt = NULL, completedAt = NULL, updatedAt = ?
+                               WHERE userId = ? AND provider = ? AND remoteCertId = ?""",
+                            (ts, uid, provider, remote_id),
+                        )
                 else:
                     c.execute(
                         """INSERT INTO ssl_certificates
@@ -4506,6 +4878,8 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             san_val = json.loads(san_raw) if san_raw else []
         except Exception:
             san_val = san_raw or []
+        global_auto_renew = get_system_setting("sslAutoRenewEnabled", "0") == "1"
+        cert_auto_renew = bool(row["autoRenew"]) if "autoRenew" in row.keys() else True
         return {
             "id": row["id"],
             "remoteCertId": row["remoteCertId"],
@@ -4526,13 +4900,62 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             "isUploaded": False,
             "remoteCreatedAt": row["remoteCreatedAt"] or row["createdAt"],
             "syncedAt": row["syncedAt"] or "",
-            "autoRenew": bool(row["autoRenew"]) if "autoRenew" in row.keys() else True,
+            "autoRenew": cert_auto_renew,
+            "globalAutoRenew": global_auto_renew,
+            "effectiveAutoRenew": global_auto_renew and cert_auto_renew,
             "lastRenewedAt": row["lastRenewedAt"] if "lastRenewedAt" in row.keys() else "",
             "renewError": row["renewError"] if "renewError" in row.keys() else "",
         }
 
     def _list_acme_certs(search: str = "", filter_cred: str = "") -> list:
         """Return acme certs from the DB, joined to their DNS credential name."""
+        # A process/container restart can interrupt the daemon issue worker and
+        # otherwise leave a certificate stuck in "applying" forever. Reconcile
+        # completed files first; mark only genuinely stale applications failed.
+        with conn() as c:
+            applying_rows = c.execute(
+                """SELECT id, domain, certType, updatedAt
+                   FROM ssl_certificates
+                   WHERE userId = ? AND provider = 'acme' AND status = 'applying'""",
+                (uid,),
+            ).fetchall()
+        for applying_row in applying_rows:
+            updated_at = parse_dt(applying_row["updatedAt"])
+            if not updated_at or (now() - updated_at).total_seconds() <= 20 * 60:
+                continue
+            try:
+                svc = acme_api.AcmeService(key_length=str(applying_row["certType"] or "2048"))
+                pem = svc.read_pem(str(applying_row["domain"] or ""))
+                meta = acme_api.parse_cert_pem(pem["publicKey"])
+                ts = now_iso()
+                with conn() as c:
+                    c.execute(
+                        """UPDATE ssl_certificates SET status = 'issued', statusMsg = '',
+                             notBefore = ?, notAfter = ?, san = ?, issuer = ?,
+                             syncedAt = ?, updatedAt = ? WHERE id = ?""",
+                        (
+                            meta.get("notBefore", ""), meta.get("notAfter", ""),
+                            json.dumps(meta.get("san") or [], ensure_ascii=False),
+                            meta.get("issuer", "Let's Encrypt"), ts, ts, applying_row["id"],
+                        ),
+                    )
+                    c.commit()
+                continue
+            except Exception:
+                pass
+
+            with conn() as c:
+                c.execute(
+                    """UPDATE ssl_certificates
+                       SET status = 'failed',
+                           statusMsg = '签发任务已中断或超时，请重新申请',
+                           renewError = '签发任务已中断或超时，请重新申请',
+                           updatedAt = ?
+                       WHERE id = ? AND status = 'applying'""",
+                    (now_iso(), applying_row["id"]),
+                )
+                c.commit()
+
         with conn() as c:
             rows = c.execute(
                 """SELECT s.*, d.name AS credentialName
@@ -4573,7 +4996,303 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             account_id = ""
         return row, provider, secrets, account_id
 
+    def _validate_acme_managed_domains(provider: str, secrets: Dict[str, Any], domains: List[str]) -> None:
+        """Fail early when a credential with zone-list support cannot manage every SAN.
+
+        Aliyun credentials remain supported by acme.sh, but this project has no
+        AliDNS API client to enumerate their zones, so verification is delegated
+        to acme.sh for that provider.
+        """
+        api_obj = None
+        if provider == "cloudflare":
+            token = str(secrets.get("apiToken") or "").strip()
+            if token:
+                api_obj = CloudflareApi(token)
+        elif provider in ("dnspod", "dnspod_token"):
+            api_obj = DnspodApi(secrets)
+        if api_obj is None:
+            return
+        try:
+            zones = []
+            for page_no in range(1, 21):
+                page_result = api_obj.list_zones(page_no, 200)
+                batch = page_result.get("zones", [])
+                if not isinstance(batch, list):
+                    batch = []
+                zones.extend(batch)
+                try:
+                    total = int(page_result.get("total") or len(zones))
+                except Exception:
+                    total = len(zones)
+                if not batch or len(zones) >= total:
+                    break
+        except Exception as exc:
+            raise ValueError(f"无法验证 DNS 凭证的域名管理范围: {exc}")
+        zone_names = {
+            str(zone.get("name") or "").strip().lower().rstrip(".")
+            for zone in zones if isinstance(zone, dict)
+        }
+        unmanaged = []
+        for domain_name in domains:
+            host = str(domain_name or "").lower().lstrip("*.").rstrip(".")
+            if not any(host == zone or host.endswith("." + zone) for zone in zone_names if zone):
+                unmanaged.append(domain_name)
+        if unmanaged:
+            raise ValueError("所选 DNS 凭证无法管理以下域名: " + "、".join(unmanaged))
+
+    def _ensure_deployment_events() -> None:
+        """Create one idempotent deployment event for every deployable certificate."""
+        ts = now_iso()
+        with conn() as c:
+            rows = c.execute(
+                """SELECT provider, remoteCertId, credentialId, domain
+                   FROM ssl_certificates
+                   WHERE userId = ? AND status = 'issued' AND TRIM(domain) != ''""",
+                (uid,),
+            ).fetchall()
+            for row in rows:
+                source = "letsencrypt" if row["provider"] == "acme" else "tencent"
+                c.execute(
+                    """INSERT OR IGNORE INTO ssl_deployment_events
+                       (userId, provider, remoteCertId, credentialId, domain, source, status, createdAt, updatedAt)
+                       VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                    (uid, row["provider"], row["remoteCertId"], row["credentialId"], row["domain"], source, ts, ts),
+                )
+                c.execute(
+                    """UPDATE ssl_deployment_events SET credentialId = ?, domain = ?, source = ?
+                       WHERE userId = ? AND provider = ? AND remoteCertId = ?""",
+                    (row["credentialId"], row["domain"], source, uid, row["provider"], row["remoteCertId"]),
+                )
+            c.commit()
+
     try:
+        # Deployment event queue consumed by site deployment plugins.
+        if self.command == "GET" and sub == "/deployment-events":
+            _ensure_deployment_events()
+            with conn() as c:
+                rows = c.execute(
+                    """SELECT * FROM ssl_deployment_events WHERE userId = ?
+                       ORDER BY createdAt DESC LIMIT 100""",
+                    (uid,),
+                ).fetchall()
+            self._ok([dict(row) for row in rows], "获取证书部署事件成功")
+            return
+
+        if self.command == "POST" and sub == "/deployment-events/claim":
+            _ensure_deployment_events()
+            with conn() as c:
+                c.execute("BEGIN IMMEDIATE")
+                c.execute(
+                    """UPDATE ssl_deployment_events SET status = 'queued', error = '部署执行中断，已重新排队',
+                         startedAt = NULL, updatedAt = ?
+                       WHERE userId = ? AND status = 'running'
+                         AND datetime(updatedAt) < datetime('now', '-10 minutes')""",
+                    (now_iso(), uid),
+                )
+                row = c.execute(
+                    """SELECT * FROM ssl_deployment_events
+                       WHERE userId = ? AND status IN ('queued', 'failed') AND attempts < 5
+                         AND (nextAttemptAt IS NULL OR datetime(nextAttemptAt) <= datetime('now'))
+                       ORDER BY createdAt ASC LIMIT 1""",
+                    (uid,),
+                ).fetchone()
+                if row is None:
+                    c.commit()
+                    self._ok(None, "暂无待部署证书")
+                    return
+                c.execute(
+                    """UPDATE ssl_deployment_events SET status = 'running', attempts = attempts + 1,
+                         startedAt = COALESCE(startedAt, ?), updatedAt = ?, error = NULL
+                       WHERE id = ? AND status IN ('queued', 'failed')""",
+                    (now_iso(), now_iso(), row["id"]),
+                )
+                if c.execute("SELECT changes()").fetchone()[0] != 1:
+                    c.rollback()
+                    self._ok(None, "部署事件已被其他执行器领取")
+                    return
+                c.commit()
+            payload = dict(row)
+            payload["attempts"] = int(row["attempts"] or 0) + 1
+            self._ok(payload, "已领取证书部署事件")
+            return
+
+        m_deploy_result = re.fullmatch(r"/deployment-events/(\d+)/result", sub)
+        if self.command == "POST" and m_deploy_result:
+            event_id = int(m_deploy_result.group(1))
+            result_status = str(body.get("status") or "failed").strip().lower()
+            if result_status not in ("success", "failed", "skipped"):
+                self._err("无效部署结果状态", 400)
+                return
+            with conn() as c:
+                event = c.execute(
+                    "SELECT * FROM ssl_deployment_events WHERE id = ? AND userId = ?",
+                    (event_id, uid),
+                ).fetchone()
+                if event is None:
+                    self._err("部署事件不存在", 404)
+                    return
+                if str(event["status"] or "") != "running":
+                    self._err("部署事件未处于执行中，拒绝重复或过期回执", 409)
+                    return
+                attempts = int(event["attempts"] or 0)
+                error = str(body.get("error") or "")[:500]
+                next_attempt = None
+                stored_status = result_status
+                if result_status == "failed" and attempts < 5:
+                    delay = min(3600, 60 * (2 ** max(0, attempts - 1)))
+                    next_attempt = (now() + timedelta(seconds=delay)).isoformat().replace("+00:00", "Z")
+                c.execute(
+                    """UPDATE ssl_deployment_events SET status = ?, targetName = ?, fingerprint = ?,
+                         error = ?, nextAttemptAt = ?, completedAt = ?, updatedAt = ? WHERE id = ?""",
+                    (
+                        stored_status, str(body.get("targetName") or "")[:253],
+                        str(body.get("fingerprint") or "")[:128], error, next_attempt,
+                        now_iso() if result_status in ("success", "skipped") or attempts >= 5 else None,
+                        now_iso(), event_id,
+                    ),
+                )
+                c.commit()
+            self._ok({"id": event_id, "status": stored_status, "nextAttemptAt": next_attempt}, "部署结果已记录")
+            return
+
+        # ACME task management for visibility and manual recovery.
+        if self.command == "GET" and sub == "/acme-jobs":
+            with conn() as c:
+                rows = c.execute(
+                    "SELECT * FROM ssl_acme_jobs WHERE userId = ? ORDER BY createdAt DESC LIMIT 100",
+                    (uid,),
+                ).fetchall()
+            self._ok([dict(row) for row in rows], "获取 ACME 任务成功")
+            return
+
+        m_job_action = re.fullmatch(r"/acme-jobs/(\d+)/(retry|cancel)", sub)
+        if self.command == "POST" and m_job_action:
+            job_id = int(m_job_action.group(1))
+            action = m_job_action.group(2)
+            with conn() as c:
+                job = c.execute("SELECT id, certificateId, operation, status FROM ssl_acme_jobs WHERE id = ? AND userId = ?", (job_id, uid)).fetchone()
+                if job is None:
+                    self._err("ACME 任务不存在", 404)
+                    return
+                if action == "retry":
+                    c.execute("UPDATE ssl_acme_jobs SET status = 'queued', attempts = 0, error = NULL, startedAt = NULL, completedAt = NULL, updatedAt = ? WHERE id = ? AND status IN ('failed', 'cancelled')", (now_iso(), job_id))
+                else:
+                    c.execute("UPDATE ssl_acme_jobs SET status = 'cancelled', completedAt = ?, updatedAt = ? WHERE id = ? AND status IN ('queued', 'failed')", (now_iso(), now_iso(), job_id))
+                if c.execute("SELECT changes()").fetchone()[0] != 1:
+                    c.rollback()
+                    self._err("当前任务状态不允许" + ("重试" if action == "retry" else "取消"), 409)
+                    return
+                if action == "retry":
+                    if str(job["operation"] or "issue") == "issue":
+                        c.execute(
+                            "UPDATE ssl_certificates SET status = 'applying', statusMsg = '任务已重新排队', renewError = '', updatedAt = ? WHERE id = ? AND userId = ?",
+                            (now_iso(), job["certificateId"], uid),
+                        )
+                    else:
+                        c.execute(
+                            "UPDATE ssl_certificates SET renewError = '', updatedAt = ? WHERE id = ? AND userId = ?",
+                            (now_iso(), job["certificateId"], uid),
+                        )
+                else:
+                    c.execute(
+                        "UPDATE ssl_certificates SET status = 'cancelled', statusMsg = '签发任务已取消', updatedAt = ? WHERE id = ? AND userId = ? AND status = 'applying' AND ? = 'issue'",
+                        (now_iso(), job["certificateId"], uid, str(job["operation"] or "issue")),
+                    )
+                c.commit()
+            self._ok({"id": job_id, "status": "queued" if action == "retry" else "cancelled"}, "ACME 任务已" + ("重新排队" if action == "retry" else "取消"))
+            return
+
+        # Internal persisted ACME job runner. The app worker calls this endpoint;
+        # queued/running rows remain in SQLite across restarts.
+        if self.command == "POST" and sub == "/acme-jobs/process":
+            if not u.get("_internal"):
+                self._err("该接口仅供内部任务执行器调用", 403)
+                return
+            with conn() as c:
+                c.execute("BEGIN IMMEDIATE")
+                c.execute(
+                    """UPDATE ssl_acme_jobs SET status = 'queued', error = '任务中断，已自动重新排队',
+                         startedAt = NULL, updatedAt = ?
+                       WHERE userId = ? AND status = 'running'
+                         AND datetime(updatedAt) < datetime('now', '-20 minutes')""",
+                    (now_iso(), uid),
+                )
+                job = c.execute(
+                    """SELECT * FROM ssl_acme_jobs
+                       WHERE userId = ? AND status = 'queued' AND attempts < 3
+                       ORDER BY createdAt ASC LIMIT 1""",
+                    (uid,),
+                ).fetchone()
+                if job is None:
+                    c.commit()
+                    self._ok(None, "暂无待处理 ACME 任务")
+                    return
+                c.execute(
+                    """UPDATE ssl_acme_jobs SET status = 'running', attempts = attempts + 1,
+                         startedAt = COALESCE(startedAt, ?), updatedAt = ?, error = NULL
+                         WHERE id = ? AND status = 'queued'""",
+                    (now_iso(), now_iso(), job["id"]),
+                )
+                if c.execute("SELECT changes()").fetchone()[0] != 1:
+                    c.rollback()
+                    self._ok(None, "任务已被其他执行器领取")
+                    return
+                c.commit()
+
+            attempts = int(job["attempts"] or 0) + 1
+            try:
+                dns_row, dns_provider, dns_secrets, account_id = _acme_dns_context(str(job["dnsCredentialId"]))
+                domains = json.loads(job["domains"] or "[]")
+                if not isinstance(domains, list) or not domains:
+                    domains = [job["domain"]]
+                svc = acme_api.AcmeService(key_length=str(job["keyLength"] or "2048"))
+                meta = svc.issue(domains, dns_provider, dns_secrets, account_id)
+                ts = now_iso()
+                with conn() as c:
+                    c.execute(
+                        """UPDATE ssl_certificates SET status = 'issued', statusMsg = '',
+                             notBefore = ?, notAfter = ?, san = ?, issuer = ?, lastRenewedAt = ?,
+                             renewError = '', syncedAt = ?, updatedAt = ? WHERE id = ?""",
+                        (
+                            meta.get("notBefore", ""), meta.get("notAfter", ""),
+                            json.dumps(meta.get("san") or domains, ensure_ascii=False),
+                            meta.get("issuer", "Let's Encrypt"), ts, ts, ts, job["certificateId"],
+                        ),
+                    )
+                    c.execute(
+                        """UPDATE ssl_acme_jobs SET status = 'success', completedAt = ?, updatedAt = ?, error = NULL
+                           WHERE id = ?""",
+                        (ts, ts, job["id"]),
+                    )
+                    c.execute(
+                        """UPDATE ssl_deployment_events SET status = 'queued', attempts = 0, error = NULL,
+                             nextAttemptAt = NULL, targetName = NULL, fingerprint = NULL,
+                             startedAt = NULL, completedAt = NULL, updatedAt = ?
+                           WHERE userId = ? AND provider = 'acme' AND remoteCertId = ?""",
+                        (ts, uid, job["domain"]),
+                    )
+                    c.commit()
+                cache_delete_pattern(f"ssl:certs:all:user:{uid}:*")
+                self._ok({"jobId": job["id"], "certificateId": job["certificateId"]}, "ACME 任务处理成功")
+                return
+            except Exception as ex:
+                final = attempts >= 3
+                next_status = "failed" if final else "queued"
+                cert_status = "failed" if final else "applying"
+                msg = str(ex)[:500]
+                with conn() as c:
+                    c.execute(
+                        "UPDATE ssl_acme_jobs SET status = ?, error = ?, updatedAt = ?, completedAt = ? WHERE id = ?",
+                        (next_status, msg, now_iso(), now_iso() if final else None, job["id"]),
+                    )
+                    c.execute(
+                        "UPDATE ssl_certificates SET status = ?, statusMsg = ?, renewError = ?, updatedAt = ? WHERE id = ?",
+                        (cert_status, (msg if final else f"签发失败，等待自动重试（{attempts}/3）：{msg}"), msg, now_iso(), job["certificateId"]),
+                    )
+                    c.commit()
+                self._ok({"jobId": job["id"], "retrying": not final}, "ACME 任务失败，已重试排队" if not final else "ACME 任务失败")
+                return
+
         # GET/POST /api/ssl/auto-renew — auto-renewal toggle + status
         if sub in ("/auto-renew", "/auto-renew/"):
             if self.command == "GET":
@@ -4707,6 +5426,11 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             limit = min(100, max(1, int(first_or_none(q, "limit") or "20")))
             search = first_or_none(q, "search") or ""
             filter_cred = first_or_none(q, "filterCredentialId") or ""
+            status_filter = (first_or_none(q, "status") or "").strip().lower()
+            source_filter = (first_or_none(q, "source") or "").strip().lower()
+            if source_filter not in ("", "tencent", "letsencrypt"):
+                self._err("无效的证书来源筛选", 400)
+                return
 
             # ── Aggregated multi-credential view (parallel fetch + short cache) ──
             if cred_id_raw == "all":
@@ -4740,11 +5464,22 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         cr, sid, skey = args
                         try:
                             cr_api = TencentSslApi(sid, skey)
-                            r = cr_api.list_certificates(offset=0, limit=100, search_key=search or None)
-                            for cert in r.get("certificates", []):
-                                cert["credentialId"] = cr["id"]
-                                cert["credentialName"] = cr["name"]
-                            return r.get("certificates", []), None
+                            certificates: list = []
+                            offset = 0
+                            while True:
+                                r = cr_api.list_certificates(offset=offset, limit=100, search_key=search or None)
+                                batch = r.get("certificates", [])
+                                for cert in batch:
+                                    cert["credentialId"] = cr["id"]
+                                    cert["credentialName"] = cr["name"]
+                                    cert["provider"] = "tencent_ssl"
+                                    cert["source"] = "tencent"
+                                certificates.extend(batch)
+                                total_count = int(r.get("totalCount") or len(certificates))
+                                if len(batch) < 100 or len(certificates) >= total_count:
+                                    break
+                                offset += 100
+                            return certificates, None
                         except Exception as ex:
                             return [], {"credentialId": cr["id"], "name": cr["name"], "error": str(ex)}
 
@@ -4757,7 +5492,8 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                                 if err is not None:
                                     errors.append(err)
                                 all_certs.extend(certs)
-                    cache_set(agg_cache_k, {"certs": all_certs, "errors": errors}, 60)
+                    agg_ttl = 10 if any(c.get("status") in ("applying", "validating") for c in all_certs) else 60
+                    cache_set(agg_cache_k, {"certs": all_certs, "errors": errors}, agg_ttl)
 
                 # Merge locally-stored acme certs (not backed by a cloud list API).
                 try:
@@ -4765,6 +5501,8 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 except Exception:
                     pass
 
+                summarized = _ssl_filter_and_summarize(all_certs, status_filter, source_filter)
+                all_certs = summarized["certs"]
                 all_certs.sort(key=lambda x: x.get("remoteCreatedAt", ""), reverse=True)
                 total = len(all_certs)
                 offset = (page_num - 1) * limit
@@ -4773,6 +5511,8 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     "success": True,
                     "message": "获取证书列表成功（聚合·缓存）" if agg_cached is not None else "获取证书列表成功（聚合）",
                     "data": paged,
+                    "statusSummary": summarized["statusSummary"],
+                    "sourceSummary": summarized["sourceSummary"],
                     "pagination": {
                         "total": total,
                         "page": page_num,
@@ -4798,6 +5538,8 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     c2 = dict(cert)
                     c2["credentialId"] = cred_row["id"]
                     c2["credentialName"] = cred_row["name"]
+                    c2["provider"] = "tencent_ssl"
+                    c2["source"] = "tencent"
                     certs_out.append(c2)
                 self._paged(certs_out, cached["totalCount"], page_num, limit, "获取证书列表成功（缓存）")
                 return
@@ -4809,8 +5551,11 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 c2 = dict(cert)
                 c2["credentialId"] = cred_row["id"]
                 c2["credentialName"] = cred_row["name"]
+                c2["provider"] = "tencent_ssl"
+                c2["source"] = "tencent"
                 certs_out.append(c2)
-            cache_set(cache_k, result, 120)
+            result_ttl = 10 if any(c.get("status") in ("applying", "validating") for c in result.get("certificates", [])) else 120
+            cache_set(cache_k, result, result_ttl)
             self._paged(certs_out, result["totalCount"], page_num, limit, "获取证书列表成功")
             return
 
@@ -4822,6 +5567,27 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             if not cred_id_raw:
                 self._err("缺少 credentialId 参数", 400)
                 return
+
+            # Let's Encrypt certificates are stored locally and their
+            # credentialId points to a DNS credential, not a Tencent SSL API
+            # credential. Return the local detail before entering _ssl_api().
+            with conn() as c:
+                acme_row = c.execute(
+                    """SELECT s.*, d.name AS credentialName
+                       FROM ssl_certificates s
+                       LEFT JOIN dns_credentials d ON d.id = s.credentialId
+                       WHERE s.userId = ? AND s.provider = 'acme'
+                         AND s.remoteCertId = ?
+                       LIMIT 1""",
+                    (uid, cert_id),
+                ).fetchone()
+            if acme_row is not None:
+                detail = _acme_row_to_cert(acme_row)
+                detail["dvAuths"] = []
+                detail["deployedResources"] = []
+                self._ok(detail, "获取 Let's Encrypt 证书详情成功")
+                return
+
             cred_row, api = _ssl_api(cred_id_raw)
             cred_id = int(cred_row["id"])
 
@@ -5020,10 +5786,12 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         # acme.sh (DNS-01). Long-running (waits for DNS propagation), so we insert
         # an 'applying' row, return immediately, and finish in a background thread.
         if self.command == "POST" and sub == "/certificates/issue-acme":
+            if not _require_api_scope("ssl:issue"):
+                return
             if not acme_api.acme_available():
                 self._err("acme.sh 未安装，签发功能仅在 Docker 部署环境可用", 503)
                 return
-            domain = acme_api.normalize_domain(str(body.get("domain") or ""))
+            domain = acme_api.validate_domain(str(body.get("domain") or ""))
             dns_cred_id_raw = _get_cred_id(body.get("dnsCredentialId"))
             key_length = str(body.get("keyLength") or "2048").strip() or "2048"
             extra = body.get("altNames") if isinstance(body.get("altNames"), list) else []
@@ -5031,15 +5799,23 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 self._err("缺少 domain 参数", 400)
                 return
             try:
-                dns_row, dns_provider, dns_secrets, account_id = _acme_dns_context(dns_cred_id_raw)
+                dns_row, _dns_provider, _dns_secrets, _account_id = _acme_dns_context(dns_cred_id_raw)
             except ValueError as ve:
                 self._err(str(ve), 400)
                 return
             dns_cred_id = int(dns_row["id"])
-            domains = [domain] + [acme_api.normalize_domain(str(d)) for d in extra if acme_api.normalize_domain(str(d))]
+            if len(extra) > 99:
+                self._err("单张证书最多支持 100 个域名", 400)
+                return
+            domains = [domain] + [acme_api.validate_domain(str(d)) for d in extra]
             # De-dup while preserving order (primary first).
             seen: set = set()
             domains = [d for d in domains if not (d in seen or seen.add(d))]
+            try:
+                _validate_acme_managed_domains(_dns_provider, _dns_secrets, domains)
+            except ValueError as ve:
+                self._err(str(ve), 400)
+                return
             san_json = json.dumps(domains, ensure_ascii=False)
             ts = now_iso()
 
@@ -5071,38 +5847,53 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     cert_row_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
                 c.commit()
 
-            def _issue_worker():
-                svc = acme_api.AcmeService(key_length=key_length)
-                try:
-                    meta = svc.issue(domains, dns_provider, dns_secrets, account_id)
-                    with conn() as c2:
-                        c2.execute(
-                            """UPDATE ssl_certificates SET status = 'issued', statusMsg = '',
-                                 notBefore = ?, notAfter = ?, san = ?, issuer = ?,
-                                 lastRenewedAt = ?, renewError = '', syncedAt = ?, updatedAt = ?
-                               WHERE id = ?""",
-                            (
-                                meta.get("notBefore", ""), meta.get("notAfter", ""),
-                                json.dumps(meta.get("san") or domains, ensure_ascii=False),
-                                meta.get("issuer", "Let's Encrypt"),
-                                now_iso(), now_iso(), now_iso(), cert_row_id,
-                            ),
-                        )
-                        c2.commit()
-                except Exception as ex:
-                    with conn() as c2:
-                        c2.execute(
-                            "UPDATE ssl_certificates SET status = 'failed', statusMsg = ?, renewError = ?, updatedAt = ? WHERE id = ?",
-                            (str(ex)[:500], str(ex)[:500], now_iso(), cert_row_id),
-                        )
-                        c2.commit()
-
-            threading.Thread(target=_issue_worker, daemon=True).start()
+            with conn() as c:
+                active_job = c.execute(
+                    """SELECT id FROM ssl_acme_jobs
+                       WHERE userId = ? AND certificateId = ? AND status IN ('queued', 'running')
+                       ORDER BY id DESC LIMIT 1""",
+                    (uid, cert_row_id),
+                ).fetchone()
+                if active_job is None:
+                    c.execute(
+                        """INSERT INTO ssl_acme_jobs
+                           (userId, certificateId, dnsCredentialId, domain, domains, keyLength,
+                            operation, status, attempts, createdAt, updatedAt)
+                           VALUES (?, ?, ?, ?, ?, ?, 'issue', 'queued', 0, ?, ?)""",
+                        (uid, cert_row_id, dns_cred_id, domain, san_json, key_length, ts, ts),
+                    )
+                    job_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+                else:
+                    job_id = active_job["id"]
+                c.commit()
             self._ok(
-                {"id": cert_row_id, "domain": domain, "status": "applying", "provider": "acme"},
-                "已开始通过 Let's Encrypt 签发，DNS 验证通常需要 1-3 分钟，请稍后刷新列表查看结果",
+                {"id": cert_row_id, "jobId": job_id, "domain": domain, "status": "applying", "provider": "acme"},
+                "已加入 Let's Encrypt 持久化签发队列，服务重启后会自动继续处理",
                 201,
             )
+            return
+
+        # POST /api/ssl/certificates/<id>/complete — complete DV validation
+        m_auto_renew = re.fullmatch(r"/certificates/([^/]+)/auto-renew", sub)
+        if self.command == "POST" and m_auto_renew:
+            cert_id = urllib.parse.unquote(m_auto_renew.group(1))
+            enabled = bool(body.get("enabled"))
+            with conn() as c:
+                row = c.execute(
+                    """SELECT id FROM ssl_certificates
+                       WHERE userId = ? AND provider = 'acme' AND remoteCertId = ? LIMIT 1""",
+                    (uid, cert_id),
+                ).fetchone()
+                if row is None:
+                    self._err("仅 Let's Encrypt 证书支持单独设置自动续期", 404)
+                    return
+                c.execute(
+                    "UPDATE ssl_certificates SET autoRenew = ?, updatedAt = ? WHERE id = ?",
+                    (1 if enabled else 0, now_iso(), row["id"]),
+                )
+                c.commit()
+            cache_delete_pattern(f"ssl:certs:all:user:{uid}:*")
+            self._ok({"enabled": enabled}, "该证书自动续期已" + ("开启" if enabled else "关闭"))
             return
 
         # POST /api/ssl/certificates/<id>/complete — complete DV validation
@@ -5358,6 +6149,10 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         # GET /api/ssl/certificates/<id>/pem — return PEM text (for BaoTa plugin)
         m = re.fullmatch(r"/certificates/([^/]+)/pem", sub)
         if self.command == "GET" and m:
+            if not _require_api_scope("ssl:pem"):
+                return
+            if not self._check_sensitive_rate_limit(f"ssl-pem:{uid}:{self._client_ip() or 'unknown'}"):
+                return
             cert_id = urllib.parse.unquote(m.group(1))
             cred_id_raw = _get_cred_id(first_or_none(q, "credentialId"))
             if not cred_id_raw:
@@ -5377,7 +6172,11 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 except acme_api.AcmeApiError as ae:
                     self._err(str(ae), getattr(ae, "status", 502))
                     return
-                self._ok({"publicKey": pem["publicKey"], "privateKey": pem["privateKey"], "certId": cert_id}, "获取证书 PEM 成功")
+                try:
+                    create_log(user_id=uid, action="READ_PRIVATE_KEY", resource_type="SSL_CERTIFICATE", status="SUCCESS", record_name=cert_id, ip_address=self._client_ip())
+                except Exception:
+                    pass
+                self._sensitive_ok({"publicKey": pem["publicKey"], "privateKey": pem["privateKey"], "certId": cert_id}, "获取证书 PEM 成功")
                 return
             cred_row, api = _ssl_api(cred_id_raw)
             result = api.download_certificate(cert_id)
@@ -5431,7 +6230,11 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             if not private_pem or not public_pem:
                 self._err("证书包中缺少有效的公钥或私钥文件", 502)
                 return
-            self._ok({"publicKey": public_pem, "privateKey": private_pem, "certId": cert_id}, "获取证书 PEM 成功")
+            try:
+                create_log(user_id=uid, action="READ_PRIVATE_KEY", resource_type="SSL_CERTIFICATE", status="SUCCESS", record_name=cert_id, ip_address=self._client_ip())
+            except Exception:
+                pass
+            self._sensitive_ok({"publicKey": public_pem, "privateKey": private_pem, "certId": cert_id}, "获取证书 PEM 成功")
             return
 
         # POST /api/ssl/certificates/upload — upload third-party cert
@@ -5790,6 +6593,13 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                                     ts, ts, ts, ar["id"],
                                 ),
                             )
+                            c.execute(
+                                """UPDATE ssl_deployment_events SET status = 'queued', attempts = 0, error = NULL,
+                                     nextAttemptAt = NULL, targetName = NULL, fingerprint = NULL,
+                                     startedAt = NULL, completedAt = NULL, updatedAt = ?
+                                   WHERE userId = ? AND provider = 'acme' AND remoteCertId = ?""",
+                                (ts, uid, domain),
+                            )
                             c.commit()
                         renewed.append({"domain": domain, "credential": ar["dnsName"] or "acme", "newCertId": domain, "dnsRecordAdded": True, "source": "letsencrypt"})
                         _invalidate(int(ar["credentialId"]))
@@ -6037,16 +6847,25 @@ def _api_tokens_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> No
 
     sub = path[len("/api/api-tokens"):].strip()
     body = self._json_body(b)
+    allowed_scopes = {"ssl:read", "ssl:pem", "ssl:issue", "ssl:renew", "ssl:deploy", "*"}
 
     try:
         # GET /api/api-tokens — list tokens (never expose the hash)
         if self.command == "GET" and sub in ("", "/"):
             with conn() as c:
                 rows = c.execute(
-                    "SELECT id, name, prefix, lastUsedAt, createdAt FROM api_tokens WHERE userId = ? ORDER BY id DESC",
+                    "SELECT id, name, prefix, scopes, lastUsedAt, createdAt FROM api_tokens WHERE userId = ? ORDER BY id DESC",
                     (uid,),
                 ).fetchall()
-            self._ok([dict(r) for r in rows], "获取 API Token 列表成功")
+            result = []
+            for r in rows:
+                item = dict(r)
+                try:
+                    item["scopes"] = json.loads(item.get("scopes") or '["*"]')
+                except Exception:
+                    item["scopes"] = ["*"]
+                result.append(item)
+            self._ok(result, "获取 API Token 列表成功")
             return
 
         # POST /api/api-tokens — create a new long-lived token
@@ -6055,12 +6874,18 @@ def _api_tokens_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> No
             if not name:
                 self._err("请填写 Token 名称", 400)
                 return
+            scopes_raw = body.get("scopes")
+            scopes = [str(s).strip() for s in scopes_raw] if isinstance(scopes_raw, list) else ["ssl:read", "ssl:pem", "ssl:issue", "ssl:renew", "ssl:deploy"]
+            scopes = list(dict.fromkeys(s for s in scopes if s in allowed_scopes))
+            if not scopes or ("*" in scopes and len(scopes) > 1):
+                self._err("无效的 Token 权限范围", 400)
+                return
             raw, token_hash = generate_api_token()
             prefix = raw[:12]
             with conn() as c:
                 c.execute(
-                    "INSERT INTO api_tokens (userId, name, tokenHash, prefix) VALUES (?, ?, ?, ?)",
-                    (uid, name, token_hash, prefix),
+                    "INSERT INTO api_tokens (userId, name, tokenHash, prefix, scopes) VALUES (?, ?, ?, ?, ?)",
+                    (uid, name, token_hash, prefix, json.dumps(scopes, ensure_ascii=False)),
                 )
                 c.commit()
                 tid = c.execute(
@@ -6068,7 +6893,7 @@ def _api_tokens_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> No
                     (uid, token_hash),
                 ).fetchone()
             self._ok(
-                {"id": tid["id"] if tid else None, "name": name, "token": raw, "prefix": prefix},
+                {"id": tid["id"] if tid else None, "name": name, "token": raw, "prefix": prefix, "scopes": scopes},
                 "Token 已创建，请妥善保存（仅显示一次）",
                 201,
             )

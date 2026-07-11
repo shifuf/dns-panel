@@ -8,6 +8,8 @@ interface PaginatedResponse<T> {
   data: T[];
   pagination: { total: number; page: number; limit: number; pages: number };
   errors?: Array<{ credentialId: number; name: string; error: string }>;
+  statusSummary?: Record<string, number>;
+  sourceSummary?: Record<string, number>;
 }
 
 export interface SslCredential {
@@ -64,13 +66,15 @@ export async function deleteSslCredential(id: number): Promise<ApiResponse> {
 
 export async function getSslCertificates(
   credentialId: number | 'all',
-  params?: { page?: number; limit?: number; search?: string; filterCredentialId?: number },
+  params?: { page?: number; limit?: number; search?: string; filterCredentialId?: number; status?: string; source?: string },
 ): Promise<PaginatedResponse<SslCertificate>> {
   const query = new URLSearchParams({ credentialId: String(credentialId) });
   if (params?.page) query.set('page', String(params.page));
   if (params?.limit) query.set('limit', String(params.limit));
   if (params?.search) query.set('search', params.search);
   if (params?.filterCredentialId) query.set('filterCredentialId', String(params.filterCredentialId));
+  if (params?.status) query.set('status', params.status);
+  if (params?.source) query.set('source', params.source);
   const res = await api.get(`/ssl/certificates?${query.toString()}`);
   return res as unknown as PaginatedResponse<SslCertificate>;
 }
@@ -95,6 +99,68 @@ export async function issueAcmeCertificate(
 ): Promise<ApiResponse<{ id: number; domain: string; status: string; provider: string }>> {
   const res = await api.post('/ssl/certificates/issue-acme', params);
   return res as unknown as ApiResponse<{ id: number; domain: string; status: string; provider: string }>;
+}
+
+export interface SslAcmeJob {
+  id: number;
+  certificateId: number;
+  dnsCredentialId: number;
+  domain: string;
+  domains: string;
+  operation: 'issue' | 'renew';
+  status: 'queued' | 'running' | 'success' | 'failed' | 'cancelled';
+  attempts: number;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+}
+
+export interface SslDeploymentEvent {
+  id: number;
+  provider: string;
+  remoteCertId: string;
+  credentialId?: number;
+  domain: string;
+  source: 'tencent' | 'letsencrypt';
+  status: 'queued' | 'running' | 'success' | 'failed' | 'skipped';
+  attempts: number;
+  nextAttemptAt?: string;
+  targetName?: string;
+  fingerprint?: string;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function getSslAcmeJobs(): Promise<ApiResponse<SslAcmeJob[]>> {
+  const res = await api.get('/ssl/acme-jobs');
+  return res as unknown as ApiResponse<SslAcmeJob[]>;
+}
+
+export async function retrySslAcmeJob(id: number): Promise<ApiResponse> {
+  const res = await api.post(`/ssl/acme-jobs/${id}/retry`, {});
+  return res as unknown as ApiResponse;
+}
+
+export async function cancelSslAcmeJob(id: number): Promise<ApiResponse> {
+  const res = await api.post(`/ssl/acme-jobs/${id}/cancel`, {});
+  return res as unknown as ApiResponse;
+}
+
+export async function getSslDeploymentEvents(): Promise<ApiResponse<SslDeploymentEvent[]>> {
+  const res = await api.get('/ssl/deployment-events');
+  return res as unknown as ApiResponse<SslDeploymentEvent[]>;
+}
+
+export async function setCertificateAutoRenew(
+  credentialId: number,
+  certId: string,
+  enabled: boolean,
+): Promise<ApiResponse<{ enabled: boolean }>> {
+  const res = await api.post(`/ssl/certificates/${encodeURIComponent(certId)}/auto-renew`, { credentialId, enabled });
+  return res as unknown as ApiResponse<{ enabled: boolean }>;
 }
 
 export async function completeSslCertificate(

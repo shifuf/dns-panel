@@ -2,6 +2,7 @@
 import { ref, computed, watch, onMounted } from 'vue';
 import { useQuery } from '@tanstack/vue-query';
 import { NSelect, NDataTable, NTag, NSpin, NEmpty, NPagination, NButton, NDrawer, useMessage } from 'naive-ui';
+import type { SelectOption } from 'naive-ui';
 import { cleanupLogs, clearLogs, getLogs } from '@/services/logs';
 import { getSystemSettings } from '@/services/auth';
 import { formatDateTime } from '@/utils/formatters';
@@ -79,18 +80,15 @@ onMounted(async () => {
 
 watch(filters, () => { page.value = 1; }, { deep: true });
 
-const actionOptions = [
-  { label: '全部', value: null },
+const actionOptions: SelectOption[] = [
   ...Object.entries(ACTION_TYPES).map(([k, v]) => ({ label: v, value: k })),
 ];
 
-const resourceOptions = [
-  { label: '全部', value: null },
+const resourceOptions: SelectOption[] = [
   ...Object.entries(RESOURCE_TYPES).map(([k, v]) => ({ label: v, value: k })),
 ];
 
-const statusOptions = [
-  { label: '全部', value: null },
+const statusOptions: SelectOption[] = [
   ...Object.entries(OPERATION_STATUS).map(([k, v]) => ({ label: v, value: k })),
 ];
 

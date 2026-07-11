@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import type { ProviderConfig, ProviderType } from '@/types/dns';
+import type { ProviderConfig } from '@/types/dns';
 import {
   Cloud, Server, Globe, CloudRain, CloudSun, Earth,
-  Flame, CloudCog, Waypoints, Tag, Power, Rocket, HardDrive, Zap,
+  Flame, CloudCog, Waypoints, Tag, Power, Rocket, HardDrive,
 } from 'lucide-vue-next';
 
 const props = defineProps<{

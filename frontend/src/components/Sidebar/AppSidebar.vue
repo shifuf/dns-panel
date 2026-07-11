@@ -33,7 +33,7 @@ const sidebarProviders = computed(() => {
     providerStore.credentials.map((c) => normalizeProviderType(c.provider))
   );
   providerStore.providers
-    .filter((p) => (p.capabilities?.recordTypes?.length ?? 1) > 0)
+    .filter((p) => p.capabilities?.supportsRecordManagement === true)
     .forEach((p) => {
       const type = normalizeProviderType(p.type);
       if (!enabledTypes.has(type)) return;
@@ -107,7 +107,8 @@ function onProviderPointerUp() {
 }
 
 function onProviderPointerMove(e: PointerEvent) {
-  if (!draggingType.value) return;
+  const dragging = draggingType.value;
+  if (!dragging) return;
   
   if (rafId) {
     cancelAnimationFrame(rafId);
@@ -116,11 +117,13 @@ function onProviderPointerMove(e: PointerEvent) {
   rafId = requestAnimationFrame(() => {
     const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
     const item = el?.closest?.('[data-provider-type]') as HTMLElement | null;
-    const over = item?.getAttribute('data-provider-type') as ProviderType | null;
-    if (!over || over === draggingType.value) return;
+    const rawOver = item?.getAttribute('data-provider-type');
+    if (!rawOver) return;
+    const over = normalizeProviderType(rawOver as ProviderType);
+    if (over === dragging) return;
 
     const order = providerOrder.value;
-    const from = order.indexOf(draggingType.value);
+    const from = order.indexOf(dragging);
     const to = order.indexOf(over);
     if (from < 0 || to < 0 || from === to) return;
 

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue';
 import { NCheckbox, NInput, NButton, NSwitch, NRadioGroup, NRadio, useMessage, NTabs, NTab } from 'naive-ui';
-import { Save, Info, Download, Upload, Database, RefreshCw, ShieldCheck } from 'lucide-vue-next';
+import { Save, Info, Download, Upload, Database, RefreshCw } from 'lucide-vue-next';
 import { useQueryClient } from '@tanstack/vue-query';
 import type { BackupPayload } from '@/types';
 import { getStoredUser, updatePassword, updateDomainExpirySettings, saveAuthData, getSystemSettings, updateSystemSettings, exportBackup, restoreBackup } from '@/services/auth';
@@ -231,20 +231,6 @@ const smtpUser = ref('');
 const smtpPass = ref('');
 const smtpFrom = ref('');
 const expirySaving = ref(false);
-
-const profileScore = computed(() => {
-  let score = 0;
-  if (expiryNotifyEnabled.value) score += 1;
-  if (expiryEmailEnabled.value) score += 1;
-  if ((parseInt(expiryThresholdDays.value, 10) || 7) <= 14) score += 1;
-  return score;
-});
-
-const profileLevel = computed(() => {
-  if (profileScore.value >= 3) return '高';
-  if (profileScore.value === 2) return '中';
-  return '基础';
-});
 
 const selectedBackupName = computed(() => selectedBackupFile.value?.name || '未选择文件');
 const backupScopeSummary = computed(() => getSelectedScopes('backup').map((scope) => scope.toUpperCase()));
@@ -559,7 +545,7 @@ async function handleRestoreBackup() {
 
                 <div class="settings-subpanel">
                   <label class="mb-1 block text-sm text-slate-400">到期提醒阈值（天）</label>
-                  <NInput v-model:value="expiryThresholdDays" type="number" size="small" class="!w-24" />
+                  <NInput v-model:value="expiryThresholdDays" size="small" class="!w-24" />
                 </div>
 
                 <div class="settings-subpanel">
@@ -627,15 +613,15 @@ async function handleRestoreBackup() {
           <div class="space-y-4">
             <div class="settings-subpanel">
               <p class="settings-subpanel-label">最大重试次数</p>
-              <NInput v-model:value="retryMaxAttempts" type="number" placeholder="输入最大重试次数" size="small" />
+              <NInput v-model:value="retryMaxAttempts" placeholder="输入最大重试次数" size="small" />
             </div>
             <div class="settings-subpanel">
               <p class="settings-subpanel-label">重试间隔（秒）</p>
-              <NInput v-model:value="retryIntervalSeconds" type="number" placeholder="输入重试间隔" size="small" />
+              <NInput v-model:value="retryIntervalSeconds" placeholder="输入重试间隔" size="small" />
             </div>
             <div class="settings-subpanel">
               <p class="settings-subpanel-label">单次请求超时（秒）</p>
-              <NInput v-model:value="retryTimeoutSeconds" type="number" placeholder="输入单次超时秒数" size="small" />
+              <NInput v-model:value="retryTimeoutSeconds" placeholder="输入单次超时秒数" size="small" />
             </div>
             <NButton type="primary" size="small" :loading="retrySettingsLoading" @click="saveRetrySettings">
               <template #icon><Save :size="14" /></template>
@@ -654,7 +640,7 @@ async function handleRestoreBackup() {
             <div v-if="isAdmin" class="settings-subpanel">
               <p class="settings-subpanel-label">日志保留时长（天）</p>
               <div class="flex items-center gap-2">
-                <NInput v-model:value="logRetentionDays" type="number" size="small" class="!w-20" />
+                <NInput v-model:value="logRetentionDays" size="small" class="!w-20" />
                 <span class="text-xs text-slate-400">天</span>
               </div>
             </div>

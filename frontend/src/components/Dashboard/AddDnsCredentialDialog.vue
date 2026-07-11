@@ -35,7 +35,11 @@ const selectedProviderConfig = computed(() =>
 );
 
 const visibleProviders = computed(() =>
-  providers.value.filter((p) => (p.category || 'dns') === 'dns' && p.type !== 'dnspod_token')
+  providers.value.filter((p) =>
+    (p.category || 'dns') === 'dns'
+    && p.capabilities?.supportsRecordManagement === true
+    && p.type !== 'dnspod_token'
+  )
 );
 
 function mergeProviders(list: ProviderConfig[]): ProviderConfig[] {

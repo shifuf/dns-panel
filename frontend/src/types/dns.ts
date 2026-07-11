@@ -34,6 +34,7 @@ export interface DnsCredential {
  * 供应商能力配置
  */
 export interface ProviderCapabilities {
+  supportsRecordManagement: boolean;
   supportsWeight: boolean;
   supportsLine: boolean;
   supportsStatus: boolean;

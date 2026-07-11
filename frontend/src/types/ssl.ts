@@ -30,6 +30,8 @@ export interface SslCertificate {
   syncedAt?: string;
   /** acme.sh certs only — auto-renew tracking. */
   autoRenew?: boolean;
+  globalAutoRenew?: boolean;
+  effectiveAutoRenew?: boolean;
   lastRenewedAt?: string;
   renewError?: string;
   keyLength?: string;

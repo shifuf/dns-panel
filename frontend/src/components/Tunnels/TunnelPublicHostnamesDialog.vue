@@ -1,15 +1,14 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
-import { NModal, NTabs, NTabPane, NInput, NButton, NDataTable, NFormItem, NEmpty, useMessage } from 'naive-ui';
+import { useQuery, useMutation } from '@tanstack/vue-query';
+import { NModal, NTabs, NTabPane, NInput, NButton, NEmpty, useMessage } from 'naive-ui';
 import { Plus, Trash2 } from 'lucide-vue-next';
 import {
   getTunnelConfig, upsertTunnelPublicHostname, deleteTunnelPublicHostname,
   getTunnelCidrRoutes, createTunnelCidrRoute, deleteTunnelCidrRoute,
   getTunnelHostnameRoutes, createTunnelHostnameRoute, deleteTunnelHostnameRoute,
 } from '@/services/tunnels';
-import type { Tunnel, TunnelPublicHostnameRoute, TunnelCidrRoute, TunnelHostnameRoute } from '@/types';
-import { h } from 'vue';
+import type { Tunnel, TunnelPublicHostnameRoute } from '@/types';
 
 const props = defineProps<{
   tunnel: Tunnel;
@@ -18,7 +17,6 @@ const props = defineProps<{
 
 const emit = defineEmits<{ close: [] }>();
 const message = useMessage();
-const queryClient = useQueryClient();
 
 // Public hostnames from config
 const { data: configData, refetch: refetchConfig } = useQuery({

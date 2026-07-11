@@ -28,6 +28,7 @@ from modules.provider_catalog import (
     get_all_provider_capabilities,
     get_provider_capabilities,
     get_provider_display_name,
+    get_record_management_provider_types,
     get_supported_provider_types,
     get_supported_provider_types_by_category,
 )
@@ -156,15 +157,18 @@ SUPPORTED_PROVIDER_TYPES = tuple(
 )
 SUPPORTED_PROVIDER_SET = frozenset(SUPPORTED_PROVIDER_TYPES)
 SUPPORTED_DNS_PROVIDER_TYPES = tuple(get_supported_provider_types_by_category("dns"))
+SUPPORTED_DNS_RECORD_PROVIDER_TYPES = tuple(get_record_management_provider_types())
 SUPPORTED_SSL_PROVIDER_TYPES = tuple(get_supported_provider_types_by_category("ssl"))
 SUPPORTED_ACCELERATION_PROVIDER_TYPES = tuple(get_supported_provider_types_by_category("acceleration"))
 SUPPORTED_NON_SSL_PROVIDER_TYPES = tuple(SUPPORTED_DNS_PROVIDER_TYPES)
 SUPPORTED_DNS_PROVIDER_SET = frozenset(SUPPORTED_DNS_PROVIDER_TYPES)
+SUPPORTED_DNS_RECORD_PROVIDER_SET = frozenset(SUPPORTED_DNS_RECORD_PROVIDER_TYPES)
 SUPPORTED_SSL_PROVIDER_SET = frozenset(SUPPORTED_SSL_PROVIDER_TYPES)
 SUPPORTED_ACCELERATION_PROVIDER_SET = frozenset(SUPPORTED_ACCELERATION_PROVIDER_TYPES)
 SUPPORTED_NON_SSL_PROVIDER_SET = frozenset(SUPPORTED_NON_SSL_PROVIDER_TYPES)
 SUPPORTED_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_PROVIDER_TYPES)
 SUPPORTED_DNS_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_DNS_PROVIDER_TYPES)
+SUPPORTED_DNS_RECORD_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_DNS_RECORD_PROVIDER_TYPES)
 SUPPORTED_SSL_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_SSL_PROVIDER_TYPES)
 SUPPORTED_ACCELERATION_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_ACCELERATION_PROVIDER_TYPES)
 SUPPORTED_NON_SSL_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_NON_SSL_PROVIDER_TYPES)
@@ -176,6 +180,10 @@ def is_supported_provider(provider: Any) -> bool:
 
 def is_supported_dns_provider(provider: Any) -> bool:
     return str(provider or "").strip() in SUPPORTED_DNS_PROVIDER_SET
+
+
+def is_supported_dns_record_provider(provider: Any) -> bool:
+    return str(provider or "").strip() in SUPPORTED_DNS_RECORD_PROVIDER_SET
 
 
 def get_provider_name(provider: Any) -> str:
@@ -665,6 +673,31 @@ def init_db() -> None:
         )
         c.execute(
             """
+            CREATE TABLE IF NOT EXISTS domain_expiry_notifications (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              userId INTEGER NOT NULL,
+              domain TEXT NOT NULL,
+              expiresAt DATETIME NOT NULL,
+              daysRemaining INTEGER,
+              channels TEXT,
+              status TEXT NOT NULL DEFAULT 'tracked',
+              errorMessage TEXT,
+              lastNotifiedAt DATETIME,
+              createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(userId, domain, expiresAt),
+              FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_domain_expiry_notifications_user_expires ON domain_expiry_notifications(userId, expiresAt)"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_domain_expiry_notifications_domain ON domain_expiry_notifications(userId, domain)"
+        )
+        c.execute(
+            """
             CREATE TABLE IF NOT EXISTS ssl_certificates (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               userId INTEGER NOT NULL,
@@ -701,6 +734,30 @@ def init_db() -> None:
             c.execute("ALTER TABLE ssl_certificates ADD COLUMN lastRenewedAt TEXT")
         if "renewError" not in ssl_cols:
             c.execute("ALTER TABLE ssl_certificates ADD COLUMN renewError TEXT")
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ssl_acme_jobs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              userId INTEGER NOT NULL,
+              certificateId INTEGER NOT NULL,
+              dnsCredentialId INTEGER NOT NULL,
+              domain TEXT NOT NULL,
+              domains TEXT NOT NULL,
+              keyLength TEXT NOT NULL DEFAULT '2048',
+              operation TEXT NOT NULL DEFAULT 'issue',
+              status TEXT NOT NULL DEFAULT 'queued',
+              attempts INTEGER NOT NULL DEFAULT 0,
+              error TEXT,
+              createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+              startedAt DATETIME,
+              completedAt DATETIME,
+              updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY (certificateId) REFERENCES ssl_certificates(id) ON DELETE CASCADE
+            )
+            """
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_acme_jobs_status ON ssl_acme_jobs(status, updatedAt)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_acme_jobs_user ON ssl_acme_jobs(userId, status)")
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS system_settings (
@@ -1192,14 +1249,18 @@ def verify_api_token(token: str) -> Dict[str, Any] | None:
     h = hashlib.sha256(raw.encode()).hexdigest()
     with conn() as c:
         row = c.execute(
-            "SELECT t.id, t.userId, t.name, u.username, u.email FROM api_tokens t JOIN users u ON u.id = t.userId WHERE t.tokenHash = ?",
+            "SELECT t.id, t.userId, t.name, t.scopes, u.username, u.email FROM api_tokens t JOIN users u ON u.id = t.userId WHERE t.tokenHash = ?",
             (h,),
         ).fetchone()
         if not row:
             return None
         c.execute("UPDATE api_tokens SET lastUsedAt = ? WHERE id = ?", (now_iso(), row["id"]))
         c.commit()
-    return {"id": row["userId"], "username": row["username"], "email": row["email"], "_api_token": True}
+    try:
+        scopes = json.loads(row["scopes"] or '["*"]')
+    except Exception:
+        scopes = ["*"]
+    return {"id": row["userId"], "username": row["username"], "email": row["email"], "_api_token": True, "_api_scopes": scopes}
 
 
 def dflt_rules() -> List[Dict[str, Any]]:
@@ -1227,6 +1288,8 @@ def with_default_list(v: Any) -> List[Dict[str, Any]]:
 
 class H(BaseHTTPRequestHandler):
     server_version = "PyBackendV2/1.0"
+    _sensitive_rate_lock = threading.Lock()
+    _sensitive_rate: Dict[str, List[float]] = {}
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[py-v2] {self.address_string()} - {fmt % args}")
@@ -1262,6 +1325,30 @@ class H(BaseHTTPRequestHandler):
 
     def _ok(self, data: Any = None, msg: str = "操作成功", code: int = 200) -> None:
         self._json(code, {"success": True, "message": msg, "data": data})
+
+    def _sensitive_ok(self, data: Any = None, msg: str = "操作成功") -> None:
+        raw = json.dumps({"success": True, "message": msg, "data": data}, ensure_ascii=False).encode()
+        self.send_response(200)
+        self._cors()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _check_sensitive_rate_limit(self, key: str, limit: int = 30, window: int = 60) -> bool:
+        current = time.time()
+        with self._sensitive_rate_lock:
+            hits = [ts for ts in self._sensitive_rate.get(key, []) if current - ts < window]
+            if len(hits) >= limit:
+                self._sensitive_rate[key] = hits
+                self._err("敏感接口请求过于频繁，请稍后重试", 429)
+                return False
+            hits.append(current)
+            self._sensitive_rate[key] = hits
+        return True
 
     def _err(self, msg: str = "操作失败", code: int = 400, err: Any = None) -> None:
         body: Dict[str, Any] = {"success": False, "message": msg}
@@ -1311,6 +1398,8 @@ class H(BaseHTTPRequestHandler):
         return data if isinstance(data, dict) else {}
 
     def _auth(self) -> Dict[str, Any] | None:
+        if hasattr(self, "_auth_cache"):
+            return self._auth_cache
         ah = self.headers.get("Authorization", "")
         if not ah.startswith("Bearer "):
             self._err("未提供认证令牌", 401)
@@ -1322,13 +1411,30 @@ class H(BaseHTTPRequestHandler):
             # Fall back to long-lived API tokens (e.g. for the BaoTa SSL plugin).
             api_user = verify_api_token(tok)
             if api_user:
+                self._auth_cache = api_user
                 return api_user
             self._err(f"无效或过期的令牌: {e}", 401)
             return None
         if p.get("type") == "2fa_pending":
             self._err("请完成两步验证", 401)
             return None
+        self._auth_cache = p
         return p
+
+    def _guard_scoped_api_token(self, path: str) -> bool:
+        ah = self.headers.get("Authorization", "")
+        if not ah.startswith("Bearer dpan_"):
+            return True
+        user = self._auth()
+        if not user:
+            return False
+        scopes = set(user.get("_api_scopes") or [])
+        if "*" in scopes or path.startswith("/api/ssl"):
+            return True
+        if self.command == "GET" and path.startswith("/api/dns-credentials") and "ssl:read" in scopes:
+            return True
+        self._err("当前 API Token 无权访问该模块", 403)
+        return False
 
     def _handle(self) -> None:
         u = urllib.parse.urlsplit(self.path)
@@ -1780,15 +1886,17 @@ class H(BaseHTTPRequestHandler):
                     f"""
                     SELECT *
                     FROM dns_credentials
-                    WHERE userId = ? AND provider IN ({SUPPORTED_DNS_PROVIDER_SQL})
+                    WHERE userId = ? AND provider IN ({SUPPORTED_DNS_RECORD_PROVIDER_SQL})
                     ORDER BY isDefault DESC, createdAt ASC, id ASC
                     LIMIT 1
                     """,
-                    (uid, *SUPPORTED_DNS_PROVIDER_TYPES),
+                    (uid, *SUPPORTED_DNS_RECORD_PROVIDER_TYPES),
                 ).fetchone()
             if not row:
                 raise ValueError("未配置默认凭证")
         provider = str(row["provider"] or "").strip().lower()
+        if provider not in SUPPORTED_DNS_RECORD_PROVIDER_SET:
+            raise ValueError(f"当前 Python 版本暂不支持 {provider} 的 DNS 记录操作")
         secrets = self._credential_secrets(row)
 
         if provider == "cloudflare":
@@ -1977,8 +2085,8 @@ class H(BaseHTTPRequestHandler):
         dur = [int(x.get("durationMs") or 0) for x in jobs if isinstance(x.get("durationMs"), int) and int(x.get("durationMs") or 0) > 0]
         with conn() as c:
             creds = c.execute(
-                f"SELECT provider FROM dns_credentials WHERE userId = ? AND provider IN ({SUPPORTED_DNS_PROVIDER_SQL})",
-                (uid, *SUPPORTED_DNS_PROVIDER_TYPES),
+                f"SELECT provider FROM dns_credentials WHERE userId = ? AND provider IN ({SUPPORTED_DNS_RECORD_PROVIDER_SQL})",
+                (uid, *SUPPORTED_DNS_RECORD_PROVIDER_TYPES),
             ).fetchall()
             logs = c.execute("SELECT action,status,recordType,newValue,oldValue FROM logs WHERE userId = ? AND datetime(timestamp)>=datetime(?)", (uid, t24.isoformat().replace("+00:00", "Z"))).fetchall()
             exp7 = c.execute("SELECT COUNT(*) c FROM domain_expiry_notifications WHERE userId = ? AND datetime(expiresAt)>=datetime('now') AND datetime(expiresAt)<=datetime(?)", (uid, (now() + timedelta(days=7)).isoformat().replace("+00:00", "Z"))).fetchone()["c"]
@@ -2038,22 +2146,191 @@ class H(BaseHTTPRequestHandler):
         start = (page - 1) * limit
         self._ok({"jobs": items[start:start + limit], "total": len(items), "page": page, "limit": limit}, "获取同步任务成功")
 
+    def _sync_targets(self, uid: int, scope: str, provider: str | None, credential_id: int | None) -> List[sqlite3.Row]:
+        if scope == "credential":
+            if credential_id is None:
+                raise ValueError("scope 为 credential 时必须提供 credentialId")
+            row = self._get_credential_row(uid, credential_id)
+            if not row:
+                raise ValueError("凭证不存在或无权访问")
+            row_provider = str(row["provider"] or "").strip().lower()
+            if row_provider not in SUPPORTED_DNS_RECORD_PROVIDER_SET:
+                raise ValueError(f"{get_provider_name(row_provider)} 暂不支持 DNS 记录同步")
+            return [row]
+
+        if scope == "provider":
+            provider_name = str(provider or "").strip().lower()
+            if not provider_name:
+                raise ValueError("scope 为 provider 时必须提供 provider")
+            if provider_name not in SUPPORTED_DNS_RECORD_PROVIDER_SET:
+                raise ValueError(f"{get_provider_name(provider_name)} 暂不支持 DNS 记录同步")
+            with conn() as c:
+                rows = c.execute(
+                    """
+                    SELECT *
+                    FROM dns_credentials
+                    WHERE userId = ? AND provider = ?
+                    ORDER BY isDefault DESC, createdAt ASC, id ASC
+                    """,
+                    (uid, provider_name),
+                ).fetchall()
+            if not rows:
+                raise ValueError("未找到可同步的凭证")
+            return list(rows)
+
+        with conn() as c:
+            rows = c.execute(
+                f"""
+                SELECT *
+                FROM dns_credentials
+                WHERE userId = ? AND provider IN ({SUPPORTED_DNS_RECORD_PROVIDER_SQL})
+                ORDER BY provider ASC, isDefault DESC, createdAt ASC, id ASC
+                """,
+                (uid, *SUPPORTED_DNS_RECORD_PROVIDER_TYPES),
+            ).fetchall()
+        if not rows:
+            raise ValueError("未找到可同步的 DNS 记录管理凭证")
+        return list(rows)
+
+    def _append_sync_alert(self, uid: int, job: Dict[str, Any]) -> None:
+        if job.get("status") != "failed":
+            return
+        if path.startswith("/api/") and not self._guard_scoped_api_token(path):
+            return
+        ev = with_default_list(read_state(uid, "alert-events", []))
+        title = "同步任务失败"
+        message = str(job.get("error") or "DNS 同步任务执行失败")
+        ev.insert(
+            0,
+            {
+                "id": make_id("sync-alert"),
+                "level": "high",
+                "status": "open",
+                "title": title,
+                "message": message,
+                "createdAt": now_iso(),
+            },
+        )
+        write_state(uid, "alert-events", ev[:MAX_EVENTS])
+
+    def _execute_sync_job(self, uid: int, base_job: Dict[str, Any]) -> Dict[str, Any]:
+        from modules.cache import cache_delete_pattern, cache_set, dashboard_summary_key, zones_key
+
+        started = time.monotonic()
+        job = dict(base_job)
+        job["status"] = "running"
+        job["updatedAt"] = now_iso()
+
+        targets = self._sync_targets(
+            uid,
+            str(job.get("scope") or "all"),
+            str(job.get("provider") or "").strip() or None,
+            int(job["credentialId"]) if isinstance(job.get("credentialId"), int) else None,
+        )
+        results: List[Dict[str, Any]] = []
+        failures: List[str] = []
+
+        for row in targets:
+            cred_id = int(row["id"])
+            provider = str(row["provider"] or "").strip().lower()
+            detail: Dict[str, Any] = {
+                "credentialId": cred_id,
+                "credentialName": str(row["name"] or ""),
+                "provider": provider,
+                "providerName": get_provider_name(provider),
+            }
+            try:
+                cache_delete_pattern(f"dns:zones:cred:{cred_id}:*")
+                cache_delete_pattern(f"dns:records:cred:{cred_id}:*")
+                ctx = self._dns_context(uid, {"credentialId": [str(cred_id)]})
+                if provider == "cloudflare":
+                    result = ctx["cf"].list_zones(1, 100, None)
+                    zones_raw = result.get("zones") if isinstance(result, dict) else []
+                    zones = [self._map_cf_zone(z) for z in zones_raw if isinstance(z, dict)]
+                else:
+                    result = ctx["dnspod"].list_zones(1, 100, None)
+                    zones_raw = result.get("zones") if isinstance(result, dict) else []
+                    zones = [self._map_dnspod_zone(z) for z in zones_raw if isinstance(z, dict)]
+                total = int(result.get("total")) if isinstance(result, dict) and result.get("total") is not None else len(zones)
+                cache_set(
+                    zones_key(cred_id, page=1, pageSize=100, keyword=None),
+                    {"zones": zones, "total": total, "page": 1, "pageSize": 100},
+                    int((get_provider_capabilities(provider) or {}).get("domainCacheTtl", 300) or 300),
+                )
+                detail.update({"status": "success", "zoneCount": total})
+            except Exception as exc:
+                msg = str(exc)
+                failures.append(f"{get_provider_name(provider)}#{cred_id}: {msg}")
+                detail.update({"status": "failed", "error": msg})
+            results.append(detail)
+
+        duration_ms = max(0, int((time.monotonic() - started) * 1000))
+        job["durationMs"] = duration_ms
+        job["updatedAt"] = now_iso()
+        job["results"] = results[:50]
+        job["targetCount"] = len(targets)
+        job["successCount"] = sum(1 for item in results if item.get("status") == "success")
+        job["failedCount"] = len(failures)
+        if failures:
+            job["status"] = "failed"
+            job["error"] = "; ".join(failures[:3])
+        else:
+            job["status"] = "success"
+            job["error"] = None
+
+        cache_delete_pattern(dashboard_summary_key(uid))
+        items = with_default_list(read_state(uid, "sync-jobs", []))
+        items.insert(0, job)
+        write_state(uid, "sync-jobs", items[:MAX_SYNC])
+        self._append_sync_alert(uid, job)
+        try:
+            create_log(
+                user_id=uid,
+                action="SYNC",
+                resource_type="DASHBOARD",
+                status="SUCCESS" if job["status"] == "success" else "FAILED",
+                record_name=str(job.get("id") or ""),
+                new_value=json.dumps(
+                    {
+                        "scope": job.get("scope"),
+                        "provider": job.get("provider"),
+                        "credentialId": job.get("credentialId"),
+                        "targetCount": job.get("targetCount"),
+                        "successCount": job.get("successCount"),
+                        "failedCount": job.get("failedCount"),
+                    },
+                    ensure_ascii=False,
+                ),
+                error_message=job.get("error"),
+            )
+        except Exception:
+            pass
+        return job
+
     def _sync_create(self, uid: int, body: Dict[str, Any]) -> None:
         scope = str(body.get("scope") or "").strip()
         if scope not in VALID_SCOPE:
             self._err("无效的 scope，需为 all/provider/credential", 400); return
         cred = int(body["credentialId"]) if isinstance(body.get("credentialId"), (int, float)) else None
-        if scope == "credential" and cred is None:
-            self._err("scope 为 credential 时必须提供 credentialId", 400); return
-        items = with_default_list(read_state(uid, "sync-jobs", []))
-        job = {"id": make_id("sync"), "status": "pending", "scope": scope, "provider": str(body.get("provider")).strip() if body.get("provider") else None, "credentialId": cred, "createdAt": now_iso(), "updatedAt": now_iso()}
-        items.insert(0, job); write_state(uid, "sync-jobs", items[:MAX_SYNC]); self._ok({"job": job}, "创建同步任务成功", 201)
+        provider = str(body.get("provider") or "").strip().lower() or None
+        job = {"id": make_id("sync"), "status": "running", "scope": scope, "provider": provider, "credentialId": cred, "createdAt": now_iso(), "updatedAt": now_iso()}
+        try:
+            job = self._execute_sync_job(uid, job)
+        except ValueError as exc:
+            self._err(str(exc), 400); return
+        self._ok({"job": job}, "同步任务执行完成", 201)
 
     def _sync_retry(self, uid: int, sid: str) -> None:
         items = with_default_list(read_state(uid, "sync-jobs", []))
         src = next((x for x in items if x.get("id") == sid), None)
-        job = {"id": make_id("retry"), "status": "success", "scope": src.get("scope") if src else "all", "provider": src.get("provider") if src else None, "credentialId": src.get("credentialId") if src else None, "durationMs": 0, "createdAt": now_iso(), "updatedAt": now_iso()}
-        items.insert(0, job); write_state(uid, "sync-jobs", items[:MAX_SYNC]); self._ok({"job": job}, "同步任务已重试")
+        if not src:
+            self._err("同步任务不存在", 404); return
+        job = {"id": make_id("retry"), "status": "running", "scope": src.get("scope") or "all", "provider": src.get("provider"), "credentialId": src.get("credentialId"), "createdAt": now_iso(), "updatedAt": now_iso(), "retryOf": sid}
+        try:
+            job = self._execute_sync_job(uid, job)
+        except ValueError as exc:
+            self._err(str(exc), 400); return
+        self._ok({"job": job}, "同步任务已重试")
 
     def _rules_list(self, uid: int) -> None:
         items = with_default_list(read_state(uid, "alert-rules", []))
@@ -2259,11 +2536,41 @@ def _ssl_autorenew_worker() -> None:
         time.sleep(slept)
 
 
+def _ssl_acme_job_worker() -> None:
+    """Process persisted ACME jobs. Queued jobs survive process/container restarts."""
+    import urllib.request
+    time.sleep(5)
+    while True:
+        try:
+            with conn() as c:
+                users = c.execute(
+                    """SELECT DISTINCT u.id, u.username
+                       FROM users u JOIN ssl_acme_jobs j ON j.userId = u.id
+                       WHERE j.status IN ('queued', 'running')"""
+                ).fetchall()
+            for u in users:
+                tok = sign_access_token({"id": u["id"], "sub": u["id"], "username": u["username"], "_internal": True}, expires_seconds=900)
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{PORT}/api/ssl/acme-jobs/process",
+                    data=b"{}",
+                    headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(req, timeout=700).read()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(5)
+
+
 def main() -> None:
     init_db()
     from modules.cache import cache_ping
     redis_ok = cache_ping()
     threading.Thread(target=_ssl_autorenew_worker, daemon=True).start()
+    threading.Thread(target=_ssl_acme_job_worker, daemon=True).start()
     s = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     print(json.dumps({"message": "Python Backend V2 started", "port": PORT, "legacyProxy": LEGACY, "databasePath": str(DB), "redis": "connected" if redis_ok else "unavailable (degraded mode)", "frontend": str(FRONTEND_DIST) if FRONTEND_DIST.is_dir() else "not built (dev server / proxy)"}, ensure_ascii=False))
     try:

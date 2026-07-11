@@ -125,6 +125,27 @@ MIGRATIONS: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expiresAt)",
 
+    # ── domain expiry notification/tracking table ──
+    """
+    CREATE TABLE IF NOT EXISTS domain_expiry_notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      domain TEXT NOT NULL,
+      expiresAt DATETIME NOT NULL,
+      daysRemaining INTEGER,
+      channels TEXT,
+      status TEXT NOT NULL DEFAULT 'tracked',
+      errorMessage TEXT,
+      lastNotifiedAt DATETIME,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(userId, domain, expiresAt),
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_domain_expiry_notifications_user_expires ON domain_expiry_notifications(userId, expiresAt)",
+    "CREATE INDEX IF NOT EXISTS idx_domain_expiry_notifications_domain ON domain_expiry_notifications(userId, domain)",
+
     # ── ssl_certificates table ──
     """
     CREATE TABLE IF NOT EXISTS ssl_certificates (
@@ -160,6 +181,53 @@ MIGRATIONS: list[str] = [
     "ALTER TABLE ssl_certificates ADD COLUMN autoRenew INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE ssl_certificates ADD COLUMN lastRenewedAt TEXT",
     "ALTER TABLE ssl_certificates ADD COLUMN renewError TEXT",
+
+    # ── persisted ACME issue/renew jobs ──
+    """
+    CREATE TABLE IF NOT EXISTS ssl_acme_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      certificateId INTEGER NOT NULL,
+      dnsCredentialId INTEGER NOT NULL,
+      domain TEXT NOT NULL,
+      domains TEXT NOT NULL,
+      keyLength TEXT NOT NULL DEFAULT '2048',
+      operation TEXT NOT NULL DEFAULT 'issue',
+      status TEXT NOT NULL DEFAULT 'queued',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+      startedAt DATETIME,
+      completedAt DATETIME,
+      updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (certificateId) REFERENCES ssl_certificates(id) ON DELETE CASCADE
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ssl_acme_jobs_status ON ssl_acme_jobs(status, updatedAt)",
+    "CREATE INDEX IF NOT EXISTS idx_ssl_acme_jobs_user ON ssl_acme_jobs(userId, status)",
+    """
+    CREATE TABLE IF NOT EXISTS ssl_deployment_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      provider TEXT NOT NULL,
+      remoteCertId TEXT NOT NULL,
+      credentialId INTEGER,
+      domain TEXT NOT NULL,
+      source TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'queued',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      nextAttemptAt DATETIME,
+      targetName TEXT,
+      fingerprint TEXT,
+      error TEXT,
+      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+      startedAt DATETIME,
+      completedAt DATETIME,
+      updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(userId, provider, remoteCertId)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ssl_deploy_events_queue ON ssl_deployment_events(userId, status, nextAttemptAt)",
 
     # ── system_settings table (global config, not per-user) ──
     """
@@ -215,6 +283,7 @@ MIGRATIONS: list[str] = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(userId)",
+    "ALTER TABLE api_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT '[\"*\"]'",
 ]
 
 TABLE_NAME_RE = re.compile(r"CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)

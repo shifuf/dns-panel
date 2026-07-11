@@ -7,6 +7,7 @@ export interface ApiToken {
   prefix: string;
   lastUsedAt: string | null;
   createdAt: string;
+  scopes: string[];
 }
 
 export interface ApiTokenCreated extends ApiToken {
@@ -18,8 +19,8 @@ export async function getApiTokens(): Promise<ApiResponse<ApiToken[]>> {
   return res as unknown as ApiResponse<ApiToken[]>;
 }
 
-export async function createApiToken(name: string): Promise<ApiResponse<ApiTokenCreated>> {
-  const res = await api.post('/api-tokens', { name });
+export async function createApiToken(name: string, scopes: string[]): Promise<ApiResponse<ApiTokenCreated>> {
+  const res = await api.post('/api-tokens', { name, scopes });
   return res as unknown as ApiResponse<ApiTokenCreated>;
 }
 

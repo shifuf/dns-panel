@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue';
-import { NModal, NInput, NButton, NSelect, NAlert, NTag, NSpin, NDataTable, NPagination } from 'naive-ui';
+import { NModal, NInput, NButton, NSelect, NAlert, NTag, NDataTable, NPagination } from 'naive-ui';
 import { useQueryClient, useMutation } from '@tanstack/vue-query';
 import { addZones } from '@/services/domains';
 import { TABLE_PAGE_SIZE } from '@/utils/constants';

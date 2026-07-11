@@ -5,21 +5,22 @@ import { keepPreviousData } from '@tanstack/vue-query';
 import {
   NButton, NTag, NDataTable, NModal, NFormItem, NInput, NSelect, NAlert,
   NEmpty, NSpin, NPagination, NDrawer, NDrawerContent, NDescriptions,
-  NDescriptionsItem, NSwitch, NTooltip, useMessage, useDialog,
+  NDescriptionsItem, NSwitch, NTooltip, NTabs, NTabPane, useMessage, useDialog,
 } from 'naive-ui';
-import { RefreshCw, Search, Plus, Upload, Download, Trash2, Eye, CheckCircle, KeyRound, Pencil, AlertTriangle, RotateCw, ArrowUpDown, FileDown } from 'lucide-vue-next';
+import { RefreshCw, Search, Plus, Upload, Download, Trash2, Eye, CheckCircle, KeyRound, Pencil, AlertTriangle, RotateCw, ArrowUpDown, FileDown, ListChecks } from 'lucide-vue-next';
 import {
   getSslCredentials, createSslCredential, updateSslCredential, deleteSslCredential as deleteSslCred,
   getSslCertificates, getSslCertificateDetail, applySslCertificate,
   completeSslCertificate, downloadSslCertificate, uploadSslCertificate,
   deleteSslCertificate, syncSslCertificates, renewExpiredCertificates,
   autoDnsSslCertificate, cleanupDnsSslCertificate,
-  getSslAutoRenew, setSslAutoRenew, issueAcmeCertificate,
+  getSslAutoRenew, setSslAutoRenew, issueAcmeCertificate, setCertificateAutoRenew,
+  getSslAcmeJobs, retrySslAcmeJob, cancelSslAcmeJob, getSslDeploymentEvents,
 } from '@/services/ssl';
 import { getDnsCredentials } from '@/services/dnsCredentials';
 import { getDomains } from '@/services/domains';
 import AddZoneDialog from '@/components/Dashboard/AddZoneDialog.vue';
-import type { SslCredential, RenewResult } from '@/services/ssl';
+import type { SslCredential, RenewResult, SslAcmeJob, SslDeploymentEvent } from '@/services/ssl';
 import { useResponsive } from '@/composables/useResponsive';
 import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import type { SslCertificate, SslCertificateDetail, SslCertificateStatus } from '@/types/ssl';
@@ -34,7 +35,7 @@ const { isMobile } = useResponsive();
 const SSL_CRED_STORAGE_KEY = 'ssl_selected_credential';
 const savedCredId = localStorage.getItem(SSL_CRED_STORAGE_KEY);
 const selectedCredentialId = ref<number | 'all' | null>(
-  savedCredId === 'all' ? 'all' : savedCredId ? parseInt(savedCredId, 10) || null : null,
+  savedCredId === 'all' ? 'all' : savedCredId ? parseInt(savedCredId, 10) || 'all' : 'all',
 );
 
 watch(selectedCredentialId, (id) => {
@@ -51,11 +52,10 @@ const { data: sslCredentials, isLoading: credsLoading, error: credsError } = use
 });
 
 const credentialOptions = computed(() => {
-  const opts: Array<{ label: string; value: number | 'all' }> = [];
+  const opts: Array<{ label: string; value: number | 'all' }> = [
+    { label: '全部证书（腾讯云 + Let\'s Encrypt）', value: 'all' },
+  ];
   const list = sslCredentials.value || [];
-  if (list.length > 1) {
-    opts.push({ label: '全部账号', value: 'all' });
-  }
   for (const c of list) {
     const suffix = c.provider === 'dnspod' ? '（DNS 共用）' : '';
     opts.push({ label: `${c.name}${suffix}`, value: c.id });
@@ -64,10 +64,10 @@ const credentialOptions = computed(() => {
 });
 
 watch(sslCredentials, (list) => {
-  if (!list || !list.length) return;
+  if (!list) return;
   if (selectedCredentialId.value === 'all') return;
   if (selectedCredentialId.value && list.some(c => c.id === selectedCredentialId.value)) return;
-  selectedCredentialId.value = list.length > 1 ? 'all' : list[0].id;
+  selectedCredentialId.value = 'all';
 }, { immediate: true });
 
 function credNameById(id?: number) {
@@ -177,6 +177,8 @@ const page = ref(1);
 const pageSize = TABLE_PAGE_SIZE;
 const searchKeyword = ref('');
 const filterCredentialId = ref<number | null>(null);
+const statusFilter = ref<SslCertificateStatus | null>(null);
+const sourceFilter = ref<'tencent' | 'letsencrypt' | null>(null);
 const hasActiveApplying = ref(false);
 
 
@@ -193,6 +195,8 @@ const {
     pageSize,
     searchKeyword.value,
     filterCredentialId.value,
+    statusFilter.value,
+    sourceFilter.value,
   ]),
   queryFn: async () => {
     if (!selectedCredentialId.value) return { data: [], pagination: { total: 0, page: 1, limit: pageSize, pages: 0 }, errors: undefined };
@@ -201,11 +205,15 @@ const {
       limit: pageSize,
       search: searchKeyword.value || undefined,
       filterCredentialId: filterCredentialId.value || undefined,
+      status: selectedCredentialId.value === 'all' ? (statusFilter.value || undefined) : undefined,
+      source: selectedCredentialId.value === 'all' ? (sourceFilter.value || undefined) : undefined,
     });
     return {
       data: res.data || [],
       pagination: res.pagination || { total: 0, page: 1, limit: pageSize, pages: 0 },
       errors: res.errors,
+      statusSummary: res.statusSummary,
+      sourceSummary: res.sourceSummary,
     };
   },
   enabled: computed(() => !!selectedCredentialId.value),
@@ -221,6 +229,56 @@ const certsErrorMsg = computed(() => certsError.value ? String(certsError.value)
 watch(certificates, (list) => {
   hasActiveApplying.value = list.some(c => c.status === 'applying' || c.status === 'validating');
 }, { immediate: true });
+
+// ── Persistent ACME jobs and incremental deployment events ─────
+const showTaskDrawer = ref(false);
+const { data: acmeJobs, isFetching: acmeJobsFetching } = useQuery({
+  queryKey: ['ssl-acme-jobs'],
+  queryFn: async () => (await getSslAcmeJobs()).data || [],
+  enabled: computed(() => showTaskDrawer.value),
+  refetchInterval: computed(() => showTaskDrawer.value ? 5000 : false),
+});
+const { data: deploymentEvents, isFetching: deploymentEventsFetching } = useQuery({
+  queryKey: ['ssl-deployment-events'],
+  queryFn: async () => (await getSslDeploymentEvents()).data || [],
+  enabled: computed(() => showTaskDrawer.value || certificates.value.length > 0),
+  refetchInterval: computed(() => showTaskDrawer.value || hasActiveApplying.value ? 5000 : false),
+});
+
+const deploymentByCertificate = computed(() => {
+  const result = new Map<string, SslDeploymentEvent>();
+  for (const event of deploymentEvents.value || []) {
+    result.set(`${event.provider}:${event.remoteCertId}`, event);
+  }
+  return result;
+});
+
+function deploymentFor(row: SslCertificate) {
+  return deploymentByCertificate.value.get(`${row.provider || 'tencent_ssl'}:${row.remoteCertId}`);
+}
+
+const taskActionMutation = useMutation({
+  mutationFn: ({ id, action }: { id: number; action: 'retry' | 'cancel' }) =>
+    action === 'retry' ? retrySslAcmeJob(id) : cancelSslAcmeJob(id),
+  onSuccess: (_res, variables) => {
+    message.success(variables.action === 'retry' ? '任务已重新排队' : '任务已取消');
+    queryClient.invalidateQueries({ queryKey: ['ssl-acme-jobs'] });
+    queryClient.invalidateQueries({ queryKey: ['ssl-certificates'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+function formatDateTime(v?: string) {
+  if (!v) return '-';
+  try { return new Date(v).toLocaleString('zh-CN'); } catch { return v; }
+}
+
+const jobStatusLabel: Record<SslAcmeJob['status'], string> = {
+  queued: '等待中', running: '执行中', success: '成功', failed: '失败', cancelled: '已取消',
+};
+const deploymentStatusLabel: Record<SslDeploymentEvent['status'], string> = {
+  queued: '待部署', running: '部署中', success: '已部署', failed: '部署失败', skipped: '已跳过',
+};
 
 // ── Expiring/expired certificate detection ─────────────────────
 const expiringCerts = computed(() => {
@@ -263,19 +321,29 @@ function expiryDaysText(notAfter?: string): { text: string; type: 'success' | 'w
 }
 
 // ── Status filter ───────────────────────────────────────────────
-const statusFilter = ref<SslCertificateStatus | null>(null);
+watch([selectedCredentialId, searchKeyword, filterCredentialId, statusFilter, sourceFilter], () => { page.value = 1; });
 
-watch([selectedCredentialId, searchKeyword, filterCredentialId, statusFilter], () => { page.value = 1; });
-
-const statusCounts = computed(() => {
-  const counts: Record<string, number> = {};
-  for (const c of certificates.value) {
-    counts[c.status] = (counts[c.status] || 0) + 1;
-  }
+const statusCounts = computed(() => certsResponse.value?.statusSummary || certificates.value.reduce((counts, cert) => {
+  counts[cert.status] = (counts[cert.status] || 0) + 1;
   return counts;
-});
+}, {} as Record<string, number>));
+const sourceCounts = computed(() => certsResponse.value?.sourceSummary || {});
+const statusTotal = computed(() => Object.values(statusCounts.value).reduce((sum, count) => sum + count, 0));
+
+async function toggleCertificateAutoRenew(cert: SslCertificate) {
+  if (cert.provider !== 'acme' || !cert.credentialId) return;
+  const enabled = cert.autoRenew === false;
+  try {
+    await setCertificateAutoRenew(cert.credentialId, cert.remoteCertId, enabled);
+    message.success(`该证书自动续期已${enabled ? '开启' : '关闭'}`);
+    queryClient.invalidateQueries({ queryKey: ['ssl-certificates'] });
+  } catch (err) {
+    message.error(String(err));
+  }
+}
 
 const filteredCertificates = computed(() => {
+  if (selectedCredentialId.value === 'all') return certificates.value;
   if (!statusFilter.value) return certificates.value;
   return certificates.value.filter(c => c.status === statusFilter.value);
 });
@@ -539,6 +607,7 @@ const applyDnsCredId = ref<number | null>(null);
 const applyAutoDns = ref(true);
 const applyDnsCredTouched = ref(false);
 const applyOldCertId = ref<string | null>(null);
+const applySslCredId = ref<number | null>(null);
 const _settingApplyDnsCredId = ref(false);
 // acme-specific: key type and the DNS credential used for the DNS-01 challenge.
 const applyAcmeKeyLength = ref<string>('2048');
@@ -623,8 +692,8 @@ const dvMethodOptions = [
 ];
 
 const applyEffectiveCredId = computed(() => {
-  if (selectedCredentialId.value === 'all') return null;
-  return selectedCredentialId.value;
+  if (selectedCredentialId.value !== 'all') return selectedCredentialId.value;
+  return applySslCredId.value;
 });
 
 const applyMutation = useMutation({
@@ -690,6 +759,10 @@ const acmeMutation = useMutation({
     message.success(res.message || "已开始通过 Let's Encrypt 签发，请稍后刷新列表查看结果");
     showApply.value = false;
     applyDomain.value = '';
+    selectedCredentialId.value = 'all';
+    filterCredentialId.value = null;
+    statusFilter.value = null;
+    page.value = 1;
     queryClient.invalidateQueries({ queryKey: ['ssl-certificates'] });
   },
   onError: (err: any) => message.error(String(err)),
@@ -711,7 +784,8 @@ function quickReapply(cert: SslCertificate) {
     message.error('无法确定凭证，请在单一账号下操作');
     return;
   }
-  selectedCredentialId.value = credId;
+  selectedCredentialId.value = cert.provider === 'acme' ? 'all' : credId;
+  applySslCredId.value = cert.provider === 'acme' ? null : credId;
   // Re-apply keeps the cert's original channel so renewal flows stay consistent.
   applyChannel.value = cert.provider === 'acme' ? 'acme' : 'tencent';
   applyDomain.value = cert.domain || '';
@@ -734,7 +808,7 @@ function quickReapply(cert: SslCertificate) {
 }
 
 function openApply() {
-  applyChannel.value = 'tencent';
+  applyChannel.value = (sslCredentials.value || []).length > 0 ? 'tencent' : 'acme';
   applyDomain.value = '';
   applyDomainMode.value = managedDomainOptions.value.length > 0 ? 'managed' : 'manual';
   applyManagedRoot.value = managedDomainOptions.value.length > 0 ? managedDomainOptions.value[0].value : null;
@@ -745,6 +819,9 @@ function openApply() {
   applyDnsCredTouched.value = false;
   setApplyDnsCredId(null);
   applyOldCertId.value = null;
+  applySslCredId.value = selectedCredentialId.value === 'all'
+    ? (sslCredentials.value?.[0]?.id ?? null)
+    : selectedCredentialId.value;
   applyAcmeKeyLength.value = '2048';
   applyAcmeDnsCredId.value = acmeDnsCredentialOptions.value[0]?.value ?? null;
   showApply.value = true;
@@ -1078,7 +1155,11 @@ function handleDelete(cert: SslCertificate) {
 
 // ── Filter chips for "all" mode ────────────────────────────────
 const filterOptions = computed(() => {
-  const list = sslCredentials.value || [];
+  const seen = new Set<number>();
+  const list = [
+    ...(sslCredentials.value || []).map(c => ({ id: c.id, name: `${c.name} · 腾讯云` })),
+    ...(acmeDnsCredentials.value || []).map(c => ({ id: c.id, name: `${c.name} · Let's Encrypt` })),
+  ].filter(c => !seen.has(c.id) && !!seen.add(c.id));
   return [
     { label: '全部', value: null as number | null },
     ...list.map(c => ({ label: c.name, value: c.id })),
@@ -1087,6 +1168,9 @@ const filterOptions = computed(() => {
 
 // ── Table columns ──────────────────────────────────────────────
 const isAllMode = computed(() => selectedCredentialId.value === 'all');
+const canApplyCertificate = computed(() =>
+  (sslCredentials.value || []).length > 0 || acmeDnsCredentialOptions.value.length > 0,
+);
 
 const columns = computed(() => {
   const cols: any[] = [
@@ -1153,9 +1237,11 @@ const columns = computed(() => {
         const children: any[] = [srcTag];
         // acme certs carry auto-renew state; show a badge + last renewal / error.
         if (isAcme) {
-          const renew = row.autoRenew !== false
-            ? h(NTag, { size: 'tiny', bordered: false, type: 'info' }, () => '自动续期')
-            : h(NTag, { size: 'tiny', bordered: false, type: 'default' }, () => '手动');
+          const renew = row.effectiveAutoRenew
+            ? h(NTag, { size: 'tiny', bordered: false, type: 'success' }, () => '续期生效')
+            : row.autoRenew !== false && row.globalAutoRenew === false
+              ? h(NTag, { size: 'tiny', bordered: false, type: 'warning' }, () => '等待全局开启')
+              : h(NTag, { size: 'tiny', bordered: false, type: 'default' }, () => '单独关闭');
           let sub: any = null;
           if (row.renewError) {
             sub = h(NTooltip, { trigger: 'hover' }, {
@@ -1169,6 +1255,23 @@ const columns = computed(() => {
           if (sub) children.push(h('div', { class: 'mt-0.5' }, [sub]));
         }
         return h('div', { class: 'space-y-0.5' }, children);
+      },
+    },
+    {
+      title: '部署',
+      key: 'deployment',
+      width: 120,
+      render: (row: SslCertificate) => {
+        const event = deploymentFor(row);
+        if (!event) return h('span', { class: 'text-xs text-slate-400' }, '暂无事件');
+        const type = event.status === 'success' ? 'success' : event.status === 'failed' ? 'error'
+          : event.status === 'running' ? 'info' : event.status === 'skipped' ? 'default' : 'warning';
+        const tag = h(NTag, { size: 'tiny', bordered: false, type }, () => deploymentStatusLabel[event.status]);
+        const detail = event.targetName || event.error;
+        return detail ? h(NTooltip, { trigger: 'hover' }, {
+          trigger: () => h('div', { class: 'cursor-help space-y-0.5' }, [tag, event.targetName ? h('div', { class: 'text-xs text-slate-400 truncate' }, event.targetName) : null]),
+          default: () => event.error || `目标站点：${event.targetName}`,
+        }) : tag;
       },
     },
     {
@@ -1208,6 +1311,13 @@ const columns = computed(() => {
                 icon: () => h(Download, { size: 13 }),
                 default: () => '下载',
               })
+            : null,
+          row.provider === 'acme'
+            ? h(NButton, {
+                size: 'tiny', secondary: true,
+                type: row.autoRenew === false ? 'default' : 'success',
+                onClick: () => toggleCertificateAutoRenew(row),
+              }, { default: () => row.autoRenew === false ? '开启续期' : '关闭续期' })
             : null,
           (row.status === 'expired' || (row.status === 'issued' && row.notAfter && new Date(row.notAfter).getTime() - Date.now() < 30 * 86400000))
             ? h(NButton, { size: 'tiny', secondary: true, type: 'warning', onClick: () => quickReapply(row) },
@@ -1263,7 +1373,7 @@ const columns = computed(() => {
         >
           <template #prefix><Search :size="14" class="text-slate-500" /></template>
         </NInput>
-        <NButton size="small" type="primary" :disabled="!selectedCredentialId || selectedCredentialId === 'all'" @click="openApply">
+        <NButton size="small" type="primary" :disabled="!canApplyCertificate" @click="openApply">
           <template #icon><Plus :size="14" /></template>
           申请
         </NButton>
@@ -1280,6 +1390,10 @@ const columns = computed(() => {
         >
           <template #icon><RefreshCw :size="14" /></template>
           同步
+        </NButton>
+        <NButton size="small" secondary @click="showTaskDrawer = true" title="查看持久化签发任务与自动部署事件">
+          <template #icon><ListChecks :size="14" /></template>
+          任务
         </NButton>
         <NButton
           size="small"
@@ -1369,12 +1483,11 @@ const columns = computed(() => {
     </NAlert>
 
     <!-- No credentials -->
-    <section v-if="!credsLoading && !credsError && (!sslCredentials || sslCredentials.length === 0)" class="panel p-8">
-      <NEmpty description="暂无可用的腾讯云凭证">
+    <section v-if="!credsLoading && !credsError && !canApplyCertificate" class="panel p-8">
+      <NEmpty description="暂无可用的证书签发凭证">
         <template #extra>
           <p class="mb-3 text-sm text-slate-500">
-            需要含有 SecretId / SecretKey 的腾讯云凭证。
-            已有的腾讯云 DNS 凭证会自动出现，也可以单独添加。
+            可添加含 SecretId / SecretKey 的腾讯云凭证，或在设置中添加支持 DNS-01 的 DNS 凭证来申请 Let's Encrypt 证书。
           </p>
           <NButton size="small" type="primary" @click="openAddCred">
             <template #icon><Plus :size="14" /></template>
@@ -1385,9 +1498,9 @@ const columns = computed(() => {
     </section>
 
     <!-- Table -->
-    <section v-else-if="(sslCredentials && sslCredentials.length > 0) || credsError" class="panel p-4">
+    <section class="panel p-4">
       <!-- Filter chips for "all" mode -->
-      <div v-if="isAllMode && (sslCredentials?.length ?? 0) > 1" class="mb-3 flex flex-wrap gap-2">
+      <div v-if="isAllMode && filterOptions.length > 2" class="mb-3 flex flex-wrap gap-2">
         <NButton
           v-for="opt in filterOptions"
           :key="String(opt.value)"
@@ -1408,7 +1521,7 @@ const columns = computed(() => {
           :secondary="statusFilter !== null"
           @click="statusFilter = null"
         >
-          全部 ({{ certificates.length }})
+          全部 ({{ statusTotal }})
         </NButton>
         <template v-for="(cfg, key) in statusConfig" :key="key">
           <NButton
@@ -1421,6 +1534,20 @@ const columns = computed(() => {
             {{ cfg.label }} ({{ statusCounts[key] }})
           </NButton>
         </template>
+      </div>
+
+      <!-- Issuance source filters use backend full-set counts. -->
+      <div v-if="isAllMode && Object.keys(sourceCounts).length > 0" class="mb-3 flex flex-wrap items-center gap-2">
+        <span class="text-xs text-slate-500">来源：</span>
+        <NButton size="tiny" :type="sourceFilter === null ? 'primary' : 'default'" :secondary="sourceFilter !== null" @click="sourceFilter = null">
+          全部 ({{ Object.values(sourceCounts).reduce((sum, count) => sum + count, 0) }})
+        </NButton>
+        <NButton v-if="sourceCounts.tencent" size="tiny" :type="sourceFilter === 'tencent' ? 'primary' : 'default'" :secondary="sourceFilter !== 'tencent'" @click="sourceFilter = sourceFilter === 'tencent' ? null : 'tencent'">
+          腾讯云 ({{ sourceCounts.tencent }})
+        </NButton>
+        <NButton v-if="sourceCounts.letsencrypt" size="tiny" :type="sourceFilter === 'letsencrypt' ? 'success' : 'default'" :secondary="sourceFilter !== 'letsencrypt'" @click="sourceFilter = sourceFilter === 'letsencrypt' ? null : 'letsencrypt'">
+          Let's Encrypt ({{ sourceCounts.letsencrypt }})
+        </NButton>
       </div>
 
       <!-- Sort controls + batch toolbar + export -->
@@ -1594,6 +1721,14 @@ const columns = computed(() => {
         <NFormItem v-if="!applyOldCertId" label="签发渠道">
           <NSelect v-model:value="applyChannel" :options="channelOptions" />
         </NFormItem>
+        <NFormItem v-if="applyChannel === 'tencent' && selectedCredentialId === 'all'" label="腾讯云 SSL 凭证" required>
+          <NSelect
+            v-model:value="applySslCredId"
+            :options="credentialOptions.filter(option => option.value !== 'all')"
+            placeholder="选择用于申请证书的腾讯云凭证"
+            filterable
+          />
+        </NFormItem>
         <NFormItem label="域名" required>
           <div class="space-y-2 w-full">
             <div class="flex items-center gap-2">
@@ -1707,7 +1842,7 @@ const columns = computed(() => {
             暂无可用于 DNS 验证的凭证。请先在设置中添加 Cloudflare、DNSPod 或阿里云凭证。
           </NAlert>
           <NAlert type="info" :bordered="false">
-            由 acme.sh 通过 Let's Encrypt 签发，全程自动完成 DNS 验证（加记录 → 验证 → 清理），签发后默认开启自动续期。DNS 传播通常需要 1-3 分钟，提交后请稍后刷新列表查看结果。支持通配符域名（如 *.example.com）。
+            由 acme.sh 通过 Let's Encrypt 签发，全程自动完成 DNS 验证（加记录 → 验证 → 清理），签发后默认开启自动续期。主域名和所有 SAN 必须由同一个 DNS 凭证管理；Cloudflare / DNSPod 会在提交时校验管理范围。DNS 传播通常需要 1-3 分钟。支持通配符域名（如 *.example.com）。
           </NAlert>
         </template>
       </div>
@@ -1716,7 +1851,7 @@ const columns = computed(() => {
         <NButton
           type="primary"
           :loading="applyMutation.isPending.value || acmeMutation.isPending.value"
-          :disabled="!applyFinalDomain || (applyChannel === 'acme' && !applyAcmeDnsCredId)"
+          :disabled="!applyFinalDomain || (applyChannel === 'acme' ? !applyAcmeDnsCredId : !applyEffectiveCredId)"
           @click="submitApply()"
         >
           提交申请
@@ -1871,6 +2006,59 @@ const columns = computed(() => {
     </NModal>
 
     <!-- Detail Drawer -->
+    <NDrawer v-model:show="showTaskDrawer" :width="isMobile ? '100%' : 760" placement="right">
+      <NDrawerContent title="SSL 自动化任务" closable>
+        <NTabs type="line" animated>
+          <NTabPane name="acme" tab="签发任务">
+            <div v-if="acmeJobsFetching && !(acmeJobs || []).length" class="flex justify-center py-12"><NSpin /></div>
+            <NEmpty v-else-if="!(acmeJobs || []).length" description="暂无 ACME 签发任务" class="py-12" />
+            <div v-else class="space-y-3">
+              <div v-for="job in acmeJobs" :key="job.id" class="rounded-xl border border-panel-border p-3">
+                <div class="flex items-start gap-3">
+                  <div class="min-w-0 flex-1">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="font-medium text-slate-700">{{ job.domain }}</span>
+                      <NTag size="tiny" :bordered="false" :type="job.status === 'success' ? 'success' : job.status === 'failed' ? 'error' : job.status === 'running' ? 'info' : job.status === 'cancelled' ? 'default' : 'warning'">
+                        {{ jobStatusLabel[job.status] }}
+                      </NTag>
+                      <span class="text-xs text-slate-400">尝试 {{ job.attempts }}/3</span>
+                    </div>
+                    <p class="mt-1 text-xs text-slate-500">{{ job.operation === 'renew' ? '续期' : '签发' }} · 创建于 {{ formatDateTime(job.createdAt) }}</p>
+                    <p v-if="job.error" class="mt-1 break-all text-xs text-red-500">{{ job.error }}</p>
+                  </div>
+                  <div class="flex gap-2">
+                    <NButton v-if="job.status === 'failed' || job.status === 'cancelled'" size="tiny" secondary type="warning" @click="taskActionMutation.mutate({ id: job.id, action: 'retry' })">重试</NButton>
+                    <NButton v-if="job.status === 'queued' || job.status === 'failed'" size="tiny" secondary @click="taskActionMutation.mutate({ id: job.id, action: 'cancel' })">取消</NButton>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </NTabPane>
+          <NTabPane name="deployment" tab="部署事件">
+            <div v-if="deploymentEventsFetching && !(deploymentEvents || []).length" class="flex justify-center py-12"><NSpin /></div>
+            <NEmpty v-else-if="!(deploymentEvents || []).length" description="暂无证书部署事件" class="py-12" />
+            <div v-else class="space-y-3">
+              <div v-for="event in deploymentEvents" :key="event.id" class="rounded-xl border border-panel-border p-3">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="font-medium text-slate-700">{{ event.domain }}</span>
+                  <NTag size="tiny" :bordered="false">{{ event.source === 'letsencrypt' ? "Let's Encrypt" : '腾讯云' }}</NTag>
+                  <NTag size="tiny" :bordered="false" :type="event.status === 'success' ? 'success' : event.status === 'failed' ? 'error' : event.status === 'running' ? 'info' : event.status === 'skipped' ? 'default' : 'warning'">
+                    {{ deploymentStatusLabel[event.status] }}
+                  </NTag>
+                  <span class="text-xs text-slate-400">尝试 {{ event.attempts }}/5</span>
+                </div>
+                <p class="mt-1 text-xs text-slate-500">
+                  目标：{{ event.targetName || '待匹配' }} · 更新于 {{ formatDateTime(event.updatedAt) }}
+                  <span v-if="event.nextAttemptAt"> · 下次重试 {{ formatDateTime(event.nextAttemptAt) }}</span>
+                </p>
+                <p v-if="event.error" class="mt-1 break-all text-xs text-red-500">{{ event.error }}</p>
+              </div>
+            </div>
+          </NTabPane>
+        </NTabs>
+      </NDrawerContent>
+    </NDrawer>
+
     <NDrawer v-model:show="showDetail" :width="isMobile ? '100%' : 560" placement="right">
       <NDrawerContent title="证书详情" closable>
         <div v-if="detailLoading" class="flex justify-center py-20"><NSpin size="large" /></div>

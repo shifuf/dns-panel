@@ -134,11 +134,6 @@ watch(
   }
 );
 
-const selectedRecords = computed(() => {
-  const selected = new Set(checkedRowKeys.value);
-  return visibleRecords.value.filter((r) => selected.has(r.id));
-});
-
 const typeColor: Record<string, string> = {
   A: '#2563EB',
   AAAA: '#7C3AED',

@@ -1,14 +1,14 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref } from 'vue';
 import { NButton, NInput, NModal, NAlert, NEmpty, NSpin, useMessage, useDialog } from 'naive-ui';
 import { Plus, Pencil, Trash2, Key } from 'lucide-vue-next';
-import { createCredential, updateCredential, deleteCredential, verifyCredential } from '@/services/credentials';
+import { createCredential, updateCredential, deleteCredential } from '@/services/credentials';
 import type { CfCredential } from '@/types';
 
 const message = useMessage();
 const dlg = useDialog();
 
-const props = defineProps<{
+defineProps<{
   accounts: CfCredential[];
   loading: boolean;
 }>();

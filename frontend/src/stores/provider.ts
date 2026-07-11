@@ -19,8 +19,8 @@ function readCache<T>(key: string): T[] {
 }
 
 function isDnsCategory(provider: ProviderConfig): boolean {
-  if (provider.category) return provider.category === 'dns';
-  return (provider.capabilities?.recordTypes?.length ?? 0) > 0;
+  if ((provider.category || 'dns') !== 'dns') return false;
+  return provider.capabilities?.supportsRecordManagement === true;
 }
 
 export const useProviderStore = defineStore('provider', () => {

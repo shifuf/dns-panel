@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import { useQuery } from '@tanstack/vue-query';
-import { NTag, NSpin } from 'naive-ui';
+import { NTag } from 'naive-ui';
 import { getTunnelToken, getTunnelConfig } from '@/services/tunnels';
 import { formatDateTime } from '@/utils/formatters';
 import type { Tunnel } from '@/types';

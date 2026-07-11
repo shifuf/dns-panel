@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, List
 
+RECORD_MANAGEMENT_PROVIDER_TYPES = frozenset({"cloudflare", "dnspod", "dnspod_token"})
+
 PROVIDER_CAPABILITIES: List[Dict[str, Any]] = [
     {
         "provider": "cloudflare",
@@ -357,6 +359,9 @@ def get_all_provider_capabilities() -> List[Dict[str, Any]]:
         normalized = deepcopy(item)
         normalized["provider"] = provider
         normalized["category"] = str(normalized.get("category") or "dns").strip().lower() or "dns"
+        normalized["supportsRecordManagement"] = bool(
+            normalized.get("supportsRecordManagement", provider in RECORD_MANAGEMENT_PROVIDER_TYPES)
+        )
         merged.append(normalized)
     deduped: Dict[str, Dict[str, Any]] = {}
     for item in merged:
@@ -396,6 +401,20 @@ def get_supported_provider_types_by_category(category: str) -> tuple[str, ...]:
         for item in get_all_provider_capabilities()
         if str(item.get("provider") or "").strip()
         and str(item.get("category") or "dns").strip().lower() == normalized
+    )
+
+
+def provider_supports_record_management(provider: str) -> bool:
+    item = get_provider_capabilities(provider)
+    return bool(item and item.get("supportsRecordManagement") is True)
+
+
+def get_record_management_provider_types() -> tuple[str, ...]:
+    return tuple(
+        str(item.get("provider") or "").strip().lower()
+        for item in get_all_provider_capabilities()
+        if str(item.get("provider") or "").strip()
+        and item.get("supportsRecordManagement") is True
     )
 
 

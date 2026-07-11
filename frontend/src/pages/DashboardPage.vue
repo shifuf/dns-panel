@@ -2,7 +2,7 @@
 import { ref, computed, watch, h, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
-import { NDataTable, NInput, NButton, NTag, NEmpty, NSpin, NPagination, NSelect, NDrawer, NModal, NSwitch, NCheckbox, useMessage, useDialog } from 'naive-ui';
+import { NDataTable, NInput, NButton, NTag, NEmpty, NSpin, NPagination, NSelect, NDrawer, NModal, NSwitch, useMessage, useDialog } from 'naive-ui';
 import { Search, RefreshCw, Plus, Trash2, Download, ArrowUpDown, ShieldCheck, AlertTriangle, Clock3, Layers3, Tag, Check } from 'lucide-vue-next';
 import type { DataTableColumns } from 'naive-ui';
 import { useProviderStore } from '@/stores/provider';
@@ -882,15 +882,16 @@ async function handleOneClickInspection() {
     const durationMs = Date.now() - begin;
     finishLocalSyncTask(taskId, { status: 'success', durationMs });
     if (issues > 0) {
+      const alert: AlertEvent = {
+        id: `inspect-${Date.now()}`,
+        level: issues > 3 ? 'high' : 'medium',
+        status: 'open',
+        title: '巡检发现异常',
+        message: `本次巡检发现 ${issues} 个异常域名`,
+        createdAt: new Date().toISOString(),
+      };
       localAlertEvents.value = [
-        {
-          id: `inspect-${Date.now()}`,
-          level: issues > 3 ? 'high' : 'medium',
-          status: 'open',
-          title: '巡检发现异常',
-          message: `本次巡检发现 ${issues} 个异常域名`,
-          createdAt: new Date().toISOString(),
-        },
+        alert,
         ...localAlertEvents.value,
       ].slice(0, 200);
     }

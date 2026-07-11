@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
-import { NButton, NInput, NEmpty, NTag, useMessage, useDialog } from 'naive-ui';
+import { NButton, NInput, NEmpty, NTag, NSelect, useMessage, useDialog } from 'naive-ui';
 import { Plus, Trash2, KeyRound, Copy, Check } from 'lucide-vue-next';
 import { getApiTokens, createApiToken, deleteApiToken, type ApiToken } from '@/services/apiTokens';
 
@@ -19,11 +19,22 @@ const { data: tokens, isLoading } = useQuery({
 
 const showCreate = ref(false);
 const newName = ref('');
+const tokenProfile = ref<'baota' | 'readonly' | 'full'>('baota');
+const profileOptions = [
+  { label: '宝塔 SSL 插件（推荐）', value: 'baota' },
+  { label: 'SSL 只读', value: 'readonly' },
+  { label: '完整 API 权限', value: 'full' },
+];
+const profileScopes = {
+  baota: ['ssl:read', 'ssl:pem', 'ssl:issue', 'ssl:renew', 'ssl:deploy'],
+  readonly: ['ssl:read'],
+  full: ['*'],
+};
 const newlyCreated = ref<{ token: string; name: string } | null>(null);
 const copied = ref(false);
 
 const createMutation = useMutation({
-  mutationFn: () => createApiToken(newName.value.trim()),
+  mutationFn: () => createApiToken(newName.value.trim(), profileScopes[tokenProfile.value]),
   onSuccess: (res) => {
     showCreate.value = false;
     newName.value = '';
@@ -37,6 +48,7 @@ const createMutation = useMutation({
 
 function openCreate() {
   newName.value = '';
+  tokenProfile.value = 'baota';
   showCreate.value = true;
 }
 
@@ -121,6 +133,10 @@ function handleDelete(token: ApiToken) {
           <label class="mb-1 block text-xs text-slate-500">Token 名称</label>
           <NInput v-model:value="newName" placeholder="如：宝塔SSL插件" size="small" @keyup.enter="handleCreate" />
         </div>
+        <div class="w-52">
+          <label class="mb-1 block text-xs text-slate-500">权限用途</label>
+          <NSelect v-model:value="tokenProfile" :options="profileOptions" size="small" />
+        </div>
         <NButton size="small" @click="showCreate = false">取消</NButton>
         <NButton size="small" type="primary" :loading="createMutation.isPending.value" @click="handleCreate">创建</NButton>
       </div>
@@ -142,6 +158,7 @@ function handleDelete(token: ApiToken) {
             <NTag size="tiny" :bordered="false" type="info">{{ t.prefix }}…</NTag>
           </div>
           <p class="text-xs text-slate-400">创建于 {{ t.createdAt }}<span v-if="t.lastUsedAt"> · 最近使用 {{ t.lastUsedAt }}</span></p>
+          <div class="mt-1 flex flex-wrap gap-1"><NTag v-for="scope in t.scopes" :key="scope" size="tiny" :bordered="false">{{ scope }}</NTag></div>
         </div>
         <NButton text size="small" type="error" @click="handleDelete(t)">
           <template #icon><Trash2 :size="14" /></template>

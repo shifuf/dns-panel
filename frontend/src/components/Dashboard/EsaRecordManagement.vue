@@ -1,16 +1,14 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue';
+import { ref, computed, h } from 'vue';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
-import { NDataTable, NButton, NTag, NModal, NInput, NSelect, NSwitch, NFormItem, NSpin, NEmpty, NPagination, useMessage } from 'naive-ui';
+import { NDataTable, NButton, NTag, NModal, NInput, NInputNumber, NSelect, NSwitch, NFormItem, NSpin, NEmpty, NPagination, useMessage } from 'naive-ui';
 import { Plus, RefreshCw, Trash2, Edit2, Shield } from 'lucide-vue-next';
 import {
   listEsaRecords, createEsaRecord, updateEsaRecord, deleteEsaRecord,
-  listEsaCertificatesByRecord, applyEsaCertificate, checkEsaCnameStatus,
+  applyEsaCertificate,
   type EsaDnsRecord,
 } from '@/services/aliyunEsa';
-import { useResponsive } from '@/composables/useResponsive';
 import { TABLE_PAGE_SIZE } from '@/utils/constants';
-import { h } from 'vue';
 
 const props = defineProps<{
   credentialId: number;
@@ -22,7 +20,6 @@ const props = defineProps<{
 
 const message = useMessage();
 const queryClient = useQueryClient();
-const { isMobile } = useResponsive();
 
 const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SRV', 'CAA'];
 
@@ -61,45 +58,6 @@ const paginatedRecords = computed(() => {
   const start = (page.value - 1) * pageSize;
   return records.value.slice(start, start + pageSize);
 });
-
-// CNAME status check
-const cnameRecords = computed(() =>
-  records.value.filter(r => r.type === 'CNAME' && r.recordCname)
-    .map(r => ({ recordName: r.recordName, recordCname: r.recordCname! }))
-);
-
-const { data: cnameStatusData } = useQuery({
-  queryKey: computed(() => ['esa-cname-status', cnameRecords.value]),
-  queryFn: () => checkEsaCnameStatus({ records: cnameRecords.value }),
-  enabled: computed(() => cnameRecords.value.length > 0),
-});
-
-function getCnameStatus(recordName: string): string {
-  const results = cnameStatusData.value?.data?.results || [];
-  const entry = results.find(r => r.recordName === recordName);
-  return entry?.status || '-';
-}
-
-// Certificate status
-const recordNames = computed(() => records.value.map(r => r.recordName));
-const { data: certData } = useQuery({
-  queryKey: computed(() => ['esa-certs', props.credentialId, props.siteId, recordNames.value]),
-  queryFn: () => listEsaCertificatesByRecord({
-    credentialId: props.credentialId,
-    siteId: props.siteId,
-    recordNames: recordNames.value,
-    region: props.region,
-  }),
-  enabled: computed(() => recordNames.value.length > 0),
-});
-
-function getCertStatus(recordName: string): string {
-  const records = certData.value?.data?.records || [];
-  const entry = records.find(r => r.recordName === recordName);
-  if (!entry) return '-';
-  if (entry.applyingCount && entry.applyingCount > 0) return '申请中';
-  return entry.status || '-';
-}
 
 // CRUD mutations
 const createMutation = useMutation({
@@ -262,7 +220,7 @@ const columns = computed(() => [
         </NFormItem>
         <div class="grid grid-cols-2 gap-4">
           <NFormItem label="TTL" :show-feedback="false">
-            <NInput v-model:value="formTTL" type="number" size="small" />
+            <NInputNumber v-model:value="formTTL" :min="1" size="small" class="w-full" />
           </NFormItem>
           <NFormItem label="代理" :show-feedback="false">
             <NSwitch v-model:value="formProxied" />

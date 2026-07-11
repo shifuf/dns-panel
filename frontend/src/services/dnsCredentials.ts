@@ -9,6 +9,7 @@ type ProviderCapabilitiesApi = {
   category?: ProviderCategory;
   name: string;
   icon?: string;
+  supportsRecordManagement?: boolean;
   supportsWeight?: boolean;
   supportsLine?: boolean;
   supportsStatus?: boolean;
@@ -44,6 +45,7 @@ export async function getProviders(): Promise<ApiResponse<{ providers: ProviderC
       if (!type) return null;
 
       const capabilities: ProviderCapabilities = {
+        supportsRecordManagement: p.supportsRecordManagement ?? false,
         supportsWeight: p.supportsWeight ?? false,
         supportsLine: p.supportsLine ?? false,
         supportsStatus: p.supportsStatus ?? false,
