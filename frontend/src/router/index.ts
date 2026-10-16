@@ -17,6 +17,12 @@ const routes: RouteRecordRaw[] = [
     meta: { public: true },
   },
   {
+    path: '/register',
+    name: 'Register',
+    component: () => import('@/pages/RegisterPage.vue'),
+    meta: { public: true },
+  },
+  {
     path: '/',
     component: () => import('@/layouts/AppLayout.vue'),
     children: [
@@ -55,6 +61,11 @@ const routes: RouteRecordRaw[] = [
       {
         path: 'ssl',
         name: 'SSLCertificates',
+        component: () => import('@/pages/SSLCertificatesPage.vue'),
+      },
+      {
+        path: 'letsencrypt',
+        name: 'LetsEncryptCertificates',
         component: () => import('@/pages/SSLCertificatesPage.vue'),
       },
       {

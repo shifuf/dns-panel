@@ -14,6 +14,24 @@ export const register = async (params: {
   return api.post('/auth/register', params);
 };
 
+/** 查询公开注册是否开放 */
+export const getRegistrationStatus = async (): Promise<
+  ApiResponse<{ open: boolean; registrationOpen?: boolean; setupComplete?: boolean }>
+> => {
+  const res = (await api.get('/auth/registration-status')) as any;
+  const data = res?.data || res || {};
+  const open = Boolean(data.open ?? data.registrationOpen);
+  return {
+    success: true,
+    message: res?.message || 'ok',
+    data: {
+      open,
+      registrationOpen: open,
+      setupComplete: Boolean(data.setupComplete),
+    },
+  } as ApiResponse<{ open: boolean; registrationOpen?: boolean; setupComplete?: boolean }>;
+};
+
 export const getSetupStatus = async (force = false): Promise<ApiResponse<SetupStatus>> => {
   if (!force && cachedSetupStatus) {
     return {

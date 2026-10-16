@@ -181,6 +181,11 @@ function goToSsl() {
   navigate('/ssl');
 }
 
+function goToLetsEncrypt() {
+  providerStore.selectProvider(null);
+  navigate('/letsencrypt');
+}
+
 function goToEdgeOne() {
   providerStore.selectProvider(null);
   navigate('/edgeone');
@@ -230,7 +235,12 @@ async function navigate(path: string) {
 
     <button class="nav-btn" :class="{ active: route.path === '/ssl' }" @click="goToSsl">
       <ShieldCheck :size="18" />
-      SSL 证书
+      腾讯云 SSL
+    </button>
+
+    <button class="nav-btn" :class="{ active: route.path === '/letsencrypt' }" @click="goToLetsEncrypt">
+      <ShieldCheck :size="18" />
+      Let's Encrypt
     </button>
 
     <button class="nav-btn" :class="{ active: route.path === '/edgeone' }" @click="goToEdgeOne">

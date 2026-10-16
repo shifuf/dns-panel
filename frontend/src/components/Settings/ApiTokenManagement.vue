@@ -19,15 +19,19 @@ const { data: tokens, isLoading } = useQuery({
 
 const showCreate = ref(false);
 const newName = ref('');
-const tokenProfile = ref<'baota' | 'readonly' | 'full'>('baota');
+const tokenProfile = ref<'baota' | 'readonly' | 'dns' | 'ops' | 'full'>('baota');
 const profileOptions = [
   { label: '宝塔 SSL 插件（推荐）', value: 'baota' },
   { label: 'SSL 只读', value: 'readonly' },
+  { label: 'DNS 读写', value: 'dns' },
+  { label: '运维只读（仪表盘/日志）', value: 'ops' },
   { label: '完整 API 权限', value: 'full' },
 ];
 const profileScopes = {
   baota: ['ssl:read', 'ssl:pem', 'ssl:issue', 'ssl:renew', 'ssl:deploy'],
   readonly: ['ssl:read'],
+  dns: ['dns:read', 'dns:write'],
+  ops: ['dashboard:read', 'logs:read', 'ssl:read', 'dns:read'],
   full: ['*'],
 };
 const newlyCreated = ref<{ token: string; name: string } | null>(null);

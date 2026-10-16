@@ -17,7 +17,21 @@ from modules.provider_catalog import (  # noqa: E402
 
 class ProviderCatalogTests(unittest.TestCase):
     def test_record_management_providers_match_python_dns_implementation(self) -> None:
-        expected = {"cloudflare", "dnspod", "dnspod_token"}
+        expected = {
+            "cloudflare",
+            "dnspod",
+            "dnspod_token",
+            "aliyun",
+            "huawei",
+            "baidu",
+            "west",
+            "huoshan",
+            "jdcloud",
+            "dnsla",
+            "namesilo",
+            "powerdns",
+            "spaceship",
+        }
 
         self.assertEqual(set(get_record_management_provider_types()), expected)
         for provider in expected:

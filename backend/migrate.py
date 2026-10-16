@@ -301,6 +301,66 @@ MIGRATIONS: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(userId)",
     "ALTER TABLE api_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT '[\"*\"]'",
+
+    # ── unified notification settings (per-user channel configs) ──
+    """
+    CREATE TABLE IF NOT EXISTS notification_settings (
+      userId INTEGER PRIMARY KEY,
+      channels TEXT NOT NULL DEFAULT '[]',
+      enabled BOOLEAN NOT NULL DEFAULT 1,
+      updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE
+    )
+    """,
+
+    # ── DNS record change history ──
+    """
+    CREATE TABLE IF NOT EXISTS dns_record_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      credentialId INTEGER,
+      zoneId TEXT,
+      zoneName TEXT,
+      recordId TEXT,
+      recordName TEXT,
+      recordType TEXT,
+      action TEXT NOT NULL,
+      oldValue TEXT,
+      newValue TEXT,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_dns_record_history_user ON dns_record_history(userId, createdAt)",
+    "CREATE INDEX IF NOT EXISTS idx_dns_record_history_zone ON dns_record_history(userId, zoneId)",
+
+    # ── DNS record templates ──
+    """
+    CREATE TABLE IF NOT EXISTS dns_record_templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT,
+      records TEXT NOT NULL,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_dns_record_templates_user ON dns_record_templates(userId)",
+
+    # ── in-app notifications ──
+    """
+    CREATE TABLE IF NOT EXISTS inapp_notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      level TEXT NOT NULL DEFAULT 'info',
+      title TEXT NOT NULL,
+      message TEXT,
+      status TEXT NOT NULL DEFAULT 'unread',
+      meta TEXT,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_inapp_notifications_user ON inapp_notifications(userId, status, createdAt)",
 ]
 
 TABLE_NAME_RE = re.compile(r"CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)

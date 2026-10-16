@@ -4,6 +4,7 @@ import { NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvid
 import { lightOverrides, darkOverrides } from './theme/naive-overrides';
 import { useTheme } from './composables/useTheme';
 import ErrorBoundary from './components/ErrorBoundary.vue';
+import CommandPalette from './components/CommandPalette.vue';
 
 const { isDark } = useTheme();
 const currentTheme = computed(() => isDark.value ? darkTheme : undefined);
@@ -22,6 +23,7 @@ const currentOverrides = computed(() => isDark.value ? darkOverrides : lightOver
         <NNotificationProvider>
           <ErrorBoundary>
             <router-view />
+            <CommandPalette />
           </ErrorBoundary>
         </NNotificationProvider>
       </NDialogProvider>

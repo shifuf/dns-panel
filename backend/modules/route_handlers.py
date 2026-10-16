@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import csv
 import io
 import ipaddress
+import json
 import socket
 import urllib.parse
 import urllib.request
@@ -21,7 +22,18 @@ from modules.cache import (
     dashboard_summary_key,
 )
 from modules import acme_api
+from modules.tencent_ssl_api import (
+    TencentSslApi, TencentSslApiError, parse_certificate_datetime,
+    certificate_days_remaining, certificate_is_expired,
+)
 from modules.acme_api import AcmeService, AcmeApiError
+from modules import dns_extras
+from modules.notification import (
+    send_notification,
+    notify_user,
+    sanitize_notification_channels,
+    validate_webhook_url,
+)
 
 def attach_route_methods(handler_cls: type, env: Dict[str, Any]) -> None:
     method_names = [
@@ -37,12 +49,68 @@ def attach_route_methods(handler_cls: type, env: Dict[str, Any]) -> None:
         '_dashboard',
         '_ssl_routes',
         '_api_tokens_routes',
+        '_notifications_routes',
     ]
     for name in method_names:
         fn = globals().get(name)
         if callable(fn):
             fn.__globals__.update(env)
             setattr(handler_cls, name, fn)
+
+
+
+def _is_registration_open() -> bool:
+    raw = str(get_system_setting("registration_open", "0") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _append_dns_record_history(
+    *,
+    user_id: int,
+    credential_id: int | None,
+    zone_id: str | None,
+    zone_name: str | None,
+    record_id: str | None,
+    record_name: str | None,
+    record_type: str | None,
+    action: str,
+    old_value: Any = None,
+    new_value: Any = None,
+) -> None:
+    """Best-effort insert into dns_record_history; no-op if table is missing."""
+    try:
+        if not table_exists("dns_record_history"):
+            return
+        old_s = None
+        new_s = None
+        if old_value is not None:
+            old_s = old_value if isinstance(old_value, str) else json.dumps(old_value, ensure_ascii=False)
+        if new_value is not None:
+            new_s = new_value if isinstance(new_value, str) else json.dumps(new_value, ensure_ascii=False)
+        with conn() as c:
+            c.execute(
+                """
+                INSERT INTO dns_record_history (
+                    userId, credentialId, zoneId, zoneName, recordId, recordName,
+                    recordType, action, oldValue, newValue, createdAt
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    int(user_id),
+                    int(credential_id) if credential_id is not None else None,
+                    str(zone_id) if zone_id is not None else None,
+                    str(zone_name) if zone_name is not None else None,
+                    str(record_id) if record_id is not None else None,
+                    str(record_name) if record_name is not None else None,
+                    str(record_type) if record_type is not None else None,
+                    str(action or "").strip().upper() or "UPDATE",
+                    old_s,
+                    new_s,
+                ),
+            )
+            c.commit()
+    except Exception:
+        pass
 
 def _auth_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     sub = path[len("/api/auth") :] or "/"
@@ -124,11 +192,55 @@ def _auth_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         if not setup_complete:
             self._err("系统尚未初始化，请先完成安装向导", 403)
             return
-        self._err("公开注册已关闭", 403)
+        if str(get_system_setting("registration_open", "0") or "0") != "1":
+            self._err("公开注册已关闭", 403)
+            return
+        username = str(body.get("username") or "").strip()
+        email_raw = str(body.get("email") or "").strip()
+        email = email_raw if email_raw else None
+        password = str(body.get("password") or "")
+        if len(username) < 3:
+            self._err("用户名至少 3 个字符", 400)
+            return
+        if not password_is_strong(password):
+            self._err("密码必须至少 8 位，且包含大小写字母和数字", 400)
+            return
+        if email and not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email):
+            self._err("邮箱格式不正确", 400)
+            return
+        with conn() as c:
+            exists = c.execute("SELECT id FROM users WHERE username = ? OR email = ? LIMIT 1", (username, email or "")).fetchone()
+            if exists:
+                self._err("用户名或邮箱已存在", 409)
+                return
+            hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=10)).decode("utf-8")
+            c.execute(
+                """
+                INSERT INTO users (username, email, password, role, createdAt, updatedAt)
+                VALUES (?, ?, ?, 'user', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                (username, email, hashed),
+            )
+            user_id = int(c.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+            row = c.execute(
+                """
+                SELECT id, username, email, role, cfAccountId, twoFactorEnabled,
+                       domainExpiryDisplayMode, domainExpiryThresholdDays,
+                       domainExpiryNotifyEnabled, domainExpiryNotifyWebhookUrl,
+                       domainExpiryNotifyEmailEnabled, domainExpiryNotifyEmailTo,
+                       smtpHost, smtpPort, smtpSecure, smtpUser, smtpFrom, smtpPass,
+                       createdAt, updatedAt
+                FROM users WHERE id = ? LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            c.commit()
+        self._ok({"user": user_public_dict(row)}, "注册成功", 201)
         return
 
     if self.command == "GET" and sub == "/registration-status":
-        self._json(200, {"registrationOpen": False, "setupComplete": setup_complete})
+        open_flag = str(get_system_setting("registration_open", "0") or "0") == "1"
+        self._json(200, {"registrationOpen": open_flag, "open": open_flag, "setupComplete": setup_complete})
         return
 
     if self.command == "POST" and sub == "/login":
@@ -321,7 +433,8 @@ def _auth_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             set_system_setting("backup_file_prefix", sanitize_backup_file_prefix(str(body.get("backupFilePrefix") or "")))
         if "backupWriteServerCopy" in body:
             set_system_setting("backup_write_server_copy", "1" if bool(body.get("backupWriteServerCopy")) else "0")
-        set_system_setting("registration_open", "0")
+        if "registrationOpen" in body:
+            set_system_setting("registration_open", "1" if bool(body.get("registrationOpen")) else "0")
         self._ok(None, "系统设置已更新")
         return
 
@@ -925,11 +1038,7 @@ def _domain_expiry_payload(user_row: Any, due_results: List[Dict[str, Any]]) -> 
 
 
 def _send_domain_expiry_webhook(url: str, payload: Dict[str, Any]) -> None:
-    target = str(url or "").strip()
-    if not target:
-        raise ValueError("Webhook URL 未配置")
-    if not re.match(r"^https?://", target, re.IGNORECASE):
-        raise ValueError("Webhook URL 必须以 http:// 或 https:// 开头")
+    target = validate_webhook_url(url)
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         target,
@@ -940,8 +1049,13 @@ def _send_domain_expiry_webhook(url: str, payload: Dict[str, Any]) -> None:
             "User-Agent": "dns-panel-domain-expiry/1.0",
         },
     )
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+            raise ValueError("Webhook URL 不允许 HTTP 重定向")
+
+    opener = urllib.request.build_opener(_NoRedirect())
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with opener.open(req, timeout=10) as resp:
             if int(getattr(resp, "status", 200)) < 200 or int(getattr(resp, "status", 200)) >= 300:
                 raise ValueError(f"Webhook 返回 HTTP {getattr(resp, 'status', 0)}")
     except urllib.error.HTTPError as exc:
@@ -1084,6 +1198,106 @@ def _mark_domain_expiry_delivery(uid: int, due_results: List[Dict[str, Any]], st
         c.commit()
 
 
+# Alert windows (days remaining buckets). A domain is alerted when remaining
+# days falls into one of these buckets, with 24h dedup per domain+bucket.
+DOMAIN_EXPIRY_ALERT_WINDOWS = (30, 15, 7, 3, 1)
+
+
+def _domain_expiry_threshold_bucket(days_remaining: int) -> int | None:
+    """Map remaining days to the tightest matching alert window bucket."""
+    matched = None
+    for window in DOMAIN_EXPIRY_ALERT_WINDOWS:
+        if days_remaining <= window:
+            matched = window
+    return matched
+
+
+def _domain_expiry_notified_recently(last_notified_at: Any, hours: int = 24) -> bool:
+    if not last_notified_at:
+        return False
+    dt = parse_dt(last_notified_at)
+    if not dt:
+        return False
+    return (now() - dt).total_seconds() < max(1, hours) * 3600
+
+
+def _fire_expiry_warning_alert_rules(uid: int, due: List[Dict[str, Any]]) -> int:
+    """Fire dashboard alert-rules of type expiry_warning (inapp events only).
+
+    External channels (email/webhook/...) are delivered once by
+    `_process_domain_expiry_notifications` via NotificationService, so this
+    helper intentionally only writes dashboard alert-events to avoid duplicates.
+    Returns the number of rules that fired.
+    """
+    if not due:
+        return 0
+    try:
+        from modules.notification import append_dashboard_alert_event
+    except Exception:
+        append_dashboard_alert_event = None  # type: ignore
+
+    rules = with_default_list(read_state(uid, "alert-rules", []))
+    if not rules:
+        rules = dflt_rules()
+        write_state(uid, "alert-rules", rules)
+
+    min_days = min(int(item.get("daysRemaining") or 9999) for item in due)
+    fired = 0
+    for rule in rules:
+        if not isinstance(rule, dict) or not rule.get("enabled", True):
+            continue
+        if str(rule.get("type") or "") != "expiry_warning":
+            continue
+        threshold = rule.get("threshold")
+        try:
+            thr = int(threshold) if threshold is not None else 7
+        except Exception:
+            thr = 7
+        matching = [d for d in due if int(d.get("daysRemaining") or 9999) <= thr]
+        if not matching:
+            continue
+        targets = matching
+        title = str(rule.get("name") or "到期预警告警")
+        lines = [f"{item.get('domain')}（剩余 {item.get('daysRemaining')} 天）" for item in targets[:20]]
+        message = f"检测到 {len(targets)} 个域名即将到期：\n" + "\n".join(lines)
+
+        channels = [str(x).strip() for x in (rule.get("channels") if isinstance(rule.get("channels"), list) else ["inapp"])]
+        # Write inapp dashboard event when rule includes inapp (default) or has no channels.
+        if "inapp" in channels or not channels:
+            try:
+                if append_dashboard_alert_event:
+                    append_dashboard_alert_event(
+                        uid,
+                        title=title,
+                        message=message,
+                        level="high" if min_days <= 3 else "medium",
+                        event_type="expiry_warning",
+                    )
+                else:
+                    ev = with_default_list(read_state(uid, "alert-events", []))
+                    ev.insert(
+                        0,
+                        {
+                            "id": make_id("expiry-alert"),
+                            "level": "high" if min_days <= 3 else "medium",
+                            "status": "open",
+                            "title": title,
+                            "message": message,
+                            "type": "expiry_warning",
+                            "createdAt": now_iso(),
+                        },
+                    )
+                    write_state(uid, "alert-events", ev[:MAX_EVENTS])
+                fired += 1
+            except Exception:
+                pass
+        else:
+            # Rule exists and matched but only external channels — still count as fired
+            # so caller can mark lastNotifiedAt; external send is done elsewhere.
+            fired += 1
+    return fired
+
+
 def _process_domain_expiry_notifications(uid: int, results: List[Dict[str, Any]]) -> Dict[str, Any]:
     with conn() as c:
         user_row = c.execute(
@@ -1103,7 +1317,8 @@ def _process_domain_expiry_notifications(uid: int, results: List[Dict[str, Any]]
         return {"tracked": 0, "notified": 0}
 
     threshold = int(user_row["domainExpiryThresholdDays"] or 7)
-    track_window = max(30, threshold)
+    # Always track up to the widest alert window (30d) or user threshold, whichever is larger.
+    track_window = max(30, threshold, max(DOMAIN_EXPIRY_ALERT_WINDOWS))
     tracked = 0
     due: List[Dict[str, Any]] = []
 
@@ -1126,37 +1341,98 @@ def _process_domain_expiry_notifications(uid: int, results: List[Dict[str, Any]]
         if days <= track_window:
             _upsert_domain_expiry_tracking(uid, normalized, days)
             tracked += 1
-        if days <= threshold:
-            row = _select_domain_expiry_tracking(uid, normalized)
-            if row and str(row["status"] or "") in {"sent", "partial"} and row["lastNotifiedAt"]:
-                continue
-            due.append(normalized)
+
+        bucket = _domain_expiry_threshold_bucket(days)
+        # Also honour the user-configured threshold as an additional trigger.
+        should_alert = bucket is not None or days <= threshold
+        if not should_alert:
+            continue
+
+        row = _select_domain_expiry_tracking(uid, normalized)
+        # Dedup: skip if last notified within 24h for the same domain+threshold bucket.
+        if row and _domain_expiry_notified_recently(row["lastNotifiedAt"], hours=24):
+            continue
+        # Legacy: status sent/partial without recent timestamp still re-notify after 24h only.
+        if row and str(row["status"] or "") in {"sent", "partial"} and row["lastNotifiedAt"] and _domain_expiry_notified_recently(row["lastNotifiedAt"], hours=24):
+            continue
+        normalized["alertBucket"] = bucket if bucket is not None else threshold
+        due.append(normalized)
 
     cache_delete_pattern(dashboard_summary_key(uid))
 
-    deliveries: List[Dict[str, Any]] = []
     if not due:
         return {"tracked": tracked, "notified": 0}
 
-    webhook_url = str(user_row["domainExpiryNotifyWebhookUrl"] or "").strip()
-    if bool(user_row["domainExpiryNotifyEnabled"]) and webhook_url:
-        try:
-            _send_domain_expiry_webhook(webhook_url, _domain_expiry_payload(user_row, due))
-            deliveries.append({"channel": "webhook", "status": "success"})
-        except Exception as exc:
-            deliveries.append({"channel": "webhook", "status": "failed", "error": str(exc)})
+    # Fire dashboard alert rules (inapp events only; external channels sent below)
+    alert_fired = 0
+    try:
+        alert_fired = int(_fire_expiry_warning_alert_rules(uid, due) or 0)
+    except Exception:
+        alert_fired = 0
 
-    if bool(user_row["domainExpiryNotifyEmailEnabled"]):
-        try:
-            _send_domain_expiry_email(user_row, _domain_expiry_payload(user_row, due))
-            deliveries.append({"channel": "email", "status": "success"})
-        except Exception as exc:
-            deliveries.append({"channel": "email", "status": "failed", "error": str(exc)})
+    # Deliver via unified notification service (domain-expiry channels + optional extras)
+    deliveries: List[Dict[str, Any]] = []
+    if alert_fired > 0:
+        deliveries.append({"channel": "inapp", "status": "success", "success": True})
+    try:
+        from modules.notification import notify_user
+
+        payload = _domain_expiry_payload(user_row, due)
+        lines = [
+            f"DNS Panel 检测到 {len(due)} 个域名即将到期。",
+            "",
+        ]
+        for item in due[:50]:
+            lines.append(
+                f"- {item.get('domain')}：{item.get('expiresAt')}（剩余 {item.get('daysRemaining')} 天）"
+            )
+        lines.extend(["", f"检查时间：{payload.get('generatedAt')}"])
+        content = "\n".join(lines)
+        title = f"DNS Panel 域名到期提醒（{len(due)} 个）"
+
+        # inapp/alert-events already handled by _fire_expiry_warning_alert_rules
+        raw_results = notify_user(
+            user_row,
+            "domain_expiry_warning",
+            title,
+            content,
+            level="warning",
+            meta=payload,
+            include_inapp=False,
+        )
+        for item in raw_results or []:
+            if not isinstance(item, dict):
+                continue
+            deliveries.append(
+                {
+                    "channel": item.get("channel"),
+                    "status": "success" if item.get("success") else "failed",
+                    "success": bool(item.get("success")),
+                    "error": item.get("error"),
+                }
+            )
+    except Exception as exc:
+        # Fallback to legacy per-channel senders so existing configs keep working.
+        webhook_url = str(user_row["domainExpiryNotifyWebhookUrl"] or "").strip()
+        if bool(user_row["domainExpiryNotifyEnabled"]) and webhook_url:
+            try:
+                _send_domain_expiry_webhook(webhook_url, _domain_expiry_payload(user_row, due))
+                deliveries.append({"channel": "webhook", "status": "success", "success": True})
+            except Exception as wexc:
+                deliveries.append({"channel": "webhook", "status": "failed", "success": False, "error": str(wexc)})
+        if bool(user_row["domainExpiryNotifyEmailEnabled"]):
+            try:
+                _send_domain_expiry_email(user_row, _domain_expiry_payload(user_row, due))
+                deliveries.append({"channel": "email", "status": "success", "success": True})
+            except Exception as eexc:
+                deliveries.append({"channel": "email", "status": "failed", "success": False, "error": str(eexc)})
+        if not deliveries:
+            deliveries.append({"channel": "notification", "status": "failed", "success": False, "error": str(exc)})
 
     if not deliveries:
-        return {"tracked": tracked, "notified": 0}
+        return {"tracked": tracked, "notified": 0, "due": len(due)}
 
-    success_count = sum(1 for item in deliveries if item.get("status") == "success")
+    success_count = sum(1 for item in deliveries if item.get("status") == "success" or item.get("success"))
     if success_count == len(deliveries):
         delivery_status = "sent"
     elif success_count > 0:
@@ -1187,11 +1463,66 @@ def _process_domain_expiry_notifications(uid: int, results: List[Dict[str, Any]]
     return {"tracked": tracked, "notified": len(due), "deliveryStatus": delivery_status}
 
 
+def append_inapp_via_dashboard(uid: int, kwargs: Dict[str, Any]) -> None:
+    """Bridge inapp channel → dashboard alert-events + inapp_notifications table."""
+    title = str(kwargs.get("title") or "通知")
+    content = str(kwargs.get("content") or "")
+    level = str(kwargs.get("level") or "info")
+    meta = kwargs.get("meta") if isinstance(kwargs.get("meta"), dict) else {}
+    try:
+        from modules.notification import append_dashboard_alert_event
+
+        append_dashboard_alert_event(
+            uid,
+            title=title,
+            message=content,
+            level="high" if level in {"error", "critical", "high"} else ("medium" if level in {"warning", "warn"} else "low"),
+            event_type=str(meta.get("event") or "notification"),
+        )
+    except Exception:
+        try:
+            ev = with_default_list(read_state(uid, "alert-events", []))
+            ev.insert(
+                0,
+                {
+                    "id": make_id("inapp"),
+                    "level": "medium",
+                    "status": "open",
+                    "title": title,
+                    "message": content,
+                    "createdAt": now_iso(),
+                },
+            )
+            write_state(uid, "alert-events", ev[:MAX_EVENTS])
+        except Exception:
+            pass
+    try:
+        with conn() as c:
+            c.execute(
+                """
+                INSERT INTO inapp_notifications (userId, level, title, message, status, meta, createdAt)
+                VALUES (?, ?, ?, ?, 'unread', ?, ?)
+                """,
+                (
+                    uid,
+                    level[:32],
+                    title[:200],
+                    content[:4000],
+                    json.dumps(meta, ensure_ascii=False),
+                    now_iso(),
+                ),
+            )
+            c.commit()
+    except Exception:
+        pass
+
+
 def _domain_expiry_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     sub = path[len("/api/domain-expiry") :] or "/"
     auth_user = self._auth()
     if not auth_user:
         return
+    uid = int(auth_user.get("id") or 0)
 
     if self.command == "POST" and sub == "/lookup":
         body = self._json_body(b)
@@ -1219,16 +1550,144 @@ def _domain_expiry_routes(self, path: str, q: Dict[str, List[str]], b: bytes) ->
                 results = list(pool.map(self._lookup_domain_expiry_single, unique))
         else:
             results = []
+        notify_summary: Dict[str, Any] = {}
         try:
-            uid = int(auth_user.get("id") or 0)
             if uid > 0:
-                _process_domain_expiry_notifications(uid, results)
+                notify_summary = _process_domain_expiry_notifications(uid, results) or {}
         except Exception:
             pass
-        self._ok({"results": results}, "获取域名到期信息成功")
+        self._ok({"results": results, "notify": notify_summary}, "获取域名到期信息成功")
+        return
+
+    if self.command == "POST" and sub == "/scan":
+        if uid <= 0:
+            self._err("认证失败", 401)
+            return
+        try:
+            summary = _scan_user_domain_expiry(self, uid)
+        except Exception as exc:
+            self._err(f"域名到期扫描失败: {exc}", 500)
+            return
+        self._ok(summary, "域名到期扫描完成")
+        return
+
+    if self.command == "GET" and sub == "/tracked":
+        if uid <= 0:
+            self._err("认证失败", 401)
+            return
+        page = p_int((q.get("page") or ["1"])[0], 1, 100000)
+        limit = p_int((q.get("limit") or ["50"])[0], 50, 200)
+        with conn() as c:
+            total = c.execute(
+                "SELECT COUNT(*) AS c FROM domain_expiry_notifications WHERE userId = ?",
+                (uid,),
+            ).fetchone()["c"]
+            rows = c.execute(
+                """
+                SELECT id, domain, expiresAt, daysRemaining, channels, status,
+                       errorMessage, lastNotifiedAt, createdAt, updatedAt
+                FROM domain_expiry_notifications
+                WHERE userId = ?
+                ORDER BY datetime(expiresAt) ASC, domain ASC
+                LIMIT ? OFFSET ?
+                """,
+                (uid, limit, (page - 1) * limit),
+            ).fetchall()
+        items = []
+        for row in rows:
+            channels_raw = row["channels"]
+            try:
+                channels = json.loads(channels_raw) if channels_raw else []
+            except Exception:
+                channels = []
+            items.append(
+                {
+                    "id": row["id"],
+                    "domain": row["domain"],
+                    "expiresAt": row["expiresAt"],
+                    "daysRemaining": row["daysRemaining"],
+                    "channels": channels,
+                    "status": row["status"],
+                    "errorMessage": row["errorMessage"],
+                    "lastNotifiedAt": row["lastNotifiedAt"],
+                    "createdAt": row["createdAt"],
+                    "updatedAt": row["updatedAt"],
+                }
+            )
+        self._ok({"items": items, "total": int(total or 0), "page": page, "limit": limit}, "获取跟踪域名成功")
         return
 
     self._err("接口不存在", 404)
+
+
+def _collect_user_zone_domains(handler: Any, uid: int) -> List[str]:
+    """List zone apex domains from all DNS record-management credentials for a user."""
+    domains: List[str] = []
+    seen = set()
+    with conn() as c:
+        rows = c.execute(
+            f"""
+            SELECT *
+            FROM dns_credentials
+            WHERE userId = ? AND provider IN ({SUPPORTED_DNS_RECORD_PROVIDER_SQL})
+            ORDER BY provider ASC, isDefault DESC, createdAt ASC, id ASC
+            """,
+            (uid, *SUPPORTED_DNS_RECORD_PROVIDER_TYPES),
+        ).fetchall()
+    for row in rows:
+        cred_id = int(row["id"])
+        provider = str(row["provider"] or "").strip().lower()
+        try:
+            ctx = handler._dns_context(uid, {"credentialId": [str(cred_id)]})
+            page = 1
+            page_size = 100
+            while page <= 20:
+                if provider == "cloudflare":
+                    result = ctx["cf"].list_zones(page, page_size, None)
+                    zones_raw = result.get("zones") if isinstance(result, dict) else []
+                    zones = [handler._map_cf_zone(z) for z in zones_raw if isinstance(z, dict)]
+                elif provider in ("dnspod", "dnspod_token"):
+                    result = ctx["dnspod"].list_zones(page, page_size, None)
+                    zones_raw = result.get("zones") if isinstance(result, dict) else []
+                    zones = [handler._map_dnspod_zone(z) for z in zones_raw if isinstance(z, dict)]
+                else:
+                    break
+                if not zones:
+                    break
+                for zone in zones:
+                    name = norm_domain(zone.get("name") if isinstance(zone, dict) else "")
+                    if not name or name in seen:
+                        continue
+                    seen.add(name)
+                    domains.append(name)
+                total = int(result.get("total") or 0) if isinstance(result, dict) else len(zones)
+                if page * page_size >= total or len(zones) < page_size:
+                    break
+                page += 1
+        except Exception:
+            continue
+    return domains
+
+
+def _scan_user_domain_expiry(handler: Any, uid: int) -> Dict[str, Any]:
+    """Collect domains for a user, RDAP-lookup, track and notify."""
+    domains = _collect_user_zone_domains(handler, uid)
+    results: List[Dict[str, Any]] = []
+    if domains:
+        workers = min(len(domains), 12)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(handler._lookup_domain_expiry_single, domains))
+    notify_summary: Dict[str, Any] = {}
+    try:
+        notify_summary = _process_domain_expiry_notifications(uid, results) or {}
+    except Exception as exc:
+        notify_summary = {"error": str(exc)}
+    return {
+        "scanned": len(domains),
+        "domains": domains,
+        "results": results,
+        "notify": notify_summary,
+    }
 
 
 def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
@@ -1588,34 +2047,24 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
         verify_details: Dict[str, Any] = {}
         try:
             secrets = self._json_loads_safe(decrypt_text(row["secrets"]))
-            if provider == "cloudflare":
-                token = str(secrets.get("apiToken") or "").strip()
-                if not token:
-                    raise ValueError("缺少 Cloudflare API Token")
-                cf_api = CloudflareApi(token)
-                valid = cf_api.verify_token()
+            if provider in SUPPORTED_DNS_RECORD_PROVIDER_SET:
+                dns_api = build_dns_provider_api(provider, secrets)
+                valid = bool(dns_api.verify_credentials())
                 if valid:
-                    zone_result = cf_api.list_zones(1, 100)
+                    zone_result = dns_api.list_zones(1, 100)
                     visible_zones = [
                         str(item.get("name") or "").strip()
-                        for item in (zone_result.get("zones") or []) if str(item.get("name") or "").strip()
+                        for item in (zone_result.get("zones") or [])
+                        if str(item.get("name") or "").strip()
                     ]
                     zone_count = int(zone_result.get("total") or len(visible_zones))
                     verify_details = {"zoneCount": zone_count, "visibleZones": visible_zones}
-                    if zone_count == 0:
-                        verify_details["warning"] = "Token 验证成功，但没有任何可见域名。请检查 Zone Resources 授权范围。"
-                    elif zone_count == 1:
-                        verify_details["warning"] = "当前 Token 仅能看到 1 个域名，可能只授权了单个 Zone。请在 Cloudflare API Token 的 Zone Resources 中选择 Include → All zones，或勾选全部需要管理的域名。"
+                    if provider == "cloudflare":
+                        if zone_count == 0:
+                            verify_details["warning"] = "Token 验证成功，但没有任何可见域名。请检查 Zone Resources 授权范围。"
+                        elif zone_count == 1:
+                            verify_details["warning"] = "当前 Token 仅能看到 1 个域名，可能只授权了单个 Zone。请在 Cloudflare API Token 的 Zone Resources 中选择 Include → All zones，或勾选全部需要管理的域名。"
                     cache_delete_pattern(f"dns:*:cred:{cid}:*")
-            elif provider in ("dnspod", "dnspod_token"):
-                has_tc3 = str(secrets.get("secretId") or "").strip() and str(secrets.get("secretKey") or "").strip()
-                has_token = str(secrets.get("tokenId") or "").strip() and str(secrets.get("token") or "").strip()
-                if provider == "dnspod" and not (has_tc3 or has_token):
-                    raise ValueError("DNSPod 凭证需提供 SecretId/SecretKey 或 TokenId/Token")
-                if provider == "dnspod_token" and not has_token:
-                    raise ValueError("缺少 DNSPod TokenId 或 Token")
-                DnspodApi(secrets).list_zones(1, 1)
-                valid = True
             elif provider in SUPPORTED_ACCELERATION_PROVIDER_SET:
                 validate_acceleration_credentials(provider, secrets)
                 valid = True
@@ -1722,24 +2171,18 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             if current_id > 0 and current_id in seen_credential_ids:
                 return
             dns_provider = str(row["provider"] or "").strip().lower()
-            if dns_provider not in {"cloudflare", "dnspod", "dnspod_token"}:
+            if dns_provider not in SUPPORTED_DNS_RECORD_PROVIDER_SET:
                 if report_errors:
                     errors.append({
                         "credentialId": current_id or None,
                         "credentialName": str(row["name"] or ""),
                         "provider": dns_provider,
-                        "error": "所选 DNS 凭证不支持自动配置（仅 Cloudflare / DNSPod 支持）",
+                        "error": "所选 DNS 凭证不支持自动配置（当前提供商未启用记录管理）",
                     })
                 return
             try:
                 secrets = self._credential_secrets(row)
-                if dns_provider == "cloudflare":
-                    token = str(secrets.get("apiToken") or "").strip()
-                    if not token:
-                        raise ValueError("缺少 Cloudflare API Token")
-                    api_obj = CloudflareApi(token)
-                else:
-                    api_obj = DnspodApi(secrets)
+                api_obj = build_dns_provider_api(dns_provider, secrets)
                 zones = api_obj.list_zones(1, 200).get("zones", [])
                 collected.append((api_obj, dns_provider, row, zones if isinstance(zones, list) else []))
                 if current_id > 0:
@@ -1763,13 +2206,13 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
         if auto_match_dns and not collected:
             with conn() as c:
                 rows = c.execute(
-                    """
+                    f"""
                     SELECT id, name, provider, secrets
                     FROM dns_credentials
-                    WHERE userId = ? AND provider IN ('cloudflare', 'dnspod', 'dnspod_token')
+                    WHERE userId = ? AND provider IN ({SUPPORTED_DNS_RECORD_PROVIDER_SQL})
                     ORDER BY isDefault DESC, createdAt ASC, id ASC
                     """,
-                    (uid,),
+                    (uid, *SUPPORTED_DNS_RECORD_PROVIDER_TYPES),
                 ).fetchall()
             for row in rows:
                 add_row(row, report_errors=False)
@@ -1811,12 +2254,11 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             current_type = str(item.get("type") or item.get("recordType") or "").strip().upper()
             if current_type != str(record_type or "").strip().upper():
                 continue
-            if dns_provider == "cloudflare":
-                current_name = str(item.get("name") or "").strip().rstrip(".").lower()
-                current_value = normalize_record_compare(record_type, item.get("content"))
-            else:
-                current_name = str(item.get("name") or "").strip().rstrip(".").lower()
-                current_value = normalize_record_compare(record_type, item.get("value"))
+            current_name = str(item.get("name") or "").strip().rstrip(".").lower()
+            current_value = normalize_record_compare(
+                record_type,
+                item.get("value") if item.get("value") is not None else item.get("content"),
+            )
             if current_name == expected_name and current_value == expected_value:
                 return item
         return None
@@ -1836,25 +2278,16 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
         existing = find_existing_dns_record(api_obj, dns_provider, zone_id, fqdn_name, record_type, value)
         if existing:
             return {"existing": True, "record": existing}
-        if dns_provider == "cloudflare":
-            payload = {
-                "type": str(record_type or "").strip().upper(),
-                "name": str(fqdn_name or "").strip(),
-                "content": self._normalize_txt_for_cf(record_type, value) if str(record_type or "").strip().upper() == "TXT" else str(value or "").strip(),
-                "ttl": int(ttl) if int(ttl) > 0 else 600,
-            }
-            if str(record_type or "").strip().upper() == "CNAME":
-                payload["proxied"] = False
-            record = api_obj.create_record(zone_id, payload)
-        else:
-            payload = {
-                "type": str(record_type or "").strip().upper(),
-                "name": str(fqdn_name or "").strip(),
-                "value": str(value or "").strip(),
-                "ttl": int(ttl) if int(ttl) > 0 else 600,
-                "line": "default",
-            }
-            record = api_obj.create_record(zone_id, payload)
+        payload = {
+            "type": str(record_type or "").strip().upper(),
+            "name": str(fqdn_name or "").strip(),
+            "value": str(value or "").strip(),
+            "ttl": int(ttl) if int(ttl) > 0 else 600,
+            "line": "default",
+        }
+        if str(record_type or "").strip().upper() == "CNAME":
+            payload["proxied"] = False
+        record = api_obj.create_record(zone_id, payload)
         return {"existing": False, "record": record}
 
     def normalize_fqdn(value: Any) -> str:
@@ -1863,16 +2296,6 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
     def normalize_dns_record_item(dns_provider: str, item: Any) -> Dict[str, Any] | None:
         if not isinstance(item, dict):
             return None
-        if dns_provider == "cloudflare":
-            return {
-                "id": str(item.get("id") or item.get("recordId") or "").strip(),
-                "type": str(item.get("type") or item.get("recordType") or "").strip().upper(),
-                "name": str(item.get("name") or item.get("recordName") or "").strip(),
-                "value": str(item.get("content") or item.get("value") or "").strip(),
-                "ttl": item.get("ttl"),
-                "status": str(item.get("status") or "").strip(),
-                "proxied": item.get("proxied"),
-            }
         return {
             "id": str(item.get("id") or item.get("recordId") or "").strip(),
             "type": str(item.get("type") or item.get("recordType") or "").strip().upper(),
@@ -2645,16 +3068,76 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
         return
     ip = self._client_ip()
 
-    try:
-        ctx = self._dns_context(uid, q)
-    except Exception as e:
-        self._err(str(e), 400)
-        return
-    provider = ctx["provider"]
-    is_cf = provider == "cloudflare"
-    cf = ctx.get("cf")
-    dnspod = ctx.get("dnspod")
-    dns_credential_id = int(ctx["credential"]["id"] or 0)
+    # Routes that do not require a DNS credential up-front
+    needs_dns_ctx = True
+    if self.command == "GET" and sub == "/history":
+        needs_dns_ctx = False
+    elif self.command == "POST" and re.fullmatch(r"/history/(\d+)/rollback", sub):
+        # Resolve provider API from the history row's credentialId (or query) later.
+        needs_dns_ctx = False
+    elif self.command == "GET" and sub == "/templates":
+        needs_dns_ctx = False
+    elif self.command == "POST" and sub == "/templates":
+        needs_dns_ctx = False
+    elif self.command == "DELETE" and re.fullmatch(r"/templates/(\d+)", sub):
+        needs_dns_ctx = False
+    elif self.command == "POST" and sub == "/templates/apply":
+        needs_dns_ctx = True
+    elif self.command == "POST" and sub == "/propagate-check":
+        needs_dns_ctx = False
+
+    if not needs_dns_ctx:
+        # Provide safe defaults for helpers referenced in extras that may read these
+        provider = ""
+        api = None
+        is_cf = False
+        cf = None
+        dnspod = None
+        dns_credential_id = 0
+        ctx = {"credential": {"id": 0}, "provider": "", "api": None}
+    else:
+        try:
+            ctx = self._dns_context(uid, q)
+        except Exception as e:
+            self._err(str(e), 400)
+            return
+        provider = ctx["provider"]
+        api = ctx["api"]
+        is_cf = provider == "cloudflare"
+        cf = ctx.get("cf")
+        dnspod = ctx.get("dnspod")
+        dns_credential_id = int(ctx["credential"]["id"] or 0)
+
+    def map_zone(zone: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(zone, dict):
+            return {"id": "", "name": "", "status": "active", "recordCount": None, "updatedAt": None}
+        out = {
+            "id": str(zone.get("id") or ""),
+            "name": str(zone.get("name") or ""),
+            "status": str(zone.get("status") or "active"),
+            "recordCount": zone.get("recordCount"),
+            "updatedAt": zone.get("updatedAt"),
+        }
+        if isinstance(zone.get("nameServers"), list):
+            out["nameServers"] = [str(x) for x in zone.get("nameServers") if str(x or "").strip()]
+        return out
+
+    def map_record(zone_id: str, zone_name: str, row: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(row) if isinstance(row, dict) else {}
+        out["zoneId"] = zone_id
+        out["zoneName"] = zone_name
+        out["meta"] = {"raw": row}
+        if out.get("proxied") is None and provider != "cloudflare":
+            out["proxied"] = False
+        return out
+
+    def supports_status_flag() -> bool:
+        return bool(getattr(api, "supports_status", False))
+
+    def api_error_status(exc: Exception) -> int:
+        if isinstance(exc, (DnsProviderApiError, CloudflareApiError, DnspodApiError)):
+            return int(getattr(exc, "status", 400) or 400)
+        return 400
 
     def normalize_host(value: Any) -> str:
         return self._norm_hostname(value)
@@ -2866,18 +3349,10 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
 
     def list_records_for_name(zone_id: str, zone_name: str, fqdn_name: str) -> List[Dict[str, Any]]:
         try:
-            if is_cf:
-                result = cf.list_records(zone_id, 1, 200, {"name": fqdn_name})
-                rows = result.get("records") if isinstance(result, dict) else []
-                return [
-                    self._map_cf_record(zone_id, zone_name, row)
-                    for row in rows
-                    if isinstance(row, dict) and normalize_host(row.get("name")) == normalize_host(fqdn_name)
-                ]
-            result = dnspod.list_records(zone_id, 1, 200, {"subDomain": fqdn_name})
+            result = api.list_records(zone_id, 1, 200, {"name": fqdn_name, "subDomain": fqdn_name})
             rows = result.get("records") if isinstance(result, dict) else []
             return [
-                self._map_dnspod_record(zone_id, zone_name, row)
+                map_record(zone_id, zone_name, row)
                 for row in rows
                 if isinstance(row, dict) and normalize_host(row.get("name")) == normalize_host(fqdn_name)
             ]
@@ -2885,20 +3360,7 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
             return []
 
     def update_managed_record(zone_id: str, zone_name: str, record_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        if is_cf:
-            payload = {
-                "type": str(params.get("type") or "").strip().upper(),
-                "name": str(params.get("name") or "").strip(),
-                "content": self._normalize_txt_for_cf(str(params.get("type") or "").strip().upper(), params.get("value")),
-                "ttl": int(params.get("ttl")) if isinstance(params.get("ttl"), (int, float)) else 1,
-                "priority": int(params.get("priority")) if isinstance(params.get("priority"), (int, float)) else None,
-                "comment": params.get("remark"),
-            }
-            if payload["type"] in {"A", "AAAA", "CNAME"}:
-                payload["proxied"] = bool(params.get("proxied"))
-            record = cf.update_record(zone_id, record_id, payload)
-            return self._map_cf_record(zone_id, zone_name, record)
-        record = dnspod.update_record(
+        record = api.update_record(
             zone_id,
             record_id,
             {
@@ -2910,9 +3372,10 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 "weight": params.get("weight"),
                 "line": params.get("line"),
                 "remark": params.get("remark"),
+                "proxied": params.get("proxied"),
             },
         )
-        return self._map_dnspod_record(zone_id, zone_name, record)
+        return map_record(zone_id, zone_name, record)
 
     def build_edgeone_domain_config_from_record(fqdn_name: str, record: Dict[str, Any] | None) -> Dict[str, Any]:
         source_record = dict(record or {})
@@ -3055,20 +3518,15 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
             self._ok(cached, "获取域名列表成功")
             return
         try:
-            if is_cf:
-                result = cf.list_zones(page, page_size, keyword)
-                zones_raw = result.get("zones") if isinstance(result, dict) else []
-                zones = [self._map_cf_zone(z) for z in zones_raw if isinstance(z, dict)]
-            else:
-                result = dnspod.list_zones(page, page_size, keyword)
-                zones_raw = result.get("zones") if isinstance(result, dict) else []
-                zones = [self._map_dnspod_zone(z) for z in zones_raw if isinstance(z, dict)]
+            result = api.list_zones(page, page_size, keyword)
+            zones_raw = result.get("zones") if isinstance(result, dict) else []
+            zones = [map_zone(z) for z in zones_raw if isinstance(z, dict)]
             total = int(result.get("total")) if isinstance(result, dict) and result.get("total") is not None else len(zones)
             data = {"zones": zones, "total": total, "page": page, "pageSize": page_size}
             cache_set(ck, data, (get_provider_capabilities(provider) or {}).get("domainCacheTtl", 300))
             self._ok(data, "获取域名列表成功")
-        except (CloudflareApiError, DnspodApiError) as e:
-            self._err(str(e), e.status)
+        except (DnsProviderApiError, CloudflareApiError, DnspodApiError) as e:
+            self._err(str(e), getattr(e, "status", 400))
         return
 
     if self.command == "POST" and sub == "/zones":
@@ -3077,9 +3535,10 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
             self._err("缺少必需参数: domains", 400)
             return
 
-        if is_cf:
+        account_id = ""
+        if provider == "cloudflare":
             account_id = str(ctx["credential"]["accountId"] or "").strip()
-            if not account_id:
+            if not account_id and cf is not None:
                 try:
                     account_id = cf.get_default_account_id()
                 except Exception:
@@ -3091,19 +3550,21 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
         results = []
         for domain in domains:
             try:
-                if is_cf:
-                    existed_zone = cf.get_zone_by_name(domain, account_id)
-                    if existed_zone:
-                        zone = existed_zone
-                        existed = True
-                    else:
-                        zone = cf.create_zone(domain, account_id)
-                        existed = False
-                    name_servers = [str(x) for x in zone.get("name_servers")] if isinstance(zone.get("name_servers"), list) else None
+                create_kwargs = {}
+                if provider == "cloudflare" and account_id:
+                    create_kwargs["account_id"] = account_id
+                existed = False
+                existed_zone = None
+                try:
+                    existed_zone = api.get_zone_by_name(domain)
+                except Exception:
+                    existed_zone = None
+                if existed_zone:
+                    zone = existed_zone
+                    existed = True
                 else:
-                    zone = dnspod.create_zone(domain)
-                    existed = False
-                    name_servers = None
+                    zone = api.create_zone(domain, **create_kwargs)
+                name_servers = zone.get("nameServers") if isinstance(zone, dict) and isinstance(zone.get("nameServers"), list) else None
                 results.append(
                     {
                         "domain": domain,
@@ -3147,14 +3608,10 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
     if self.command == "GET" and m:
         zone_id = urllib.parse.unquote(m.group(1))
         try:
-            if is_cf:
-                zone = cf.get_zone(zone_id)
-                self._ok({"zone": self._map_cf_zone(zone)}, "获取域名详情成功")
-            else:
-                zone = dnspod.get_zone(zone_id)
-                self._ok({"zone": self._map_dnspod_zone(zone)}, "获取域名详情成功")
-        except (CloudflareApiError, DnspodApiError) as e:
-            self._err(str(e), e.status)
+            zone = api.get_zone(zone_id)
+            self._ok({"zone": map_zone(zone)}, "获取域名详情成功")
+        except (DnsProviderApiError, CloudflareApiError, DnspodApiError) as e:
+            self._err(str(e), getattr(e, "status", 400))
         return
 
     m = re.fullmatch(r"/zones/([^/]+)", sub)
@@ -3162,19 +3619,12 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
         zone_id = urllib.parse.unquote(m.group(1))
         zone_name = zone_id
         try:
-            if is_cf:
-                zone = cf.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
-            else:
-                zone = dnspod.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
+            zone = api.get_zone(zone_id)
+            zone_name = str(zone.get("name") or zone_id)
         except Exception:
             pass
         try:
-            if is_cf:
-                ok = cf.delete_zone(zone_id)
-            else:
-                ok = dnspod.delete_zone(zone_id)
+            ok = api.delete_zone(zone_id)
             create_log(
                 user_id=uid,
                 action="DELETE",
@@ -3201,7 +3651,7 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 )
             except Exception:
                 pass
-            code = e.status if isinstance(e, (CloudflareApiError, DnspodApiError)) else 400
+            code = e.status if isinstance(e, (DnsProviderApiError, CloudflareApiError, DnspodApiError)) else 400
             self._err(str(e), code)
         return
 
@@ -3221,39 +3671,30 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
             self._ok(cached, "获取 DNS 记录成功")
             return
         try:
-            if is_cf:
-                zone = cf.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
-                filters: Dict[str, Any] = {}
-                if sub_domain:
-                    filters["name"] = sub_domain
-                if rtype:
-                    filters["type"] = rtype
-                if value:
-                    filters["content"] = value
-                res = cf.list_records(zone_id, page, page_size, filters)
-                records_raw = res.get("records") if isinstance(res, dict) else []
-                state_map = list_acceleration_states(zone_id)
-                records = [attach_acceleration_state(self._map_cf_record(zone_id, zone_name, r), state_map.get(str(r.get("id") or ""))) for r in records_raw if isinstance(r, dict)]
-                if keyword:
-                    kw = keyword.lower()
-                    records = [r for r in records if kw in str(r.get("name") or "").lower() or kw in str(r.get("value") or "").lower()]
-            else:
-                zone = dnspod.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
-                filters = {}
-                if sub_domain:
-                    filters["subDomain"] = sub_domain
-                if rtype:
-                    filters["type"] = rtype
-                if value:
-                    filters["value"] = value
-                if keyword:
-                    filters["keyword"] = keyword
-                res = dnspod.list_records(zone_id, page, page_size, filters)
-                records_raw = res.get("records") if isinstance(res, dict) else []
-                state_map = list_acceleration_states(zone_id)
-                records = [attach_acceleration_state(self._map_dnspod_record(zone_id, zone_name, r), state_map.get(str(r.get("id") or ""))) for r in records_raw if isinstance(r, dict)]
+            zone = api.get_zone(zone_id)
+            zone_name = str(zone.get("name") or zone_id)
+            filters: Dict[str, Any] = {}
+            if sub_domain:
+                filters["name"] = sub_domain
+                filters["subDomain"] = sub_domain
+            if rtype:
+                filters["type"] = rtype
+            if value:
+                filters["value"] = value
+                filters["content"] = value
+            if keyword:
+                filters["keyword"] = keyword
+            res = api.list_records(zone_id, page, page_size, filters)
+            records_raw = res.get("records") if isinstance(res, dict) else []
+            state_map = list_acceleration_states(zone_id)
+            records = [
+                attach_acceleration_state(map_record(zone_id, zone_name, r), state_map.get(str(r.get("id") or "")))
+                for r in records_raw
+                if isinstance(r, dict)
+            ]
+            if keyword:
+                kw = keyword.lower()
+                records = [r for r in records if kw in str(r.get("name") or "").lower() or kw in str(r.get("value") or "").lower()]
             caps = get_provider_capabilities(provider) or {}
             total = int(res.get("total")) if isinstance(res, dict) and res.get("total") is not None else len(records)
             data = {
@@ -3271,13 +3712,12 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
             cache_set(ck, data, caps.get("recordCacheTtl", 120))
             self._ok(data, "获取 DNS 记录成功")
         except Exception as e:
-            code = e.status if isinstance(e, (CloudflareApiError, DnspodApiError)) else 400
-            self._err(str(e), code)
+            self._err(str(e), api_error_status(e))
         return
 
     m = re.fullmatch(r"/zones/([^/]+)/records/batch-status", sub)
     if self.command == "PUT" and m:
-        if is_cf:
+        if not supports_status_flag():
             self._err("当前提供商不支持启用/禁用记录", 400)
             return
         zone_id = urllib.parse.unquote(m.group(1))
@@ -3292,7 +3732,7 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
         results = []
         for rid in record_ids:
             try:
-                dnspod.set_record_status(zone_id, rid, bool(enabled))
+                api.set_record_status(zone_id, rid, bool(enabled))
                 results.append({"recordId": rid, "success": True})
             except Exception as e:
                 results.append({"recordId": rid, "success": False, "error": str(e)})
@@ -3339,16 +3779,10 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                     "proxied": restore_record_raw.get("proxied"),
                 }
         try:
-            if is_cf:
-                zone = cf.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
-                record_raw = cf.get_record(zone_id, record_id)
-                current_record = self._map_cf_record(zone_id, zone_name, record_raw)
-            else:
-                zone = dnspod.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
-                record_raw = dnspod.get_record(zone_id, record_id)
-                current_record = self._map_dnspod_record(zone_id, zone_name, record_raw)
+            zone = api.get_zone(zone_id)
+            zone_name = str(zone.get("name") or zone_id)
+            record_raw = api.get_record(zone_id, record_id)
+            current_record = map_record(zone_id, zone_name, record_raw)
 
             fqdn_name = str(current_record.get("name") or "").strip()
             if not fqdn_name:
@@ -3471,7 +3905,7 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 "已恢复原始记录并关闭 EdgeOne 加速",
             )
         except Exception as e:
-            code = e.status if isinstance(e, (CloudflareApiError, DnspodApiError)) else 400
+            code = e.status if isinstance(e, (DnsProviderApiError, CloudflareApiError, DnspodApiError)) else 400
             self._err(str(e), code)
         return
 
@@ -3480,21 +3914,13 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
         zone_id = urllib.parse.unquote(m.group(1))
         record_id = urllib.parse.unquote(m.group(2))
         try:
-            if is_cf:
-                zone = cf.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
-                record = cf.get_record(zone_id, record_id)
-                mapped = attach_acceleration_state(self._map_cf_record(zone_id, zone_name, record))
-                self._ok({"record": mapped}, "获取记录详情成功")
-            else:
-                zone = dnspod.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
-                record = dnspod.get_record(zone_id, record_id)
-                mapped = attach_acceleration_state(self._map_dnspod_record(zone_id, zone_name, record))
-                self._ok({"record": mapped}, "获取记录详情成功")
+            zone = api.get_zone(zone_id)
+            zone_name = str(zone.get("name") or zone_id)
+            record = api.get_record(zone_id, record_id)
+            mapped = attach_acceleration_state(map_record(zone_id, zone_name, record))
+            self._ok({"record": mapped}, "获取记录详情成功")
         except Exception as e:
-            code = e.status if isinstance(e, (CloudflareApiError, DnspodApiError)) else 400
-            self._err(str(e), code)
+            self._err(str(e), api_error_status(e))
         return
 
     m = re.fullmatch(r"/zones/([^/]+)/records", sub)
@@ -3507,36 +3933,21 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
             self._err("缺少必需参数: name, type, value", 400)
             return
         try:
-            if is_cf:
-                zone = cf.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
-                payload = {
-                    "type": rtype,
-                    "name": name,
-                    "content": self._normalize_txt_for_cf(rtype, value),
-                    "ttl": int(body.get("ttl")) if isinstance(body.get("ttl"), (int, float)) else 1,
-                    "priority": int(body.get("priority")) if isinstance(body.get("priority"), (int, float)) else None,
-                    "comment": body.get("remark"),
-                }
-                if rtype in {"A", "AAAA", "CNAME"} and isinstance(body.get("proxied"), bool):
-                    payload["proxied"] = bool(body.get("proxied"))
-                record = cf.create_record(zone_id, payload)
-                mapped = self._map_cf_record(zone_id, zone_name, record)
-            else:
-                zone = dnspod.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
-                params = {
-                    "name": name,
-                    "type": rtype,
-                    "value": str(value),
-                    "ttl": int(body.get("ttl")) if isinstance(body.get("ttl"), (int, float)) else None,
-                    "priority": int(body.get("priority")) if isinstance(body.get("priority"), (int, float)) else None,
-                    "weight": int(body.get("weight")) if isinstance(body.get("weight"), (int, float)) else None,
-                    "line": body.get("line"),
-                    "remark": body.get("remark"),
-                }
-                record = dnspod.create_record(zone_id, params)
-                mapped = self._map_dnspod_record(zone_id, zone_name, record)
+            zone = api.get_zone(zone_id)
+            zone_name = str(zone.get("name") or zone_id)
+            params = {
+                "name": name,
+                "type": rtype,
+                "value": str(value),
+                "ttl": int(body.get("ttl")) if isinstance(body.get("ttl"), (int, float)) else None,
+                "priority": int(body.get("priority")) if isinstance(body.get("priority"), (int, float)) else None,
+                "weight": int(body.get("weight")) if isinstance(body.get("weight"), (int, float)) else None,
+                "line": body.get("line"),
+                "remark": body.get("remark"),
+                "proxied": bool(body.get("proxied")) if isinstance(body.get("proxied"), bool) else None,
+            }
+            record = api.create_record(zone_id, params)
+            mapped = map_record(zone_id, zone_name, record)
             create_log(
                 user_id=uid,
                 action="CREATE",
@@ -3549,6 +3960,21 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 ip_address=ip,
             )
             cache_delete_pattern(f"dns:records:cred:{ctx['credential']['id']}:z:{zone_id}:*")
+            try:
+                dns_extras.insert_history(
+                    conn,
+                    user_id=uid,
+                    credential_id=dns_credential_id,
+                    zone_id=zone_id,
+                    zone_name=zone_name,
+                    record_id=mapped.get("id"),
+                    record_name=mapped.get("name"),
+                    record_type=mapped.get("type"),
+                    action="CREATE",
+                    new_value=mapped,
+                )
+            except Exception:
+                pass
             self._ok({"record": mapped}, "DNS 记录创建成功", 201)
         except Exception as e:
             try:
@@ -3564,7 +3990,7 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 )
             except Exception:
                 pass
-            code = e.status if isinstance(e, (CloudflareApiError, DnspodApiError)) else 400
+            code = e.status if isinstance(e, (DnsProviderApiError, CloudflareApiError, DnspodApiError)) else 400
             self._err(str(e), code)
         return
 
@@ -3573,57 +3999,33 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
         zone_id = urllib.parse.unquote(m.group(1))
         record_id = urllib.parse.unquote(m.group(2))
         try:
-            if is_cf:
-                zone = cf.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
+            zone = api.get_zone(zone_id)
+            zone_name = str(zone.get("name") or zone_id)
+            old = None
+            try:
+                old = api.get_record(zone_id, record_id)
+            except Exception:
                 old = None
-                try:
-                    old = cf.get_record(zone_id, record_id)
-                except Exception:
-                    old = None
-                base = old if isinstance(old, dict) else {}
-                rtype = str(body.get("type") or base.get("type") or "").strip().upper()
-                name = str(body.get("name") or base.get("name") or "").strip()
-                value = body.get("value", base.get("content"))
-                if not name or not rtype or value is None:
-                    self._err("缺少必需参数: name, type, value", 400)
-                    return
-                payload = {
-                    "type": rtype,
-                    "name": name,
-                    "content": self._normalize_txt_for_cf(rtype, value),
-                    "ttl": int(body.get("ttl")) if isinstance(body.get("ttl"), (int, float)) else int(base.get("ttl") or 1),
-                    "priority": int(body.get("priority")) if isinstance(body.get("priority"), (int, float)) else base.get("priority"),
-                    "comment": body.get("remark") if "remark" in body else base.get("comment"),
-                }
-                if rtype in {"A", "AAAA", "CNAME"}:
-                    if isinstance(body.get("proxied"), bool):
-                        payload["proxied"] = bool(body.get("proxied"))
-                    elif isinstance(base.get("proxied"), bool):
-                        payload["proxied"] = bool(base.get("proxied"))
-                record = cf.update_record(zone_id, record_id, payload)
-                mapped = self._map_cf_record(zone_id, zone_name, record)
-            else:
-                zone = dnspod.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
-                old = None
-                try:
-                    old_rec = dnspod.get_record(zone_id, record_id)
-                    old = old_rec
-                except Exception:
-                    old = None
-                params = {
-                    "name": body.get("name"),
-                    "type": body.get("type"),
-                    "value": str(body["value"]) if "value" in body else None,
-                    "ttl": int(body.get("ttl")) if isinstance(body.get("ttl"), (int, float)) else None,
-                    "priority": int(body.get("priority")) if isinstance(body.get("priority"), (int, float)) else None,
-                    "weight": int(body.get("weight")) if isinstance(body.get("weight"), (int, float)) else None,
-                    "line": body.get("line"),
-                    "remark": body.get("remark") if "remark" in body else None,
-                }
-                record = dnspod.update_record(zone_id, record_id, params)
-                mapped = self._map_dnspod_record(zone_id, zone_name, record)
+            base = old if isinstance(old, dict) else {}
+            rtype = str(body.get("type") or base.get("type") or "").strip().upper()
+            name = str(body.get("name") or base.get("name") or "").strip()
+            value = body.get("value", base.get("value") or base.get("content"))
+            if not name or not rtype or value is None:
+                self._err("缺少必需参数: name, type, value", 400)
+                return
+            params = {
+                "name": name,
+                "type": rtype,
+                "value": str(value),
+                "ttl": int(body.get("ttl")) if isinstance(body.get("ttl"), (int, float)) else base.get("ttl"),
+                "priority": int(body.get("priority")) if isinstance(body.get("priority"), (int, float)) else base.get("priority"),
+                "weight": int(body.get("weight")) if isinstance(body.get("weight"), (int, float)) else base.get("weight"),
+                "line": body.get("line") if "line" in body else base.get("line"),
+                "remark": body.get("remark") if "remark" in body else base.get("remark"),
+                "proxied": body.get("proxied") if "proxied" in body else base.get("proxied"),
+            }
+            record = api.update_record(zone_id, record_id, params)
+            mapped = map_record(zone_id, zone_name, record)
             sync_acceleration_state_after_manual_update(zone_id, mapped)
             mapped = attach_acceleration_state(mapped)
             create_log(
@@ -3639,13 +4041,29 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 ip_address=ip,
             )
             cache_delete_pattern(f"dns:records:cred:{ctx['credential']['id']}:z:{zone_id}:*")
+            try:
+                dns_extras.insert_history(
+                    conn,
+                    user_id=uid,
+                    credential_id=dns_credential_id,
+                    zone_id=zone_id,
+                    zone_name=zone_name,
+                    record_id=mapped.get("id"),
+                    record_name=mapped.get("name"),
+                    record_type=mapped.get("type"),
+                    action="UPDATE",
+                    old_value=old,
+                    new_value=mapped,
+                )
+            except Exception:
+                pass
             self._ok({"record": mapped}, "DNS 记录更新成功")
         except Exception as e:
             try:
                 create_log(user_id=uid, action="UPDATE", resource_type="DNS", status="FAILED", error_message=str(e), ip_address=ip)
             except Exception:
                 pass
-            code = e.status if isinstance(e, (CloudflareApiError, DnspodApiError)) else 400
+            code = e.status if isinstance(e, (DnsProviderApiError, CloudflareApiError, DnspodApiError)) else 400
             self._err(str(e), code)
         return
 
@@ -3654,24 +4072,14 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
         zone_id = urllib.parse.unquote(m.group(1))
         record_id = urllib.parse.unquote(m.group(2))
         try:
-            if is_cf:
-                zone = cf.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
+            zone = api.get_zone(zone_id)
+            zone_name = str(zone.get("name") or zone_id)
+            old = None
+            try:
+                old = api.get_record(zone_id, record_id)
+            except Exception:
                 old = None
-                try:
-                    old = cf.get_record(zone_id, record_id)
-                except Exception:
-                    old = None
-                cf.delete_record(zone_id, record_id)
-            else:
-                zone = dnspod.get_zone(zone_id)
-                zone_name = str(zone.get("name") or zone_id)
-                old = None
-                try:
-                    old = dnspod.get_record(zone_id, record_id)
-                except Exception:
-                    old = None
-                dnspod.delete_record(zone_id, record_id)
+            api.delete_record(zone_id, record_id)
             delete_acceleration_state(zone_id=zone_id, record_id=record_id)
             create_log(
                 user_id=uid,
@@ -3684,6 +4092,18 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 status="SUCCESS",
                 ip_address=ip,
             )
+            _append_dns_record_history(
+                user_id=uid,
+                credential_id=dns_credential_id,
+                zone_id=zone_id,
+                zone_name=zone_name,
+                record_id=record_id,
+                record_name=old.get("name") if isinstance(old, dict) else None,
+                record_type=old.get("type") if isinstance(old, dict) else None,
+                action="DELETE",
+                old_value=old,
+                new_value=None,
+            )
             cache_delete_pattern(f"dns:records:cred:{ctx['credential']['id']}:z:{zone_id}:*")
             self._ok(None, "DNS 记录删除成功")
         except Exception as e:
@@ -3691,7 +4111,7 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 create_log(user_id=uid, action="DELETE", resource_type="DNS", status="FAILED", error_message=str(e), ip_address=ip)
             except Exception:
                 pass
-            code = e.status if isinstance(e, (CloudflareApiError, DnspodApiError)) else 400
+            code = e.status if isinstance(e, (DnsProviderApiError, CloudflareApiError, DnspodApiError)) else 400
             self._err(str(e), code)
         return
 
@@ -3707,16 +4127,10 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
             try:
                 old = None
                 try:
-                    if is_cf:
-                        old = cf.get_record(zone_id, rid)
-                    else:
-                        old = dnspod.get_record(zone_id, rid)
+                    old = api.get_record(zone_id, rid)
                 except Exception:
                     old = None
-                if is_cf:
-                    cf.delete_record(zone_id, rid)
-                else:
-                    dnspod.delete_record(zone_id, rid)
+                api.delete_record(zone_id, rid)
                 delete_acceleration_state(zone_id=zone_id, record_id=rid)
                 results.append({"recordId": rid, "success": True})
                 try:
@@ -3729,6 +4143,18 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                         old_value=json.dumps(old, ensure_ascii=False) if old else None,
                         status="SUCCESS",
                         ip_address=ip,
+                    )
+                    _append_dns_record_history(
+                        user_id=uid,
+                        credential_id=dns_credential_id,
+                        zone_id=zone_id,
+                        zone_name=None,
+                        record_id=rid,
+                        record_name=old.get("name") if isinstance(old, dict) else rid,
+                        record_type=old.get("type") if isinstance(old, dict) else None,
+                        action="DELETE",
+                        old_value=old,
+                        new_value=None,
                     )
                 except Exception:
                     pass
@@ -3754,7 +4180,7 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
 
     m = re.fullmatch(r"/zones/([^/]+)/records/([^/]+)/status", sub)
     if self.command == "PUT" and m:
-        if is_cf:
+        if not supports_status_flag():
             self._err("当前提供商不支持启用/禁用记录", 400)
             return
         zone_id = urllib.parse.unquote(m.group(1))
@@ -3764,19 +4190,19 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
             self._err("缺少参数: enabled (boolean)", 400)
             return
         try:
-            dnspod.set_record_status(zone_id, record_id, bool(enabled))
+            api.set_record_status(zone_id, record_id, bool(enabled))
             mapped = None
             try:
-                zone = dnspod.get_zone(zone_id)
+                zone = api.get_zone(zone_id)
                 zone_name = str(zone.get("name") or zone_id)
-                record = dnspod.get_record(zone_id, record_id)
-                mapped = attach_acceleration_state(self._map_dnspod_record(zone_id, zone_name, record))
+                record = api.get_record(zone_id, record_id)
+                mapped = attach_acceleration_state(map_record(zone_id, zone_name, record))
             except Exception:
                 mapped = None
             cache_delete_pattern(f"dns:records:cred:{ctx['credential']['id']}:z:{zone_id}:*")
             self._ok({"record": mapped}, "记录状态更新成功")
-        except (DnspodApiError,) as e:
-            self._err(str(e), e.status)
+        except (DnsProviderApiError, DnspodApiError) as e:
+            self._err(str(e), getattr(e, "status", 400))
         return
 
     m = re.fullmatch(r"/zones/([^/]+)/lines", sub)
@@ -3788,32 +4214,314 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
         if cached is not None:
             self._ok(cached, "获取线路列表成功")
             return
-        if is_cf:
-            data = {"lines": [{"code": "default", "name": "默认"}]}
+        try:
+            lines = api.get_lines(zone_id)
+            data = {"lines": lines if isinstance(lines, list) else [{"code": "default", "name": "默认"}]}
             cache_set(ck, data, 3600)
             self._ok(data, "获取线路列表成功")
-        else:
-            try:
-                lines = dnspod.get_lines(zone_id)
-                data = {"lines": lines}
-                cache_set(ck, data, 3600)
-                self._ok(data, "获取线路列表成功")
-            except (DnspodApiError,) as e:
-                self._err(str(e), e.status)
+        except (DnsProviderApiError, DnspodApiError) as e:
+            self._err(str(e), getattr(e, "status", 400))
         return
 
     m = re.fullmatch(r"/zones/([^/]+)/min-ttl", sub)
     if self.command == "GET" and m:
-        if is_cf:
-            self._ok({"minTTL": 1}, "获取最低TTL成功")
-        else:
-            zone_id = urllib.parse.unquote(m.group(1))
-            try:
-                min_ttl = dnspod.get_min_ttl(zone_id)
-                self._ok({"minTTL": min_ttl}, "获取最低TTL成功")
-            except (DnspodApiError,) as e:
-                self._err(str(e), e.status)
+        zone_id = urllib.parse.unquote(m.group(1))
+        try:
+            min_ttl = api.get_min_ttl(zone_id)
+            self._ok({"minTTL": min_ttl}, "获取最低TTL成功")
+        except (DnsProviderApiError, DnspodApiError) as e:
+            self._err(str(e), getattr(e, "status", 400))
         return
+
+
+    # ── DNS extras: history / templates / import-export / search / conflicts / propagate ──
+    if self.command == "GET" and sub == "/history":
+        zone_id = first_or_none(q, "zoneId")
+        record_id = first_or_none(q, "recordId")
+        page = p_int(first_or_none(q, "page") or "1", 1, 100000)
+        limit = p_int(first_or_none(q, "limit") or "50", 50, 200)
+        data = dns_extras.list_history(conn, uid, zone_id=zone_id, record_id=record_id, page=page, limit=limit)
+        self._ok(data, "获取记录历史成功")
+        return
+
+    m = re.fullmatch(r"/history/(\d+)/rollback", sub)
+    if self.command == "POST" and m:
+        hid = int(m.group(1))
+        row = dns_extras.get_history_row(conn, uid, hid)
+        if not row:
+            self._err("历史记录不存在", 404)
+            return
+        old_raw = row.get("oldValue")
+        try:
+            old = json.loads(old_raw) if isinstance(old_raw, str) else old_raw
+        except Exception:
+            old = None
+        if not isinstance(old, dict):
+            self._err("该历史记录无可回滚快照", 400)
+            return
+        zone_id = str(row.get("zoneId") or "")
+        if not zone_id:
+            self._err("历史记录缺少 zoneId", 400)
+            return
+        # Prefer the credential that produced the history row; fall back to request query / default.
+        history_cred_id = row.get("credentialId")
+        try:
+            history_cred_id = int(history_cred_id) if history_cred_id is not None else 0
+        except Exception:
+            history_cred_id = 0
+        try:
+            if history_cred_id > 0:
+                ctx = self._dns_context(uid, {"credentialId": [str(history_cred_id)]})
+            else:
+                ctx = self._dns_context(uid, q)
+            api = ctx["api"]
+            dns_credential_id = int(ctx["credential"]["id"] or 0)
+            if not api:
+                self._err("缺少可用的 DNS 凭证", 400)
+                return
+            zone = api.get_zone(zone_id)
+            zone_name = str(zone.get("name") or row.get("zoneName") or zone_id)
+            params = {
+                "name": old.get("name") or row.get("recordName"),
+                "type": old.get("type") or row.get("recordType"),
+                "value": old.get("value") or old.get("content"),
+                "ttl": old.get("ttl"),
+                "priority": old.get("priority"),
+                "weight": old.get("weight"),
+                "line": old.get("line"),
+                "remark": old.get("remark"),
+                "proxied": old.get("proxied"),
+            }
+            if not params.get("name") or not params.get("type") or not params.get("value"):
+                self._err("回滚快照缺少 name/type/value", 400)
+                return
+            rid = str(row.get("recordId") or "")
+            if rid:
+                try:
+                    record = api.update_record(zone_id, rid, params)
+                except DnsProviderApiError as update_exc:
+                    # Only fall back to create when the record is genuinely missing.
+                    status = int(getattr(update_exc, "status", 0) or 0)
+                    if status in {404, 410}:
+                        record = api.create_record(zone_id, params)
+                    else:
+                        raise
+            else:
+                record = api.create_record(zone_id, params)
+            mapped = map_record(zone_id, zone_name, record)
+            dns_extras.insert_history(
+                conn,
+                user_id=uid,
+                credential_id=dns_credential_id,
+                zone_id=zone_id,
+                zone_name=zone_name,
+                record_id=mapped.get("id"),
+                record_name=mapped.get("name"),
+                record_type=mapped.get("type"),
+                action="ROLLBACK",
+                old_value=None,
+                new_value=mapped,
+            )
+            cache_delete_pattern(f"dns:records:cred:{dns_credential_id}:z:{zone_id}:*")
+            self._ok({"record": mapped}, "回滚成功")
+        except Exception as e:
+            self._err(str(e), api_error_status(e))
+        return
+
+    if self.command == "GET" and sub == "/templates":
+        self._ok({"templates": dns_extras.list_templates(conn, uid)}, "获取模板成功")
+        return
+
+    if self.command == "POST" and sub == "/templates":
+        name = str(body.get("name") or "").strip()
+        if not name:
+            self._err("模板名称不能为空", 400)
+            return
+        records = body.get("records") if isinstance(body.get("records"), list) else []
+        tpl = dns_extras.create_template(conn, uid, name, str(body.get("description") or ""), records)
+        self._ok({"template": tpl}, "模板已创建", 201)
+        return
+
+    m = re.fullmatch(r"/templates/(\d+)", sub)
+    if self.command == "DELETE" and m:
+        ok = dns_extras.delete_template(conn, uid, int(m.group(1)))
+        if not ok:
+            self._err("模板不存在", 404)
+            return
+        self._ok({"ok": True}, "模板已删除")
+        return
+
+    if self.command == "POST" and sub == "/templates/apply":
+        template_id = body.get("templateId")
+        zone_id = str(body.get("zoneId") or "").strip()
+        if not template_id or not zone_id:
+            self._err("缺少 templateId 或 zoneId", 400)
+            return
+        tpls = {t["id"]: t for t in dns_extras.list_templates(conn, uid)}
+        tpl = tpls.get(int(template_id))
+        if not tpl:
+            self._err("模板不存在", 404)
+            return
+        created = failed = 0
+        results = []
+        zone = api.get_zone(zone_id)
+        zone_name = str(zone.get("name") or zone_id)
+        for rec in tpl.get("records") or []:
+            try:
+                params = {
+                    "name": rec.get("name"),
+                    "type": rec.get("type"),
+                    "value": rec.get("value") or rec.get("content"),
+                    "ttl": rec.get("ttl"),
+                    "priority": rec.get("priority"),
+                    "weight": rec.get("weight"),
+                    "line": rec.get("line"),
+                    "remark": rec.get("remark"),
+                }
+                record = api.create_record(zone_id, params)
+                mapped = map_record(zone_id, zone_name, record)
+                created += 1
+                results.append({"success": True, "record": mapped})
+            except Exception as e:
+                failed += 1
+                results.append({"success": False, "error": str(e)})
+        cache_delete_pattern(f"dns:records:cred:{dns_credential_id}:z:{zone_id}:*")
+        self._ok({"created": created, "failed": failed, "results": results}, "模板应用完成")
+        return
+
+    m = re.fullmatch(r"/zones/([^/]+)/export", sub)
+    if self.command == "GET" and m:
+        zone_id = urllib.parse.unquote(m.group(1))
+        fmt = first_or_none(q, "format") or "json"
+        zone = api.get_zone(zone_id)
+        zone_name = str(zone.get("name") or zone_id)
+        records_raw = dns_extras.list_all_provider_records(api, zone_id)
+        records = [map_record(zone_id, zone_name, r) for r in records_raw if isinstance(r, dict)]
+        content, filename = dns_extras.export_records(records, zone_name, fmt)
+        self._ok({"content": content, "filename": filename, "format": fmt, "count": len(records)}, "导出成功")
+        return
+
+    m = re.fullmatch(r"/zones/([^/]+)/import", sub)
+    if self.command == "POST" and m:
+        zone_id = urllib.parse.unquote(m.group(1))
+        fmt = str(body.get("format") or "json")
+        content = str(body.get("content") or "")
+        dry = bool(body.get("dryRun"))
+        try:
+            rows = dns_extras.parse_import(content, fmt)
+        except Exception as e:
+            self._err(f"解析导入内容失败: {e}", 400)
+            return
+        zone = api.get_zone(zone_id)
+        zone_name = str(zone.get("name") or zone_id)
+        created = skipped = failed = 0
+        results = []
+        for rec in rows:
+            if dry:
+                skipped += 1
+                results.append({"success": True, "dryRun": True, "record": rec})
+                continue
+            try:
+                params = {
+                    "name": rec.get("name"),
+                    "type": rec.get("type"),
+                    "value": rec.get("value") or rec.get("content"),
+                    "ttl": rec.get("ttl"),
+                    "priority": rec.get("priority"),
+                    "weight": rec.get("weight"),
+                    "line": rec.get("line"),
+                    "remark": rec.get("remark"),
+                }
+                record = api.create_record(zone_id, params)
+                mapped = map_record(zone_id, zone_name, record)
+                created += 1
+                results.append({"success": True, "record": mapped})
+                dns_extras.insert_history(
+                    conn,
+                    user_id=uid,
+                    credential_id=dns_credential_id,
+                    zone_id=zone_id,
+                    zone_name=zone_name,
+                    record_id=mapped.get("id"),
+                    record_name=mapped.get("name"),
+                    record_type=mapped.get("type"),
+                    action="CREATE",
+                    new_value=mapped,
+                )
+            except Exception as e:
+                failed += 1
+                results.append({"success": False, "error": str(e), "record": rec})
+        if not dry:
+            cache_delete_pattern(f"dns:records:cred:{dns_credential_id}:z:{zone_id}:*")
+        self._ok({"created": created, "skipped": skipped, "failed": failed, "results": results}, "导入完成")
+        return
+
+    if self.command == "GET" and sub == "/search":
+        query_text = str(first_or_none(q, "q") or "").strip()
+        limit = p_int(first_or_none(q, "limit") or "50", 50, 200)
+        if not query_text:
+            self._ok({"hits": []}, "搜索完成")
+            return
+        hits = []
+        try:
+            zones = api.list_zones(1, 50, None).get("zones") or []
+        except Exception:
+            zones = []
+        for z in zones:
+            if not isinstance(z, dict):
+                continue
+            zid = str(z.get("id") or "")
+            zname = str(z.get("name") or "")
+            try:
+                recs = api.list_records(zid, 1, 200, {"keyword": query_text}).get("records") or []
+            except Exception:
+                recs = []
+            for r in recs:
+                if not isinstance(r, dict):
+                    continue
+                name = str(r.get("name") or "")
+                value = str(r.get("value") or r.get("content") or "")
+                if query_text.lower() not in name.lower() and query_text.lower() not in value.lower():
+                    continue
+                hits.append(
+                    {
+                        "credentialId": dns_credential_id,
+                        "provider": provider,
+                        "zoneId": zid,
+                        "zoneName": zname,
+                        "recordId": str(r.get("id") or ""),
+                        "recordName": name,
+                        "recordType": str(r.get("type") or ""),
+                        "value": value,
+                    }
+                )
+                if len(hits) >= limit:
+                    break
+            if len(hits) >= limit:
+                break
+        self._ok({"hits": hits}, "搜索完成")
+        return
+
+    if self.command == "POST" and sub == "/propagate-check":
+        name = str(body.get("name") or "").strip()
+        if not name:
+            self._err("缺少 name", 400)
+            return
+        result = dns_extras.propagate_check(name, str(body.get("type") or "A"), body.get("expected"))
+        self._ok(result, "传播检测完成")
+        return
+
+    m = re.fullmatch(r"/zones/([^/]+)/conflicts", sub)
+    if self.command == "GET" and m:
+        zone_id = urllib.parse.unquote(m.group(1))
+        zone = api.get_zone(zone_id)
+        zone_name = str(zone.get("name") or zone_id)
+        records_raw = dns_extras.list_all_provider_records(api, zone_id)
+        records = [map_record(zone_id, zone_name, r) for r in records_raw if isinstance(r, dict)]
+        conflicts = dns_extras.detect_conflicts(records)
+        self._ok({"conflicts": conflicts, "scanned": len(records)}, "冲突检测完成")
+        return
+
 
     if self.command == "POST" and sub == "/refresh":
         zone_id = body.get("zoneId")
@@ -4995,7 +5703,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             required = None
             if sub in ("/certificates/issue-acme", "/certificates/apply"):
                 required = "ssl:issue"
-            elif sub in ("/auto-renew", "/auto-renew/", "/certificates/renew-expired", "/certificates/prune-superseded") or sub.endswith("/auto-renew"):
+            elif sub in ("/auto-renew", "/auto-renew/", "/certificates/renew-expired", "/certificates/prune-superseded", "/certificates/reconcile", "/certificates/clean-expired") or sub.endswith("/auto-renew"):
                 required = "ssl:renew"
             elif sub == "/certificates/sync" or sub.startswith("/deployment-events"):
                 required = "ssl:deploy"
@@ -5021,16 +5729,46 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         cache_delete_pattern(f"ssl:*:{cred_id}:*")
         cache_delete_pattern(f"ssl:certs:all:user:{uid}:*")
 
-    def _sync_to_db(cred_id: int, provider: str, certs: list) -> None:
-        """Upsert remote certificates into local ssl_certificates table."""
+    def _decorate_certificate(cert: Dict[str, Any]) -> Dict[str, Any]:
+        item = dict(cert)
+        item["daysRemaining"] = certificate_days_remaining(item.get("notAfter"))
+        item["isExpired"] = certificate_is_expired(item.get("notAfter"))
+        if str(item.get("status") or "") == "issued" and item["isExpired"]:
+            item["status"] = "expired"
+        item.setdefault("source", "tencent")
+        item.setdefault("renewalOwner", "tencent" if item.get("autoRenew") else "panel")
+        return item
+
+    def _certificate_status(cert: Dict[str, Any]) -> str:
+        status = str(cert.get("status") or "applying").strip().lower()
+        if status == "issued" and certificate_is_expired(cert.get("notAfter")):
+            return "expired"
+        return status
+
+    def _sync_to_db(cred_id: int, provider: str, certs: list, *, prune_missing: bool = False) -> Dict[str, int]:
+        """Upsert remote certificates and reconcile disappeared Tencent rows.
+
+        A cloud list response is authoritative for one credential. Rows missing
+        from that response are removed only for Tencent records, never ACME rows,
+        and only after a complete pagination pass (callers pass prune_missing
+        only after proving the fetch was complete). This prevents stale local
+        records from producing the misleading ``certificate missing`` download
+        error while avoiding deletion on a transient API page failure.
+        """
         ts = now_iso()
+        seen_ids = set()
+        inserted = updated = expired = removed = 0
         with conn() as c:
             for cert in certs:
-                remote_id = cert.get("remoteCertId", "")
+                remote_id = str(cert.get("remoteCertId", "") or "").strip()
                 if not remote_id:
                     continue
+                seen_ids.add(remote_id)
+                normalized_status = _certificate_status(cert)
+                if normalized_status == "expired":
+                    expired += 1
                 existing = c.execute(
-                    "SELECT id, notAfter, status FROM ssl_certificates WHERE userId = ? AND provider = ? AND remoteCertId = ?",
+                    "SELECT id, notAfter, status, autoRenew FROM ssl_certificates WHERE userId = ? AND provider = ? AND remoteCertId = ?",
                     (uid, provider, remote_id),
                 ).fetchone()
                 if existing:
@@ -5038,7 +5776,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         """UPDATE ssl_certificates SET
                             domain = ?, san = ?, certType = ?, productName = ?,
                             status = ?, statusMsg = ?, issuer = ?,
-                            notBefore = ?, notAfter = ?, isUploaded = ?,
+                            notBefore = ?, notAfter = ?, isUploaded = ?, autoRenew = ?,
                             remoteCreatedAt = ?, syncedAt = ?, updatedAt = ?
                         WHERE id = ?""",
                         (
@@ -5046,19 +5784,21 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                             json.dumps(cert.get("san") or [], ensure_ascii=False) if isinstance(cert.get("san"), list) else str(cert.get("san") or ""),
                             cert.get("certType", ""),
                             cert.get("productName", ""),
-                            cert.get("status", "applying"),
+                            normalized_status,
                             cert.get("statusMsg", ""),
                             cert.get("issuer", ""),
                             cert.get("notBefore", ""),
                             cert.get("notAfter", ""),
                             1 if cert.get("isUploaded") else 0,
+                            (1 if cert.get("autoRenew") else 0) if "autoRenew" in cert else int(existing["autoRenew"] or 0),
                             cert.get("remoteCreatedAt", ""),
                             ts,
                             ts,
                             existing["id"],
                         ),
                     )
-                    if cert.get("status") == "issued" and str(existing["notAfter"] or "") != str(cert.get("notAfter") or ""):
+                    updated += 1
+                    if normalized_status == "issued" and str(existing["notAfter"] or "") != str(cert.get("notAfter") or ""):
                         c.execute(
                             """UPDATE ssl_deployment_events SET status = 'queued', attempts = 0, error = NULL,
                                  nextAttemptAt = NULL, targetName = NULL, fingerprint = NULL,
@@ -5067,29 +5807,41 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                             (ts, uid, provider, remote_id),
                         )
                 else:
+                    inserted += 1
                     c.execute(
                         """INSERT INTO ssl_certificates
                             (userId, credentialId, provider, remoteCertId, domain, san,
                              certType, productName, status, statusMsg, issuer,
-                             notBefore, notAfter, isUploaded, remoteCreatedAt, syncedAt, createdAt, updatedAt)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                             notBefore, notAfter, isUploaded, autoRenew, remoteCreatedAt, syncedAt, createdAt, updatedAt)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             uid, cred_id, provider, remote_id,
                             cert.get("domain", ""),
                             json.dumps(cert.get("san") or [], ensure_ascii=False) if isinstance(cert.get("san"), list) else str(cert.get("san") or ""),
                             cert.get("certType", ""),
                             cert.get("productName", ""),
-                            cert.get("status", "applying"),
+                            normalized_status,
                             cert.get("statusMsg", ""),
                             cert.get("issuer", ""),
                             cert.get("notBefore", ""),
                             cert.get("notAfter", ""),
                             1 if cert.get("isUploaded") else 0,
+                            1 if cert.get("autoRenew") else 0,
                             cert.get("remoteCreatedAt", ""),
                             ts, ts, ts,
                         ),
                     )
+            if prune_missing and provider == "tencent_ssl":
+                query = "DELETE FROM ssl_certificates WHERE userId = ? AND credentialId = ? AND provider = 'tencent_ssl'"
+                params: list[Any] = [uid, cred_id]
+                if seen_ids:
+                    placeholders = ",".join("?" for _ in seen_ids)
+                    query += f" AND remoteCertId NOT IN ({placeholders})"
+                    params.extend(sorted(seen_ids))
+                c.execute(query, params)
+                removed = int(c.execute("SELECT changes()").fetchone()[0] or 0)
             c.commit()
+        return {"inserted": inserted, "updated": updated, "expired": expired, "removed": removed}
 
     def _acme_row_to_cert(row: Any) -> Dict[str, Any]:
         """Shape a DB ssl_certificates(provider='acme') row like a tencent cert
@@ -5099,8 +5851,10 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             san_val = json.loads(san_raw) if san_raw else []
         except Exception:
             san_val = san_raw or []
-        global_auto_renew = get_system_setting("sslAutoRenewEnabled", "0") == "1"
+        global_auto_renew = get_system_setting("sslAutoRenewEnabled", "1") == "1"
         cert_auto_renew = bool(row["autoRenew"]) if "autoRenew" in row.keys() else True
+        actual_expired = certificate_is_expired(row["notAfter"] or "")
+        display_status = "expired" if str(row["status"] or "") == "issued" and actual_expired else row["status"]
         return {
             "id": row["id"],
             "remoteCertId": row["remoteCertId"],
@@ -5113,16 +5867,19 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             "certType": "DV",
             "keyLength": row["certType"] or "2048",
             "productName": row["productName"] or "Let's Encrypt",
-            "status": row["status"],
+            "status": display_status,
             "statusMsg": row["statusMsg"] or "",
             "issuer": row["issuer"] or "Let's Encrypt",
             "notBefore": row["notBefore"] or "",
             "notAfter": row["notAfter"] or "",
+            "daysRemaining": certificate_days_remaining(row["notAfter"] or ""),
+            "isExpired": certificate_is_expired(row["notAfter"] or ""),
             "isUploaded": False,
             "remoteCreatedAt": row["remoteCreatedAt"] or row["createdAt"],
             "syncedAt": row["syncedAt"] or "",
             "autoRenew": cert_auto_renew,
             "globalAutoRenew": global_auto_renew,
+            "renewalOwner": "panel",
             "effectiveAutoRenew": global_auto_renew and cert_auto_renew,
             "lastRenewedAt": row["lastRenewedAt"] if "lastRenewedAt" in row.keys() else "",
             "renewError": row["renewError"] if "renewError" in row.keys() else "",
@@ -5262,16 +6019,22 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             raise ValueError("所选 DNS 凭证无法管理以下域名: " + "、".join(unmanaged))
 
     def _ensure_deployment_events() -> None:
-        """Create one idempotent deployment event for every deployable certificate."""
+        """Create one idempotent deployment event for every deployable certificate.
+
+        Only certs that are issued AND not actually past notAfter qualify —
+        enqueueing a dead certificate just makes the site plugin fail checks.
+        """
         ts = now_iso()
         with conn() as c:
             rows = c.execute(
-                """SELECT provider, remoteCertId, credentialId, domain
+                """SELECT provider, remoteCertId, credentialId, domain, notAfter
                    FROM ssl_certificates
                    WHERE userId = ? AND status = 'issued' AND TRIM(domain) != ''""",
                 (uid,),
             ).fetchall()
             for row in rows:
+                if certificate_is_expired(row["notAfter"] or ""):
+                    continue
                 source = "letsencrypt" if row["provider"] == "acme" else "tencent"
                 c.execute(
                     """INSERT OR IGNORE INTO ssl_deployment_events
@@ -5350,7 +6113,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             status_filter = str(first_or_none(q, "status") or "").strip().lower()
             source_filter = str(first_or_none(q, "source") or "").strip().lower()
             domain_filter = str(first_or_none(q, "domain") or "").strip()
-            if task_type and task_type not in ("acme", "deployment", "renewal"):
+            if task_type and task_type not in ("acme", "deployment", "renewal", "cleanup"):
                 self._err("无效任务类型", 400)
                 return
             if status_filter and status_filter not in ("queued", "running", "success", "failed", "skipped", "cancelled", "retry"):
@@ -5632,9 +6395,11 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     (now_iso(), uid),
                 )
                 job = c.execute(
-                    """SELECT * FROM ssl_acme_jobs
-                       WHERE userId = ? AND status = 'queued' AND attempts < 3
-                       ORDER BY createdAt ASC LIMIT 1""",
+                    """SELECT j.*, s.status AS certificateStatus
+                       FROM ssl_acme_jobs j
+                       LEFT JOIN ssl_certificates s ON s.id = j.certificateId
+                       WHERE j.userId = ? AND j.status = 'queued' AND j.attempts < 3
+                       ORDER BY j.createdAt ASC LIMIT 1""",
                     (uid,),
                 ).fetchone()
                 if job is None:
@@ -5661,7 +6426,10 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 if not isinstance(domains, list) or not domains:
                     domains = [job["domain"]]
                 svc = acme_api.AcmeService(key_length=str(job["keyLength"] or "2048"))
-                meta = svc.issue(domains, dns_provider, dns_secrets, account_id)
+                if str(job["operation"] or "issue") == "renew":
+                    meta = svc.renew(str(job["domain"] or domains[0]), dns_provider, dns_secrets, account_id, domains=domains)
+                else:
+                    meta = svc.issue(domains, dns_provider, dns_secrets, account_id)
                 ts = now_iso()
                 with conn() as c:
                     c.execute(
@@ -5694,7 +6462,11 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             except Exception as ex:
                 final = attempts >= 3
                 next_status = "failed" if final else "queued"
-                cert_status = "failed" if final else "applying"
+                operation = str(job["operation"] or "issue")
+                # A failed renewal must not turn a previously issued/expired
+                # certificate into an issuance failure. Keep its real state so
+                # the next scheduler pass can retry it safely.
+                cert_status = "failed" if operation == "issue" and final else (str(job["certificateStatus"] or "expired") if operation == "renew" else "applying")
                 msg = str(ex)[:500]
                 with conn() as c:
                     c.execute(
@@ -5703,7 +6475,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     )
                     c.execute(
                         "UPDATE ssl_certificates SET status = ?, statusMsg = ?, renewError = ?, updatedAt = ? WHERE id = ?",
-                        (cert_status, (msg if final else f"签发失败，等待自动重试（{attempts}/3）：{msg}"), msg, now_iso(), job["certificateId"]),
+                        (cert_status, (msg if final else (f"续期失败，等待自动重试（{attempts}/3）：{msg}" if operation == 'renew' else f"签发失败，等待自动重试（{attempts}/3）：{msg}")), msg, now_iso(), job["certificateId"]),
                     )
                     c.commit()
                 _write_ssl_task_log(uid, "acme", job["id"], job["domain"], "letsencrypt", "failed" if final else "retry", attempts, message=msg)
@@ -5720,8 +6492,8 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         if sub in ("/auto-renew", "/auto-renew/"):
             if self.command == "GET":
                 self._ok({
-                    "enabled": get_system_setting("sslAutoRenewEnabled", "0") == "1",
-                    "days": int(get_system_setting("sslAutoRenewDays", "7") or 7),
+                    "enabled": get_system_setting("sslAutoRenewEnabled", "1") == "1",
+                    "days": int(get_system_setting("sslAutoRenewDays", "30") or 30),
                     "lastRunAt": get_system_setting("sslAutoRenewLastRunAt", ""),
                     "lastResult": get_system_setting("sslAutoRenewLastResult", ""),
                 }, "获取自动续期设置成功")
@@ -5737,7 +6509,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         pass
                 self._ok({
                     "enabled": enabled,
-                    "days": int(get_system_setting("sslAutoRenewDays", "7") or 7),
+                    "days": int(get_system_setting("sslAutoRenewDays", "30") or 30),
                 }, "自动续期已" + ("开启" if enabled else "关闭"))
                 return
 
@@ -5897,6 +6669,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                                     cert["credentialName"] = cr["name"]
                                     cert["provider"] = "tencent_ssl"
                                     cert["source"] = "tencent"
+                                    cert.update(_decorate_certificate(cert))
                                 certificates.extend(batch)
                                 total_count = int(r.get("totalCount") or len(certificates))
                                 if len(batch) < 100 or len(certificates) >= total_count:
@@ -5976,6 +6749,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 c2["credentialName"] = cred_row["name"]
                 c2["provider"] = "tencent_ssl"
                 c2["source"] = "tencent"
+                c2 = _decorate_certificate(c2)
                 certs_out.append(c2)
             result_ttl = 10 if any(c.get("status") in ("applying", "validating") for c in result.get("certificates", [])) else 120
             cache_set(cache_k, result, result_ttl)
@@ -6296,27 +7070,52 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             )
             return
 
-        # POST /api/ssl/certificates/<id>/complete — complete DV validation
+        # POST /api/ssl/certificates/<id>/auto-renew — per-certificate renewal
+        # toggle. ACME certs flip a local flag; Tencent-issued certs call the
+        # cloud's own SetAutoRenewFlag so the cloud console and panel agree.
         m_auto_renew = re.fullmatch(r"/certificates/([^/]+)/auto-renew", sub)
         if self.command == "POST" and m_auto_renew:
             cert_id = urllib.parse.unquote(m_auto_renew.group(1))
             enabled = bool(body.get("enabled"))
             with conn() as c:
                 row = c.execute(
-                    """SELECT id FROM ssl_certificates
-                       WHERE userId = ? AND provider = 'acme' AND remoteCertId = ? LIMIT 1""",
+                    """SELECT id, provider, credentialId, isUploaded FROM ssl_certificates
+                       WHERE userId = ? AND remoteCertId = ? LIMIT 1""",
                     (uid, cert_id),
                 ).fetchone()
-                if row is None:
-                    self._err("仅 Let's Encrypt 证书支持单独设置自动续期", 404)
-                    return
+            if row is None:
+                self._err("证书不存在", 404)
+                return
+            if str(row["provider"] or "") == "acme":
+                with conn() as c:
+                    c.execute(
+                        "UPDATE ssl_certificates SET autoRenew = ?, updatedAt = ? WHERE id = ?",
+                        (1 if enabled else 0, now_iso(), row["id"]),
+                    )
+                    c.commit()
+                cache_delete_pattern(f"ssl:certs:all:user:{uid}:*")
+                self._ok({"enabled": enabled}, "该证书自动续期已" + ("开启" if enabled else "关闭"))
+                return
+            # Tencent certificate → cloud-side auto-renew flag.
+            if row["isUploaded"]:
+                self._err("上传证书不支持开启腾讯云自动续费", 400)
+                return
+            cred_row, api = _ssl_api(str(row["credentialId"]))
+            try:
+                api.set_auto_renew_flag(cert_id, enabled)
+            except TencentSslApiError as ex:
+                # Free DV certs may reject the flag; surface the cloud reason
+                # instead of pretending the toggle worked.
+                self._err(f"腾讯云自动续费设置失败：{ex}", int(getattr(ex, "status", 400) or 400))
+                return
+            with conn() as c:
                 c.execute(
                     "UPDATE ssl_certificates SET autoRenew = ?, updatedAt = ? WHERE id = ?",
                     (1 if enabled else 0, now_iso(), row["id"]),
                 )
                 c.commit()
-            cache_delete_pattern(f"ssl:certs:all:user:{uid}:*")
-            self._ok({"enabled": enabled}, "该证书自动续期已" + ("开启" if enabled else "关闭"))
+            _invalidate(int(cred_row["id"]))
+            self._ok({"enabled": enabled}, "腾讯云自动续费已" + ("开启" if enabled else "关闭"))
             return
 
         # POST /api/ssl/certificates/<id>/complete — complete DV validation
@@ -6554,6 +7353,34 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         m = re.fullmatch(r"/certificates/([^/]+)/download", sub)
         if self.command == "GET" and m:
             cert_id = urllib.parse.unquote(m.group(1))
+            # acme certs: their "remoteCertId" is the primary domain and the
+            # PEM lives in panel-managed files, not on a cloud API. Previously
+            # this fell through to the Tencent API which answered "证书不存在"
+            # for a perfectly valid Let's Encrypt certificate.
+            with conn() as c:
+                acme_row = c.execute(
+                    "SELECT domain, certType FROM ssl_certificates WHERE userId = ? AND provider = 'acme' AND remoteCertId = ? LIMIT 1",
+                    (uid, cert_id),
+                ).fetchone()
+            if acme_row is not None:
+                try:
+                    pem = acme_api.AcmeService(key_length=str(acme_row["certType"] or "2048")).read_pem(acme_row["domain"] or cert_id)
+                except acme_api.AcmeApiError as ae:
+                    self._err(str(ae), getattr(ae, "status", 502))
+                    return
+                import zipfile as _zf
+                import io as _io
+                buf = _io.BytesIO()
+                with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as zf:
+                    zf.writestr("fullchain.pem", pem["publicKey"])
+                    zf.writestr("privkey.pem", pem["privateKey"])
+                safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(acme_row["domain"] or cert_id)).strip("._") or "acme-cert"
+                try:
+                    create_log(user_id=uid, action="READ_PRIVATE_KEY", resource_type="SSL_CERTIFICATE", status="SUCCESS", record_name=cert_id, ip_address=self._client_ip())
+                except Exception:
+                    pass
+                self._binary(buf.getvalue(), f"{safe_name}.zip", "application/zip")
+                return
             cred_id_raw = _get_cred_id(first_or_none(q, "credentialId"))
             if not cred_id_raw:
                 self._err("缺少 credentialId 参数", 400)
@@ -6586,12 +7413,12 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             # is a DNS credential — so short-circuit before the tencent path.
             with conn() as c:
                 acme_row = c.execute(
-                    "SELECT domain FROM ssl_certificates WHERE userId = ? AND provider = 'acme' AND remoteCertId = ? LIMIT 1",
+                    "SELECT domain, certType FROM ssl_certificates WHERE userId = ? AND provider = 'acme' AND remoteCertId = ? LIMIT 1",
                     (uid, cert_id),
                 ).fetchone()
             if acme_row is not None:
                 try:
-                    pem = acme_api.AcmeService().read_pem(acme_row["domain"] or cert_id)
+                    pem = acme_api.AcmeService(key_length=str(acme_row["certType"] or "2048")).read_pem(acme_row["domain"] or cert_id)
                 except acme_api.AcmeApiError as ae:
                     self._err(str(ae), getattr(ae, "status", 502))
                     return
@@ -6692,12 +7519,12 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             # and remove via acme.sh (--remove + delete local files) + DB row.
             with conn() as c:
                 acme_row = c.execute(
-                    "SELECT id, credentialId FROM ssl_certificates WHERE userId = ? AND provider = 'acme' AND remoteCertId = ? LIMIT 1",
+                    "SELECT id, credentialId, certType FROM ssl_certificates WHERE userId = ? AND provider = 'acme' AND remoteCertId = ? LIMIT 1",
                     (uid, cert_id),
                 ).fetchone()
             if acme_row is not None:
                 try:
-                    acme_api.AcmeService().remove(cert_id)
+                    acme_api.AcmeService(key_length=str(acme_row["certType"] or "2048")).remove(cert_id)
                 except Exception:
                     pass  # best effort — never block DB cleanup on acme.sh
                 with conn() as c:
@@ -6743,9 +7570,9 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     break
                 offset += batch
 
-            _sync_to_db(cred_id, "tencent_ssl", all_certs)
+            sync_result = _sync_to_db(cred_id, "tencent_ssl", all_certs, prune_missing=True)
             _invalidate(cred_id)
-            self._ok({"synced": len(all_certs)}, f"同步完成，共 {len(all_certs)} 个证书")
+            self._ok({"synced": len(all_certs), **sync_result}, f"同步完成，共 {len(all_certs)} 个证书，清理 {sync_result.get('removed', 0)} 个失效本地记录")
             return
 
         # POST /api/ssl/certificates/renew-expired — auto-renew expiring certs
@@ -6754,9 +7581,8 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             import time as _time
             renew_days = int(body.get("renewDays") or 30)
             dns_credential_id = body.get("dnsCredentialId")
-            now_dt = datetime.utcnow()
-            threshold_dt = now_dt.replace(tzinfo=timezone.utc) + timedelta(days=renew_days)
-            threshold = threshold_dt.isoformat().replace("+00:00", "Z")
+            now_dt = datetime.now(timezone.utc)
+            threshold_dt = now_dt + timedelta(days=renew_days)
 
             with conn() as c:
                 cred_rows = c.execute(
@@ -6823,6 +7649,59 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                             return d_api, d_prov, z
                 return None, None, None
 
+            # Healthy ACME (Let's Encrypt) certs act as standing coverage: a
+            # domain covered by a valid wildcard LE cert should NOT trigger a
+            # fresh Tencent application — that duplicate used to spawn a new
+            # cert pair which the plugin may then deploy over the LE one
+            # (the "CN shows account.shifuf.com" wildcard mix-up).
+            acme_coverage: list = []
+            with conn() as c:
+                for row in c.execute(
+                    "SELECT domain, san, notAfter FROM ssl_certificates WHERE userId = ? AND provider = 'acme' AND status = 'issued'",
+                    (uid,),
+                ).fetchall():
+                    try:
+                        names = json.loads(row["san"] or "[]")
+                    except Exception:
+                        names = []
+                    if not isinstance(names, list) or not names:
+                        names = [row["domain"]]
+                    expires_at = parse_certificate_datetime(row["notAfter"] or "")
+                    if expires_at is None or expires_at <= now_dt:
+                        continue
+                    acme_coverage.append({"names": [str(n).lower() for n in names if str(n).strip()], "expiresAt": expires_at})
+
+            def _acme_covers(check_domain: str) -> bool:
+                """Whether a healthy ACME cert already covers this Tencent domain.
+
+                Exact names must match exactly; a literal wildcard domain
+                (``*.example.com``) is only covered by the identical wildcard
+                name, while a concrete host is covered by a wildcard exactly
+                one label above it (never by the apex-style bare name).
+                """
+                raw = (check_domain or "").strip().lower().rstrip(".")
+                if not raw:
+                    return False
+                is_wildcard = raw.startswith("*.")
+                host = raw[2:] if is_wildcard else raw
+                if not host:
+                    return False
+                for item in acme_coverage:
+                    if item["expiresAt"] <= threshold_dt:
+                        continue  # coverage too close to expiry to rely on
+                    for name in item["names"]:
+                        if is_wildcard:
+                            if name == raw:
+                                return True
+                            continue
+                        if name.startswith("*."):
+                            bare = name[2:]
+                            if host.endswith("." + bare) and host.count(".") == bare.count(".") + 1:
+                                return True
+                        elif host == name:
+                            return True
+                return False
+
             for cr in cred_rows:
                 cr_secrets = self._credential_secrets(cr)
                 sid = str(cr_secrets.get("secretId") or "").strip()
@@ -6867,12 +7746,39 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         not_after = cert.get("notAfter", "")
                         status = cert.get("status", "")
                         old_cert_id = cert.get("remoteCertId", "")
+                        if cert.get("autoRenew") and status == "issued":
+                            # Tencent's own auto-renew is ON. Trust it for most
+                            # of the window, but act as a safety net when the
+                            # cert gets within 5 days of expiry (or is already
+                            # expired) and Tencent still hasn't re-issued —
+                            # otherwise a failed cloud renewal silently kills
+                            # the domain's HTTPS.
+                            remaining = certificate_days_remaining(not_after)
+                            safety_days = min(5, max(1, renew_days))
+                            if remaining is None or remaining > safety_days:
+                                skipped.append({
+                                    "domain": domain, "credential": cr["name"],
+                                    "reason": "腾讯云自动续费已开启，由腾讯云托管续期" + (f"（剩余 {remaining} 天）" if remaining is not None else ""),
+                                    "source": "tencent",
+                                })
+                                continue
+                            # Fall through: panel-side re-application as fallback.
                         if not not_after:
                             continue
-                        # Normalize notAfter for comparison (may be "2025-06-15 08:00:00" or "2025-06-15")
-                        not_after_cmp = not_after if " " in not_after else not_after + " 00:00:00"
-                        # Skip if not expired / not expiring within threshold
-                        if not_after_cmp > threshold and status == "issued":
+                        not_after_dt = parse_certificate_datetime(not_after)
+                        # Never compare Tencent date strings lexicographically:
+                        # the API mixes space-separated and ISO-8601 timestamps.
+                        # Treat malformed dates as actionable so the user sees a
+                        # failed/diagnostic result instead of a silent skip.
+                        if not_after_dt is None:
+                            failed.append({"domain": domain, "credential": cr["name"], "error": f"证书到期时间无法解析: {not_after}"})
+                            continue
+                        # Skip if not expired / not expiring within threshold.
+                        if not_after_dt > threshold_dt and status == "issued":
+                            continue
+                        # Covered by a healthy Let's Encrypt cert → no cloud re-issue.
+                        if _acme_covers(domain):
+                            skipped.append({"domain": domain, "credential": cr["name"], "reason": "已被有效的 Let's Encrypt 证书覆盖，跳过腾讯云续期", "source": "tencent"})
                             continue
                         # Skip if already applying/validating
                         if domain in domain_in_progress:
@@ -6886,9 +7792,9 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                             dv_method = "DNS"
                             # For official renewal flow, pass OldCertificateId only when still issued and expiring soon.
                             use_old_id = ""
-                            if old_cert_id and status == "issued" and not_after_cmp <= threshold:
+                            if old_cert_id and status == "issued" and not_after_dt <= threshold_dt:
                                 # If already expired, OldCertificateId renewal is not supported.
-                                if not_after_cmp >= now_dt.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"):
+                                if not_after_dt >= now_dt:
                                     use_old_id = str(old_cert_id)
                             result = cr_api.apply_certificate(domain, dv_method, old_certificate_id=use_old_id or None)
                             new_cert_id = result.get("CertificateId", "")
@@ -6965,16 +7871,14 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 except Exception as ex:
                     failed.append({"domain": "*", "credential": cr["name"], "error": str(ex)})
 
-            # ── acme.sh certificates: renew those expiring within threshold ──
-            # These live only in the local DB (provider='acme'); acme.sh handles
-            # the DNS-01 challenge via the stored DNS credential. Force-renew,
-            # then re-parse the refreshed PEM and write metadata + lastRenewedAt
-            # back so the panel and BaoTa plugin can show renewal status.
+            # ── acme.sh certificates: queue renewals ──
+            # DNS-01 renewal can take several minutes. Never execute acme.sh in
+            # the request thread: persist a renew job and let the same durable
+            # worker used by initial issuance process it across restarts.
             if acme_api.acme_available():
                 with conn() as c:
                     acme_rows = c.execute(
-                        """SELECT s.*, d.provider AS dnsProvider, d.secrets AS dnsSecrets,
-                                  d.accountId AS dnsAccountId, d.name AS dnsName
+                        """SELECT s.*, d.provider AS dnsProvider, d.name AS dnsName
                            FROM ssl_certificates s
                            LEFT JOIN dns_credentials d ON d.id = s.credentialId
                            WHERE s.userId = ? AND s.provider = 'acme'""",
@@ -6983,61 +7887,52 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 for ar in acme_rows:
                     domain = str(ar["domain"] or "").strip()
                     if not ar["autoRenew"]:
-                        skipped.append({"domain": domain, "credential": ar["dnsName"] or "acme", "reason": "自动续期已关闭"})
+                        skipped.append({"domain": domain, "credential": ar["dnsName"] or "acme", "reason": "自动续期已关闭", "source": "letsencrypt"})
                         continue
                     not_after = str(ar["notAfter"] or "")
-                    not_after_cmp = not_after if " " in not_after else (not_after + " 00:00:00" if not_after else "")
-                    # Skip certs that aren't expiring within the threshold yet.
-                    if not_after_cmp and not_after_cmp > threshold:
+                    not_after_dt = parse_certificate_datetime(not_after)
+                    if not_after_dt is None:
+                        failed.append({"domain": domain, "credential": ar["dnsName"] or "acme", "error": f"证书到期时间无法解析: {not_after}", "source": "letsencrypt"})
+                        continue
+                    if not_after_dt > threshold_dt:
                         continue
                     if not ar["dnsProvider"]:
-                        failed.append({"domain": domain, "credential": "acme", "error": "关联的 DNS 凭证已不存在，无法续期"})
+                        failed.append({"domain": domain, "credential": "acme", "error": "关联的 DNS 凭证已不存在，无法续期", "source": "letsencrypt"})
                         continue
                     try:
-                        dns_secrets = self._json_loads_safe(decrypt_text(ar["dnsSecrets"]))
-                        svc = acme_api.AcmeService(key_length=str(ar["certType"] or "2048"))
-                        meta = svc.renew(
-                            domain,
-                            provider=str(ar["dnsProvider"] or ""),
-                            secrets=dns_secrets,
-                            account_id=str(ar["dnsAccountId"] or ""),
-                        )
-                        ts = now_iso()
-                        with conn() as c:
+                        raw_domains = json.loads(ar["san"] or "[]") if ar["san"] else []
+                        domains = raw_domains if isinstance(raw_domains, list) and raw_domains else [domain]
+                    except Exception:
+                        domains = [domain]
+                    with conn() as c:
+                        active = c.execute(
+                            """SELECT id FROM ssl_acme_jobs
+                               WHERE userId = ? AND certificateId = ? AND operation = 'renew'
+                                 AND status IN ('queued', 'running') LIMIT 1""",
+                            (uid, ar["id"]),
+                        ).fetchone()
+                        if active is None:
+                            ts = now_iso()
                             c.execute(
-                                """UPDATE ssl_certificates SET status = 'issued', statusMsg = '',
-                                    notBefore = ?, notAfter = ?, san = ?, issuer = ?,
-                                    lastRenewedAt = ?, renewError = '', syncedAt = ?, updatedAt = ?
-                                   WHERE id = ?""",
-                                (
-                                    meta.get("notBefore", ""), meta.get("notAfter", ""),
-                                    json.dumps(meta.get("san") or [], ensure_ascii=False),
-                                    meta.get("issuer", "Let's Encrypt"),
-                                    ts, ts, ts, ar["id"],
-                                ),
+                                """INSERT INTO ssl_acme_jobs
+                                   (userId, certificateId, dnsCredentialId, domain, domains, keyLength,
+                                    operation, status, attempts, createdAt, updatedAt)
+                                   VALUES (?, ?, ?, ?, ?, ?, 'renew', 'queued', 0, ?, ?)""",
+                                (uid, ar["id"], ar["credentialId"], domain, json.dumps(domains, ensure_ascii=False),
+                                 str(ar["certType"] or "2048"), ts, ts),
                             )
                             c.execute(
-                                """UPDATE ssl_deployment_events SET status = 'queued', attempts = 0, error = NULL,
-                                     nextAttemptAt = NULL, targetName = NULL, fingerprint = NULL,
-                                     startedAt = NULL, completedAt = NULL, updatedAt = ?
-                                   WHERE userId = ? AND provider = 'acme' AND remoteCertId = ?""",
-                                (ts, uid, domain),
+                                "UPDATE ssl_certificates SET statusMsg = '续期任务已排队', renewError = '', updatedAt = ? WHERE id = ?",
+                                (ts, ar["id"]),
                             )
                             c.commit()
-                        renewed.append({"domain": domain, "credential": ar["dnsName"] or "acme", "newCertId": domain, "dnsRecordAdded": True, "source": "letsencrypt"})
-                        _invalidate(int(ar["credentialId"]))
-                    except Exception as ex:
-                        with conn() as c:
-                            c.execute(
-                                "UPDATE ssl_certificates SET renewError = ?, updatedAt = ? WHERE id = ?",
-                                (str(ex)[:500], now_iso(), ar["id"]),
-                            )
-                            c.commit()
-                        failed.append({"domain": domain, "credential": ar["dnsName"] or "acme", "error": str(ex), "source": "letsencrypt"})
+                            renewed.append({"domain": domain, "credential": ar["dnsName"] or "acme", "newCertId": domain, "dnsRecordAdded": True, "source": "letsencrypt", "status": "queued"})
+                        else:
+                            skipped.append({"domain": domain, "credential": ar["dnsName"] or "acme", "reason": "已有续期任务执行中", "source": "letsencrypt"})
 
             total_renewed = len(renewed)
             for item in renewed:
-                _write_ssl_task_log(uid, "renewal", None, item.get("domain"), item.get("source") or "tencent", "success", message="证书续期已提交或完成")
+                _write_ssl_task_log(uid, "renewal", None, item.get("domain"), item.get("source") or "tencent", "queued" if item.get("status") == "queued" else "success", message="证书续期任务已排队" if item.get("status") == "queued" else "证书续期已完成")
             for item in failed:
                 failure_source = str(item.get("source") or "tencent")
                 failure_domain = str(item.get("domain") or "*")
@@ -7047,12 +7942,155 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     "event": "ssl_renewal_failed", "domain": failure_domain,
                     "source": failure_source, "reason": failure_reason, "generatedAt": now_iso(),
                 })
-            msg = f"续期检查完成：{total_renewed} 个已续期"
+            msg = f"续期检查完成：{total_renewed} 个已续期或排队"
             if failed:
                 msg += f"，{len(failed)} 个失败"
             if skipped:
                 msg += f"，{len(skipped)} 个跳过"
             self._ok({"renewed": renewed, "failed": failed, "skipped": skipped}, msg)
+            return
+
+        # POST /api/ssl/certificates/reconcile — refresh Tencent state and
+        # remove local rows whose remote certificate was deleted/expired.
+        if self.command == "POST" and sub == "/certificates/reconcile":
+            cred_id_raw = _get_cred_id()
+            if cred_id_raw and cred_id_raw != "all":
+                targets = []
+                row = self._get_credential_row(uid, cred_id_raw)
+                if row is not None and str(row["provider"] or "") == "tencent_ssl":
+                    targets = [row]
+            else:
+                with conn() as c:
+                    targets = c.execute(
+                        "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ? AND provider = 'tencent_ssl'",
+                        (uid,),
+                    ).fetchall()
+            results = []
+            for cr in targets:
+                try:
+                    sec = self._credential_secrets(cr)
+                    sid = str(sec.get("secretId") or "").strip()
+                    skey = str(sec.get("secretKey") or "").strip()
+                    if not sid or not skey:
+                        raise ValueError("腾讯云凭证缺少 SecretId / SecretKey")
+                    api = TencentSslApi(sid, skey)
+                    fetched = []
+                    offset = 0
+                    complete = False
+                    while True:
+                        page_result = api.list_certificates(offset=offset, limit=100)
+                        batch = page_result.get("certificates") or []
+                        fetched.extend(batch)
+                        total = int(page_result.get("totalCount") or len(fetched))
+                        if len(batch) < 100 or len(fetched) >= total:
+                            complete = True
+                            break
+                        offset += len(batch)
+                    sync = _sync_to_db(int(cr["id"]), "tencent_ssl", fetched, prune_missing=complete)
+                    _invalidate(int(cr["id"]))
+                    results.append({"credentialId": cr["id"], "name": cr["name"], "fetched": len(fetched), **sync})
+                except Exception as ex:
+                    results.append({"credentialId": cr["id"], "name": cr["name"], "error": str(ex)})
+            failures = [x for x in results if x.get("error")]
+            self._ok({"results": results, "failed": len(failures)}, "腾讯云证书状态检查完成")
+            return
+
+        # POST /api/ssl/certificates/clean-expired — delete dead Tencent certs
+        # (expired / revoked / failed / cancelled) from the cloud account.
+        # Guard: a dead cert for a domain that has NO issued certificate at all
+        # is still kept — deleting it would remove the remaining issuance /
+        # renewal trail, and it costs nothing on Tencent's side. Pass
+        # dryRun=true to preview, staleDays to only touch certs dead that long.
+        if self.command == "POST" and sub == "/certificates/clean-expired":
+            from datetime import datetime, timedelta
+            dry_run = bool(body.get("dryRun"))
+            try:
+                stale_days = max(0, min(365, int(body.get("staleDays") or 0)))
+            except Exception:
+                stale_days = 0
+            only_domain = str(body.get("domain") or "").strip().lower()
+            now_dt = datetime.now(timezone.utc)
+            dead_statuses = ("expired", "revoked", "failed", "cancelled")
+
+            with conn() as c:
+                cred_rows = c.execute(
+                    "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ? AND provider = 'tencent_ssl'",
+                    (uid,),
+                ).fetchall()
+
+            cleaned: list = []
+            kept: list = []
+            errors: list = []
+            for cr in cred_rows:
+                s = self._credential_secrets(cr)
+                sid = str(s.get("secretId") or "").strip()
+                skey = str(s.get("secretKey") or "").strip()
+                if not sid or not skey:
+                    continue
+                try:
+                    api = TencentSslApi(sid, skey)
+                    certs: list = []
+                    off = 0
+                    while True:
+                        r = api.list_certificates(offset=off, limit=100)
+                        batch = r.get("certificates") or []
+                        certs.extend(batch)
+                        if len(batch) < 100 or len(certs) >= r.get("totalCount", 0):
+                            break
+                        off += 100
+                except Exception as ex:
+                    errors.append({"credential": cr["name"], "error": str(ex)})
+                    continue
+
+                domains_with_issued = {
+                    (x.get("domain") or "").strip().lower()
+                    for x in certs if x.get("status") == "issued"
+                }
+                for cert in certs:
+                    status = _certificate_status(dict(cert, source="tencent"))
+                    if status not in dead_statuses:
+                        continue
+                    domain = (cert.get("domain") or "").strip().lower()
+                    if not domain or (only_domain and domain != only_domain):
+                        continue
+                    cert_id = str(cert.get("remoteCertId") or "")
+                    if not cert_id:
+                        continue
+                    if domain in domains_with_issued:
+                        # Superseded siblings also expire over time; a newer
+                        # issued cert exists, so removing the dead one is safe.
+                        pass
+                    elif stale_days <= 0:
+                        kept.append({"domain": domain, "certId": cert_id, "status": status, "reason": "该域名暂无有效证书，保留过期证书作记录"})
+                        continue
+                    else:
+                        end_dt = parse_certificate_datetime(cert.get("notAfter"))
+                        if end_dt is None or (now_dt - end_dt).days < stale_days:
+                            kept.append({"domain": domain, "certId": cert_id, "status": status, "reason": f"失效未满 {stale_days} 天"})
+                            continue
+                    if dry_run:
+                        cleaned.append({"domain": domain, "certId": cert_id, "status": status, "dryRun": True})
+                        continue
+                    try:
+                        api.delete_certificate(cert_id)
+                        with conn() as c:
+                            c.execute(
+                                "DELETE FROM ssl_certificates WHERE userId = ? AND credentialId = ? AND remoteCertId = ?",
+                                (uid, int(cr["id"]), cert_id),
+                            )
+                            c.commit()
+                        _invalidate(int(cr["id"]))
+                        cleaned.append({"domain": domain, "certId": cert_id, "status": status})
+                        _write_ssl_task_log(uid, "cleanup", None, domain, "tencent", "success", message=f"已删除云端失效证书（{status}）")
+                    except Exception as ex:
+                        errors.append({"domain": domain, "certId": cert_id, "error": str(ex)})
+                        _write_ssl_task_log(uid, "cleanup", None, domain, "tencent", "failed", message=str(ex))
+
+            verb = "预览：将清理 " if dry_run else "已清理 "
+            self._ok(
+                {"cleaned": cleaned, "kept": kept, "errors": errors, "dryRun": dry_run},
+                verb + f"{len(cleaned)} 个失效证书" + (f"，{len(kept)} 个保留" if kept else "") + (f"，{len(errors)} 个失败" if errors else ""),
+            )
             return
 
         # POST /api/ssl/certificates/prune-superseded — delete expiring/expired
@@ -7067,7 +8105,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             dry_run = bool(body.get("dryRun"))
             only_domain = str(body.get("domain") or "").strip().lower()
             cleanup_validation = body.get("cleanupValidation", True)
-            now_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
+            now_dt = datetime.now(timezone.utc)
 
             with conn() as c:
                 cred_rows = c.execute(
@@ -7107,14 +8145,8 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 return None, None, None
 
             def _remaining_days(not_after: str) -> int:
-                if not not_after:
-                    return -99999
-                na = not_after if " " in not_after else not_after + " 00:00:00"
-                try:
-                    dt = datetime.strptime(na[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    return (dt - now_dt).days
-                except Exception:
-                    return -99999
+                remaining = certificate_days_remaining(not_after, now_dt)
+                return int(remaining) if remaining is not None else -99999
 
             def _cleanup_dv(api_obj, cert_id: str, dry: bool = False) -> int:
                 """Old-cert path: remove DV records via the cert's dvAuths (used
@@ -7210,7 +8242,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     issued = [x for x in lst if x.get("status") == "issued"]
                     if not issued:
                         continue
-                    best = max(issued, key=lambda x: x.get("notAfter") or "")
+                    best = max(issued, key=lambda x: parse_certificate_datetime(x.get("notAfter")) or datetime.min.replace(tzinfo=timezone.utc))
                     best_rem = _remaining_days(best.get("notAfter"))
 
                     # Remove leftover _dnsauth validation records — but only when
@@ -7281,7 +8313,7 @@ def _api_tokens_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> No
 
     sub = path[len("/api/api-tokens"):].strip()
     body = self._json_body(b)
-    allowed_scopes = {"ssl:read", "ssl:pem", "ssl:issue", "ssl:renew", "ssl:deploy", "*"}
+    allowed_scopes = {"ssl:read", "ssl:pem", "ssl:issue", "ssl:renew", "ssl:deploy", "ssl:*", "dns:read", "dns:write", "dashboard:read", "logs:read", "accel:read", "accel:write", "*"}
 
     try:
         # GET /api/api-tokens — list tokens (never expose the hash)
@@ -7356,3 +8388,193 @@ def _api_tokens_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> No
         self._err("接口不存在", 404)
     except Exception as e:
         self._err(str(e), 500)
+
+
+def _notifications_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
+    sub = path[len("/api/notifications") :] or "/"
+    body = self._json_body(b)
+    auth_user = self._auth()
+    if not auth_user:
+        return
+    uid = int(auth_user.get("id") or 0)
+    if uid <= 0:
+        self._err("认证失败", 401)
+        return
+
+    def _load_settings():
+        with conn() as c:
+            try:
+                row = c.execute(
+                    "SELECT enabled, channels, updatedAt FROM notification_settings WHERE userId = ? LIMIT 1",
+                    (uid,),
+                ).fetchone()
+            except Exception:
+                row = None
+        if not row:
+            return {"enabled": True, "channels": []}
+        channels = []
+        raw = row["channels"] or "[]"
+        try:
+            # Prefer encrypted blob (iv:hex...); fall back to plaintext JSON for legacy rows.
+            if isinstance(raw, str) and ":" in raw and not raw.lstrip().startswith(("[", "{")):
+                try:
+                    raw = decrypt_text(raw) or "[]"
+                except Exception:
+                    pass
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, list):
+                channels = parsed
+        except Exception:
+            channels = []
+        return {
+            "enabled": bool(row["enabled"]),
+            "channels": channels,
+            "updatedAt": row["updatedAt"] if "updatedAt" in row.keys() else None,
+        }
+
+    if self.command == "GET" and sub == "/settings":
+        self._ok(_load_settings(), "获取通知设置成功")
+        return
+
+    if self.command == "PUT" and sub == "/settings":
+        enabled = body.get("enabled")
+        try:
+            channels = sanitize_notification_channels(body.get("channels") if isinstance(body.get("channels"), list) else [])
+        except ValueError as exc:
+            self._err(str(exc), 400)
+            return
+        enabled_flag = 1 if (enabled is None or bool(enabled)) else 0
+        channels_json = json.dumps(channels, ensure_ascii=False)
+        try:
+            channels_store = encrypt_text(channels_json)
+        except Exception:
+            channels_store = channels_json
+        with conn() as c:
+            c.execute(
+                """
+                INSERT INTO notification_settings (userId, channels, enabled, updatedAt)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(userId) DO UPDATE SET
+                  channels = excluded.channels,
+                  enabled = excluded.enabled,
+                  updatedAt = CURRENT_TIMESTAMP
+                """,
+                (uid, channels_store, enabled_flag),
+            )
+            c.commit()
+        self._ok(_load_settings(), "通知设置已保存")
+        return
+
+    if self.command == "POST" and sub == "/test":
+        channel = body.get("channel") if isinstance(body.get("channel"), dict) else None
+        if not channel:
+            self._err("缺少 channel 配置", 400)
+            return
+        try:
+            sanitized = sanitize_notification_channels([channel])
+        except ValueError as exc:
+            self._err(str(exc), 400)
+            return
+        if not sanitized:
+            self._err("渠道配置无效", 400)
+            return
+        title = str(body.get("title") or "DNS Panel 测试通知")
+        content = str(body.get("content") or "这是一条测试消息")
+        # enrich email channel with user SMTP if missing
+        with conn() as c:
+            user = c.execute(
+                "SELECT smtpHost, smtpPort, smtpSecure, smtpUser, smtpPass, smtpFrom, domainExpiryNotifyEmailTo, email FROM users WHERE id = ? LIMIT 1",
+                (uid,),
+            ).fetchone()
+        ch = dict(sanitized[0])
+        cfg = dict(ch.get("config") or {})
+        if str(ch.get("type") or "") == "email" and user:
+            cfg.setdefault("smtpHost", user["smtpHost"])
+            cfg.setdefault("smtpPort", user["smtpPort"])
+            cfg.setdefault("smtpSecure", user["smtpSecure"])
+            cfg.setdefault("smtpUser", user["smtpUser"])
+            if not cfg.get("smtpPass") and user["smtpPass"]:
+                try:
+                    cfg["smtpPass"] = decrypt_text(user["smtpPass"])
+                except Exception:
+                    cfg["smtpPass"] = ""
+            elif cfg.get("smtpPass"):
+                # If caller supplied the stored ciphertext by mistake, decrypt when possible.
+                raw_pass = str(cfg.get("smtpPass") or "")
+                if ":" in raw_pass and all(c in "0123456789abcdefABCDEF:" for c in raw_pass):
+                    try:
+                        decrypted = decrypt_text(raw_pass)
+                        if decrypted:
+                            cfg["smtpPass"] = decrypted
+                    except Exception:
+                        pass
+            cfg.setdefault("smtpFrom", user["smtpFrom"])
+            cfg.setdefault("to", user["domainExpiryNotifyEmailTo"] or user["email"] or cfg.get("to"))
+        if str(ch.get("type") or "") == "inapp":
+            cfg["userId"] = uid
+        ch["config"] = cfg
+        results = send_notification([ch], title, content, level="info", meta={"event": "test"})
+        self._ok({"results": results}, "测试发送完成")
+        return
+
+    if self.command == "GET" and sub == "/inbox":
+        status = str((q.get("status") or ["all"])[0] or "all").strip()
+        limit = p_int((q.get("limit") or ["50"])[0], 50, 200)
+        with conn() as c:
+            try:
+                if status in ("unread", "read"):
+                    rows = c.execute(
+                        "SELECT id, level, title, message, status, meta, createdAt FROM inapp_notifications WHERE userId = ? AND status = ? ORDER BY id DESC LIMIT ?",
+                        (uid, status, limit),
+                    ).fetchall()
+                else:
+                    rows = c.execute(
+                        "SELECT id, level, title, message, status, meta, createdAt FROM inapp_notifications WHERE userId = ? ORDER BY id DESC LIMIT ?",
+                        (uid, limit),
+                    ).fetchall()
+                unread = c.execute(
+                    "SELECT COUNT(*) AS c FROM inapp_notifications WHERE userId = ? AND status = 'unread'",
+                    (uid,),
+                ).fetchone()["c"]
+            except Exception:
+                rows, unread = [], 0
+        items = []
+        for r in rows:
+            try:
+                meta = json.loads(r["meta"] or "{}")
+            except Exception:
+                meta = {}
+            items.append(
+                {
+                    "id": r["id"],
+                    "level": r["level"],
+                    "title": r["title"],
+                    "message": r["message"],
+                    "status": r["status"],
+                    "meta": meta,
+                    "createdAt": r["createdAt"],
+                }
+            )
+        self._ok({"items": items, "unread": int(unread or 0)}, "获取站内通知成功")
+        return
+
+    if self.command == "POST" and sub == "/inbox/read":
+        nid = body.get("id")
+        mark_all = bool(body.get("all"))
+        with conn() as c:
+            try:
+                if mark_all:
+                    c.execute("UPDATE inapp_notifications SET status = 'read' WHERE userId = ? AND status = 'unread'", (uid,))
+                elif nid is not None:
+                    c.execute(
+                        "UPDATE inapp_notifications SET status = 'read' WHERE userId = ? AND id = ?",
+                        (uid, int(nid)),
+                    )
+                c.commit()
+            except Exception as exc:
+                self._err(f"标记已读失败: {exc}", 500)
+                return
+        self._ok({"ok": True}, "已标记已读")
+        return
+
+    self._err("接口不存在", 404)

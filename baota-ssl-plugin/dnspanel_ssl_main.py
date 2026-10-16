@@ -133,8 +133,8 @@ def _run_checked(command):
 def _validate_pem_pair(public_key, private_key, hostnames=None):
     if "-----BEGIN CERTIFICATE-----" not in public_key or "PRIVATE KEY-----" not in private_key:
         return False, "证书或私钥 PEM 格式无效"
-    cert_tmp = "/tmp/dnspanel-cert-" + str(os.getpid()) + ".pem"
-    key_tmp = "/tmp/dnspanel-key-" + str(os.getpid()) + ".pem"
+    cert_tmp = _plugin_tmp_path("dnspanel-cert")
+    key_tmp = _plugin_tmp_path("dnspanel-key")
     try:
         _atomic_write(cert_tmp, public_key)
         _atomic_write(key_tmp, private_key)
@@ -143,10 +143,26 @@ def _validate_pem_pair(public_key, private_key, hostnames=None):
         if hashlib.sha256(cert_pub).digest() != hashlib.sha256(key_pub).digest():
             return False, "证书与私钥不匹配"
         subprocess.check_output(["openssl", "x509", "-in", cert_tmp, "-checkend", "0", "-noout"], stderr=subprocess.STDOUT)
-        candidates = [str(h).strip().lstrip("*.") for h in (hostnames or []) if str(h).strip()]
+        candidates = []
+        for h in (hostnames or []):
+            raw = str(h).strip().lower().rstrip(".")
+            if not raw:
+                continue
+            if raw.startswith("*."):
+                # openssl -checkhost rejects literal wildcard bindings; match
+                # those against the certificate's own SAN list instead.
+                candidates.append(("wildcard", raw))
+            else:
+                candidates.append(("host", raw.lstrip("*.")))
         if candidates:
+            cert_names = _cert_names_from_pem(public_key)
             covered = False
-            for hostname in candidates:
+            for kind, hostname in candidates:
+                if kind == "wildcard":
+                    if hostname in cert_names:
+                        covered = True
+                        break
+                    continue
                 try:
                     subprocess.check_output(["openssl", "x509", "-in", cert_tmp, "-checkhost", hostname, "-noout"], stderr=subprocess.STDOUT)
                     covered = True
@@ -217,6 +233,148 @@ def _validate_server_url(value):
         return None
 
 
+def _parse_expiry(value):
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(raw)
+    except Exception:
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+    from datetime import timezone
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+def _days_remaining(cert):
+    expires = _parse_expiry(cert.get("notAfter"))
+    if expires is None:
+        return None
+    from datetime import datetime, timezone
+    return int((expires - datetime.now(timezone.utc)).total_seconds() // 86400)
+
+
+def _certificate_health(cert, renew_days=30):
+    days = _days_remaining(cert)
+    status = str(cert.get("status") or "").lower()
+    if days is None:
+        return {"state": "unknown", "daysRemaining": None, "needsRenewal": True, "reason": "无法解析证书到期时间"}
+    if days < 0 or status == "expired":
+        return {"state": "expired", "daysRemaining": days, "needsRenewal": True, "reason": "证书已过期"}
+    if days <= renew_days:
+        return {"state": "expiring", "daysRemaining": days, "needsRenewal": True, "reason": "证书即将到期"}
+    return {"state": "valid", "daysRemaining": days, "needsRenewal": False, "reason": "证书有效"}
+
+
+def _plugin_tmp_path(prefix):
+    """Temp file path for openssl scratch work (platform temp dir)."""
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), prefix + "-" + str(os.getpid()) + ".pem")
+
+
+def _cert_names_from_pem(pem_text):
+    """Extract the SAN DNS names (fallback: CN) of a certificate PEM.
+
+    Returns [] when openssl cannot parse it — callers treat that as 'unknown
+    coverage' and skip coverage-based decisions rather than guessing.
+    """
+    if not pem_text or "-----BEGIN CERTIFICATE-----" not in pem_text:
+        return []
+    cert_tmp = _plugin_tmp_path("dnspanel-names")
+    try:
+        _atomic_write(cert_tmp, pem_text)
+        names = []
+        ok, output = _run_checked([
+            "openssl", "x509", "-in", cert_tmp, "-noout",
+            "-ext", "subjectAltName",
+        ])
+        if ok:
+            for token in re.split(r"[,\s]+", output):
+                token = token.strip()
+                if token.startswith("DNS:"):
+                    name = token[4:].strip().lower().rstrip(".")
+                    if name and name not in names:
+                        names.append(name)
+        if not names:
+            ok, output = _run_checked([
+                "openssl", "x509", "-in", cert_tmp, "-noout", "-subject",
+            ])
+            if ok:
+                match = re.search(r"CN\s*=\s*([A-Za-z0-9.*_-]+)", output)
+                if match:
+                    name = match.group(1).strip().lower().rstrip(".")
+                    if name:
+                        names.append(name)
+        return names
+    except Exception:
+        return []
+    finally:
+        try:
+            os.remove(cert_tmp)
+        except Exception:
+            pass
+
+
+def _cert_not_after_from_pem(pem_text):
+    """Return the certificate notAfter as an aware UTC datetime, or None."""
+    if not pem_text or "-----BEGIN CERTIFICATE-----" not in pem_text:
+        return None
+    cert_tmp = _plugin_tmp_path("dnspanel-expiry")
+    try:
+        _atomic_write(cert_tmp, pem_text)
+        ok, output = _run_checked(["openssl", "x509", "-in", cert_tmp, "-noout", "-enddate"])
+        if not ok:
+            return None
+        raw = output.strip().split("=", 1)[-1].strip()
+        # e.g. "Jul 23 07:59:59 2026 GMT"
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.strptime(raw, "%b %d %H:%M:%S %Y %Z")
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return _parse_expiry(raw)
+    except Exception:
+        return None
+    finally:
+        try:
+            os.remove(cert_tmp)
+        except Exception:
+            pass
+
+
+def _name_covers(cert_name, host):
+    """True when certificate name `cert_name` serves `host`.
+
+    Rules follow TLS semantics: a wildcard (*.example.com) covers exactly one
+    label under its base but never the apex; a literal wildcard binding
+    ("*.example.com" as a site domain) is only served by the identical
+    wildcard name.
+    """
+    cn = str(cert_name or "").strip().lower().rstrip(".")
+    h = str(host or "").strip().lower().rstrip(".")
+    if not cn or not h:
+        return False
+    if h.startswith("*."):
+        return cn == h
+    if cn.startswith("*."):
+        base = cn[2:]
+        return h.endswith("." + base) and h.count(".") == base.count(".") + 1
+    return h == cn
+
+
+def _names_coverage_score(cert_names, hosts):
+    """How many of `hosts` are covered by the certificate's names."""
+    return sum(1 for h in (hosts or []) if any(_name_covers(n, h) for n in (cert_names or [])))
+
+
 def _dedup_latest_by_domain(certs):
     """Keep one cert per domain — the one with the MOST remaining validity.
 
@@ -229,7 +387,7 @@ def _dedup_latest_by_domain(certs):
         if not domain:
             continue
         cur = best.get(domain)
-        if not cur or (cert.get("notAfter") or "") > (cur.get("notAfter") or ""):
+        if not cur or (_parse_expiry(cert.get("notAfter")) or _parse_expiry("1970-01-01T00:00:00Z")) > (_parse_expiry(cur.get("notAfter")) or _parse_expiry("1970-01-01T00:00:00Z")):
             best[domain] = cert
     return list(best.values())
 
@@ -258,6 +416,8 @@ def _auto_renew_label(cert):
             last = str(cert.get("lastRenewedAt") or "").strip()
             return ("自动续期 · 上次 " + last[:10]) if last else "自动续期"
         return "已关闭"
+    if cert.get("autoRenew") or cert.get("autoRenewFlag") in (1, "1", True):
+        return "腾讯云自动续费"
     return "面板托管"
 
 
@@ -421,6 +581,56 @@ def _cert_deployed(site_name):
         return False
 
 
+def _installed_cert_summary(site_name):
+    """Inspect the certificate currently deployed on a site.
+
+    Returns {names, expiry, fingerprint} or None when nothing is deployed.
+    Used for downgrade protection and the update-check view.
+    """
+    if not site_name:
+        return None
+    p = "/www/server/panel/vhost/cert/" + str(site_name) + "/fullchain.pem"
+    try:
+        if not (os.path.exists(p) and os.path.getsize(p) > 0):
+            return None
+        pem = public.ReadFile(p)
+    except Exception:
+        return None
+    if not pem:
+        return None
+    raw = pem if isinstance(pem, bytes) else pem.encode("utf-8", "replace")
+    return {
+        "names": _cert_names_from_pem(pem),
+        "expiry": _cert_not_after_from_pem(pem),
+        "fingerprint": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _cert_names_from_panel_cert(cert):
+    """Merge a panel cert's primary domain and SAN list into a name list.
+
+    Note: the Tencent list endpoint reports `san` as the SAN *count*
+    (DomainNumber), and only ACME rows carry the real JSON array — anything
+    that is not a usable list is ignored and the primary domain is used.
+    """
+    names = []
+    primary = str(cert.get("domain") or "").strip().lower().rstrip(".")
+    if primary and primary not in names:
+        names.append(primary)
+    san = cert.get("san")
+    if isinstance(san, str):
+        try:
+            san = json.loads(san)
+        except Exception:
+            san = None
+    if isinstance(san, list):
+        for item in san:
+            name = str(item or "").strip().lower().rstrip(".")
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
 class dnspanel_ssl_main:
 
     def __init__(self):
@@ -439,6 +649,9 @@ class dnspanel_ssl_main:
 
         # Fetch certificate count from the panel
         cert_count = 0
+        expiring_count = 0
+        expired_count = 0
+        missing_count = 0
         connection_ok = False
         error_msg = ""
         # The panel's OWN auto-renew scheduler state (the source of truth). We
@@ -452,6 +665,14 @@ class dnspanel_ssl_main:
                 if data.get("success"):
                     connection_ok = True
                     cert_count = (data.get("pagination") or {}).get("total", 0)
+                    for cert in data.get("data") or []:
+                        health = _certificate_health(cert, int(cfg.get("renewDays") or 30))
+                        if health["state"] == "expired":
+                            expired_count += 1
+                        elif health["state"] == "expiring":
+                            expiring_count += 1
+                        if health["state"] == "unknown":
+                            missing_count += 1
                 else:
                     error_msg = data.get("message", "连接失败")
             except Exception as e:
@@ -484,6 +705,13 @@ class dnspanel_ssl_main:
             "lastSyncAt": last_sync,
             "connectionOk": connection_ok,
             "certCount": cert_count,
+            "expiringCount": expiring_count,
+            "expiredCount": expired_count,
+            "unknownExpiryCount": missing_count,
+            "lastCheckAt": cfg.get("lastCertificateCheckAt", ""),
+            "lastCheckResult": cfg.get("lastCertificateCheckResult", ""),
+            "lastSiteCheckAt": cfg.get("lastSiteCheckAt", ""),
+            "lastSiteCheckResult": cfg.get("lastSiteCheckResult", ""),
             "error": error_msg,
             "allowedSites": cfg.get("allowedSites") or [],
             "allowedSources": cfg.get("allowedSources") or ["tencent", "letsencrypt"],
@@ -599,6 +827,177 @@ class dnspanel_ssl_main:
             return public.ReturnMsg(True, ("已" + ("开启" if enabled else "关闭") + "本机自动续期，但面板同步失败（请检查 Token 权限）"))
         return public.ReturnMsg(True, "自动续期已" + ("开启" if enabled else "关闭") + "（面板 + 本机已同步）")
 
+    # ── Certificate health/reconciliation ───────────────────────
+    def check_certificates(self, args):
+        cfg = _get_config() or {}
+        if not cfg.get("serverUrl") or not cfg.get("apiToken"):
+            return public.ReturnMsg(False, "请先配置连接信息")
+        renew_days = int(getattr(args, "renewDays", None) or cfg.get("renewDays") or 30)
+        result = _panel_post("/ssl/certificates/reconcile", {"credentialId": "all"}, timeout=120)
+        cert_result = _panel_get("/ssl/certificates?credentialId=all&page=1&limit=500")
+        if not cert_result.get("success"):
+            return public.ReturnMsg(False, cert_result.get("message", "证书检查失败"))
+        certs = cert_result.get("data") or []
+        health = []
+        for cert in certs:
+            item = dict(cert)
+            item["health"] = _certificate_health(item, renew_days)
+            health.append(item)
+        due = [x for x in health if x["health"].get("needsRenewal")]
+        now_text = time.strftime("%Y-%m-%d %H:%M:%S")
+        summary = {"checked": len(health), "needsRenewal": len(due), "expired": sum(1 for x in due if x["health"]["state"] == "expired"), "reconcile": result.get("data") or {}}
+        _set_config("lastCertificateCheckAt", now_text)
+        _set_config("lastCertificateCheckResult", json.dumps(summary, ensure_ascii=False))
+        public.WriteLog("DNS面板SSL同步", "证书健康检查：检查 " + str(len(health)) + "，待续期 " + str(len(due)))
+        return {"success": True, "message": "证书检查完成", "data": summary, "certificates": health}
+
+    # ── Per-site certificate update detection ───────────────────
+    def check_site_certificates(self, args):
+        """Compare each BaoTa site's deployed certificate with the panel's
+        best available certificate and report what needs updating.
+
+        For every site with a deployed cert (or a cert available for it):
+          state = 'ok'        已部署证书有效且不劣于面板最新证书
+                  'update'    面板有更新的证书（覆盖不缩小且剩余期更长/刚续期）
+                  'expiring'  已部署证书临近到期且面板暂无更新版本
+                  'expired'   已部署证书已过期且面板暂无可用替换
+                  'missing'   站点尚无证书，面板已有可用证书
+                  'error'     无法读取站点证书（例如文件损坏）
+        """
+        cfg = _get_config() or {}
+        if not cfg.get("serverUrl") or not cfg.get("apiToken"):
+            return public.ReturnMsg(False, "请先配置连接信息")
+        renew_days = int(_to_int(cfg.get("renewDays")) or 30) if cfg.get("renewDays") else 30
+
+        cert_result = _panel_get("/ssl/certificates?credentialId=all&page=1&limit=500")
+        if not cert_result.get("success"):
+            return public.ReturnMsg(False, cert_result.get("message", "获取面板证书失败"))
+        certs = cert_result.get("data") or []
+        deployable = [
+            c for c in certs
+            if (c.get("status") == "issued" or c.get("isUploaded"))
+            and _certificate_health(c, renew_days)["state"] != "expired"
+        ]
+        deployable = _dedup_latest_by_domain(deployable)
+
+        allowed_sites = set(str(x) for x in (cfg.get("allowedSites") or []) if str(x))
+        allowed_sources = set(str(x).lower() for x in (cfg.get("allowedSources") or ["tencent", "letsencrypt"]))
+        sites = _list_bt_sites()
+
+        items = []
+        updates = 0
+        for site in sites:
+            name = str(site.get("name") or "")
+            if not name:
+                continue
+            if allowed_sites and name not in allowed_sites:
+                continue
+            hosts = [name] + [str(d).strip() for d in (site.get("domains") or []) if str(d).strip()]
+            installed = _installed_cert_summary(name)
+
+            # Best panel certificate for this site: highest coverage, then
+            # longest remaining validity; only from allowed sources.
+            best_cert = None
+            best_score = -1
+            best_rem = None
+            best_rem_raw = None
+            for cert in deployable:
+                source = "letsencrypt" if cert.get("provider") == "acme" or cert.get("source") == "letsencrypt" else "tencent"
+                if source not in allowed_sources:
+                    continue
+                cert_names = _cert_names_from_panel_cert(cert)
+                if not cert_names:
+                    continue
+                score = _names_coverage_score(cert_names, hosts)
+                if score <= 0:
+                    continue
+                rem = _days_remaining(cert)
+                rem_key = rem if rem is not None else 99999
+                if score > best_score or (score == best_score and (best_rem is None or rem_key > best_rem)):
+                    best_cert = cert
+                    best_score = score
+                    best_rem = rem_key
+                    best_rem_raw = rem
+
+            item = {
+                "site": name,
+                "hosts": hosts,
+                "deployed": bool(installed),
+                "installedNames": (installed or {}).get("names") or [],
+                "installedDaysRemaining": None,
+                "bestCertDomain": (best_cert or {}).get("domain") or "",
+                "bestCertId": (best_cert or {}).get("remoteCertId") or "",
+                "bestCertCredentialId": (best_cert or {}).get("credentialId") or "",
+                "bestCertDaysRemaining": best_rem_raw if best_cert else None,
+                "source": ("letsencrypt" if best_cert and (best_cert.get("provider") == "acme" or best_cert.get("source") == "letsencrypt") else "tencent") if best_cert else "",
+            }
+
+            if installed and installed.get("expiry"):
+                from datetime import datetime, timezone
+                inst_days = int((installed["expiry"] - datetime.now(timezone.utc)).total_seconds() // 86400)
+                item["installedDaysRemaining"] = inst_days
+            else:
+                inst_days = None
+
+            if installed is None:
+                if best_cert:
+                    item["state"] = "missing"
+                    item["action"] = "部署面板证书"
+                    updates += 1
+                else:
+                    item["state"] = "none"
+                    item["action"] = "无需处理（面板暂无可用证书）"
+            elif inst_days is None:
+                item["state"] = "error"
+                item["action"] = "无法读取站点证书，建议重新部署"
+                if best_cert:
+                    updates += 1
+            elif inst_days < 0:
+                if best_cert:
+                    item["state"] = "update"
+                    item["action"] = "站点证书已过期，立即部署面板证书"
+                    updates += 1
+                else:
+                    item["state"] = "expired"
+                    item["action"] = "已过期且面板暂无可用替换，请申请证书"
+            elif best_cert and best_score > 0:
+                inst_names = installed.get("names") or []
+                covered_new = {h for h in hosts if any(_name_covers(n, h) for n in _cert_names_from_panel_cert(best_cert))}
+                covered_old = {h for h in hosts if any(_name_covers(n, h) for n in inst_names)}
+                new_rem = item["bestCertDaysRemaining"] if item["bestCertDaysRemaining"] is not None else 99999
+                wider = covered_new - covered_old
+                fresh = new_rem > inst_days + 7
+                if wider or (fresh and covered_new >= covered_old):
+                    item["state"] = "update"
+                    item["action"] = "面板有更新证书，建议部署"
+                    updates += 1
+                elif inst_days <= renew_days:
+                    item["state"] = "expiring"
+                    item["action"] = "站点证书临近到期，面板证书未更新（可先触发续期）"
+                else:
+                    item["state"] = "ok"
+                    item["action"] = "已是最新"
+            elif inst_days <= renew_days:
+                item["state"] = "expiring"
+                item["action"] = "站点证书临近到期，面板暂无可用替换"
+            else:
+                item["state"] = "ok"
+                item["action"] = "已是最新"
+            items.append(item)
+
+        now_text = time.strftime("%Y-%m-%d %H:%M:%S")
+        summary = {
+            "sites": len(items),
+            "needUpdate": updates,
+            "expired": sum(1 for x in items if x["state"] == "expired"),
+            "expiring": sum(1 for x in items if x["state"] == "expiring"),
+            "ok": sum(1 for x in items if x["state"] == "ok"),
+        }
+        _set_config("lastSiteCheckAt", now_text)
+        _set_config("lastSiteCheckResult", json.dumps(summary, ensure_ascii=False))
+        public.WriteLog("DNS面板SSL同步", "站点证书检测：共 " + str(len(items)) + " 个站点，待更新 " + str(updates))
+        return {"success": True, "message": "站点证书检测完成", "data": {"summary": summary, "items": items}}
+
     # ── List certificates from the DNS panel ─────────────────────
     def get_certificates(self, args):
         cfg = _get_config() or {}
@@ -621,7 +1020,7 @@ class dnspanel_ssl_main:
         certs = data.get("data") or []
         # Only deployable certs (issued or uploaded), then keep the freshest one
         # per domain so duplicates from repeated renewals never confuse deploy.
-        issued = [c for c in certs if c.get("status") == "issued" or c.get("isUploaded")]
+        issued = [c for c in certs if (c.get("status") == "issued" or c.get("isUploaded")) and _certificate_health(c, int(cfg.get("renewDays") or 30))["state"] != "expired"]
         issued = _dedup_latest_by_domain(issued)
         issued.sort(key=lambda c: (c.get("domain") or ""))
         # Annotate each cert with its matched BaoTa site + deployment status,
@@ -648,6 +1047,7 @@ class dnspanel_ssl_main:
         cert_id = str(getattr(args, "certId", "") or "").strip()
         credential_id = str(getattr(args, "credentialId", "") or "").strip()
         site_name = _safe_site_name(getattr(args, "siteName", ""))
+        force = bool(getattr(args, "force", False))
 
         if not cert_id or not site_name:
             return public.ReturnMsg(False, "缺少证书ID或站点名")
@@ -681,6 +1081,53 @@ class dnspanel_ssl_main:
         valid, validation_error = _validate_pem_pair(public_key, private_key, site_hosts)
         if not valid:
             return public.ReturnMsg(False, validation_error)
+
+        # ── Downgrade protection ────────────────────────────────
+        # The invariant: hostname coverage never shrinks, and among equally
+        # covering certs the fresher one wins. This blocks a single-name cert
+        # (account.example.com) from overwriting a wildcard (*.example.com)
+        # the site relies on, and stops stale event replays of superseded
+        # certs — while still allowing a wildcard to replace a narrower cert.
+        # Manual deploys pass force=True; automatic sync keeps the invariant.
+        if not force:
+            installed = _installed_cert_summary(site_name)
+            if installed and installed.get("expiry"):
+                from datetime import datetime, timezone
+                now_utc = datetime.now(timezone.utc)
+                installed_days = (installed["expiry"] - now_utc).total_seconds() / 86400
+                if installed_days > 1:  # only protect a still-valid cert
+                    new_names = _cert_names_from_pem(public_key)
+                    installed_names = installed.get("names") or []
+                    if new_names and installed_names:
+                        hosts = [str(h).strip() for h in site_hosts if str(h).strip()]
+                        covered_new = {h for h in hosts if any(_name_covers(n, h) for n in new_names)}
+                        covered_old = {h for h in hosts if any(_name_covers(n, h) for n in installed_names)}
+                        new_expiry = _cert_not_after_from_pem(public_key)
+                        skip_reason = ""
+                        if covered_old - covered_new:
+                            skip_reason = "当前证书覆盖更广（" + "、".join(sorted(covered_old - covered_new)) + "）"
+                        elif covered_new == covered_old:
+                            # Equal coverage: only a strictly fresher cert may replace.
+                            if new_expiry is None or new_expiry <= installed["expiry"]:
+                                if new_expiry is not None and new_expiry == installed["expiry"]:
+                                    skip_reason = "证书未变化，无需重复部署"
+                                else:
+                                    skip_reason = "替换证书到期时间不晚于当前证书"
+                        else:
+                            # Strictly wider coverage — allow, but never swap in
+                            # a cert that is about to expire.
+                            if new_expiry is None or (new_expiry - now_utc).total_seconds() < 3 * 86400:
+                                skip_reason = "替换证书有效期过短"
+                        if skip_reason:
+                            public.WriteLog(
+                                "DNS面板SSL同步",
+                                "跳过部署（防止降级覆盖）：站点 " + site_name + " " + skip_reason,
+                            )
+                            return {
+                                "status": True, "skipped": True,
+                                "msg": "已跳过：站点 " + site_name + " " + skip_reason
+                                       + "，自动部署不会降低证书质量；如需强制替换请在「手动部署」选择后重试",
+                            }
 
         # Write cert files to BaoTa vhost cert directory
         cert_dir = os.path.realpath(os.path.join("/www/server/panel/vhost/cert", site_name))
@@ -1084,6 +1531,7 @@ server {
             elif allowed_matches:
                 successes = []
                 failures = []
+                deferred = []
                 fingerprints = {}
                 for site in allowed_matches:
                     matched = str(site.get("name") or "")
@@ -1093,6 +1541,14 @@ server {
                         deploy_args.credentialId = str(event.get("credentialId", ""))
                         deploy_args.siteName = matched
                         deployed_result = self.deploy(deploy_args)
+                        if deployed_result.get("skipped"):
+                            # Downgrade protection refused the swap: record the
+                            # site in the deferred list. The event itself is
+                            # marked skipped (no auto-retry storm); the user can
+                            # force-replace via manual deploy or retry from the
+                            # panel task center if the situation changes.
+                            deferred.append(matched + ": " + str(deployed_result.get("msg") or "跳过"))
+                            continue
                         if deployed_result.get("status"):
                             fingerprint = ((_get_config() or {}).get("deployedFingerprints") or {}).get(matched, "")
                             fingerprints[matched] = fingerprint
@@ -1104,14 +1560,22 @@ server {
                     except Exception as e:
                         failures.append(matched + ": " + str(e))
                         event_failed += 1
-                result_payload = {
-                    "status": "failed" if failures else "success",
-                    "targetName": ", ".join([str(site.get("name") or "") for site in allowed_matches]),
-                    "fingerprint": json.dumps(fingerprints, ensure_ascii=False, separators=(",", ":")),
-                    "error": "; ".join(failures),
-                }
-                if failures and successes:
-                    result_payload["error"] = "部分站点部署失败（成功: " + ", ".join(successes) + "）：" + result_payload["error"]
+                if deferred and not successes and not failures:
+                    result_payload = {
+                        "status": "skipped",
+                        "targetName": ", ".join([str(site.get("name") or "") for site in allowed_matches]),
+                        "error": "; ".join(deferred),
+                    }
+                    event_skipped += 1
+                else:
+                    result_payload = {
+                        "status": "failed" if failures else "success",
+                        "targetName": ", ".join([str(site.get("name") or "") for site in allowed_matches]),
+                        "fingerprint": json.dumps(fingerprints, ensure_ascii=False, separators=(",", ":")),
+                        "error": "; ".join(failures + deferred),
+                    }
+                    if failures and successes:
+                        result_payload["error"] = "部分站点部署失败（成功: " + ", ".join(successes) + "）：" + result_payload["error"]
             else:
                 event_failed += 1
             _panel_post("/ssl/deployment-events/" + str(event_id) + "/result", result_payload, timeout=30)
@@ -1137,7 +1601,7 @@ server {
         certs = data.get("data") or []
         # Deploy only the freshest cert per domain (most remaining validity).
         certs = _dedup_latest_by_domain(
-            [c for c in certs if c.get("status") == "issued" or c.get("isUploaded")]
+            [c for c in certs if (c.get("status") == "issued" or c.get("isUploaded")) and _certificate_health(c, int(cfg.get("renewDays") or 30))["state"] != "expired"]
         )
         sites = _list_bt_sites()
 
@@ -1145,13 +1609,23 @@ server {
         skipped = 0
         fallback_allowed_sites = set(str(x) for x in (cfg.get("allowedSites") or []) if str(x))
         fallback_allowed_sources = set(str(x).lower() for x in (cfg.get("allowedSources") or ["tencent", "letsencrypt"]))
+
+        # Group deployable certs by the site they cover, choosing per site the
+        # BEST candidate (widest hostname coverage, then longest validity) so a
+        # lesser cert can never land first and trigger a swap chain.
+        def _cert_score_for_hosts(cert, hosts):
+            names = _cert_names_from_panel_cert(cert)
+            score = _names_coverage_score(names, hosts)
+            rem = _days_remaining(cert)
+            return score, (rem if rem is not None else 99999)
+
+        site_best: dict = {}
         for cert in certs:
-            domain = (cert.get("domain") or "").strip().lower()
             source = "letsencrypt" if cert.get("provider") == "acme" or cert.get("source") == "letsencrypt" else "tencent"
             if source not in fallback_allowed_sources:
                 skipped += 1
                 continue
-            # Match cert domain to a site by name or bound domain.
+            domain = (cert.get("domain") or "").strip().lower()
             matched_sites = _match_sites_for_domain(domain, sites)
             if not matched_sites:
                 skipped += 1
@@ -1160,22 +1634,31 @@ server {
             if not deployable_sites:
                 skipped += 1
                 continue
-
-            # Auto-deploy to every matching whitelisted site.
             for site in deployable_sites:
-                matched = str(site.get("name") or "")
-                try:
-                    args_deploy = type("A", (), {})()
-                    args_deploy.certId = cert.get("remoteCertId", "")
-                    args_deploy.credentialId = str(cert.get("credentialId", ""))
-                    args_deploy.siteName = matched
-                    result = self.deploy(args_deploy)
-                    if result.get("status"):
-                        deployed += 1
-                    else:
-                        skipped += 1
-                except Exception:
+                site_name = str(site.get("name") or "")
+                hosts = [site_name] + [str(d).strip() for d in (site.get("domains") or []) if str(d).strip()]
+                score = _cert_score_for_hosts(cert, hosts)
+                if score[0] <= 0:
+                    continue
+                current = site_best.get(site_name)
+                if current is None or score > current[0]:
+                    site_best[site_name] = (score, cert, site)
+
+        for site_name, (score, cert, site) in site_best.items():
+            try:
+                args_deploy = type("A", (), {})()
+                args_deploy.certId = cert.get("remoteCertId", "")
+                args_deploy.credentialId = str(cert.get("credentialId", ""))
+                args_deploy.siteName = site_name
+                result = self.deploy(args_deploy)
+                if result.get("skipped"):
+                    skipped += 1  # downgrade protection refused the swap
+                elif result.get("status"):
+                    deployed += 1
+                else:
                     skipped += 1
+            except Exception:
+                skipped += 1
 
         # After deploying the fresh certs, ask the panel to prune superseded
         # certs (< keepDays remaining when a healthy newer one exists) and clean
@@ -1232,7 +1715,15 @@ server {
             pass
         # 2) Deploy the freshest issued cert per domain, then prune superseded
         #    (< renew_days) certs and clean their _dnsauth validation records.
-        return self.sync_now(args)
+        result = self.sync_now(args)
+        # 3) Refresh the site certificate update-detection report so the
+        #    overview card always reflects the latest state. Best-effort —
+        #    a detection failure must not fail the whole sync run.
+        try:
+            self.check_site_certificates(type("A", (), {})())
+        except Exception as e:
+            public.WriteLog("DNS面板SSL同步", "站点证书检测失败: " + str(e))
+        return result
 
 
 # Allow running as a script from a cron task, e.g.:

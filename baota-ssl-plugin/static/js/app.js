@@ -86,6 +86,8 @@ var dnspanel_ssl = {
             + '    <div class="k">自动续期</div><div class="v">' + renewBadge + '</div>'
             + '    <div class="k">最近同步</div><div class="v">' + (this.esc(d.lastSyncAt) || '从未同步') + '</div>'
             + '    <div class="k">可用证书数</div><div class="v">' + (d.certCount || 0) + '</div>'
+            + '    <div class="k">到期检查</div><div class="v">即将到期 ' + (d.expiringCount || 0) + '，已过期 ' + (d.expiredCount || 0) + '</div>'
+            + '    <div class="k">最近检查</div><div class="v">' + (this.esc(d.lastCheckAt) || '从未检查') + '</div>'
             + '  </div>'
             + (d.error ? '<div class="dps-alert error" style="margin-top:14px;">' + this.esc(d.error) + '</div>' : '')
             + '  <div class="dps-row" style="margin-top:18px;">'
@@ -93,9 +95,19 @@ var dnspanel_ssl = {
                 ? '    <button class="dps-btn dps-btn-primary" onclick="dnspanel_ssl.sync_now()">立即同步</button>'
                 + '    <button class="dps-btn dps-btn-ghost" onclick="dnspanel_ssl.show_issue()">申请证书</button>'
                 + '    <button class="dps-btn dps-btn-ghost" onclick="dnspanel_ssl.show_certs()">查看证书</button>'
+                + '    <button class="dps-btn dps-btn-ghost" onclick="dnspanel_ssl.show_site_check()">检测证书更新</button>'
                 : '    <button class="dps-btn dps-btn-primary" onclick="dnspanel_ssl.show_config()">前往连接配置</button>')
             + '  </div>'
-            + '</div>';
+            + '</div>'
+            + (d.lastSiteCheckAt
+                ? '<div class="dps-card"><h3>站点证书检测</h3>'
+                    + '<div class="dps-grid">'
+                    + '  <div class="k">最近检测</div><div class="v">' + this.esc(d.lastSiteCheckAt) + '</div>'
+                    + '  <div class="k">检测结果</div><div class="v" style="font-weight:400;color:#64748b">' + this.esc(d.lastSiteCheckResult) + '</div>'
+                    + '</div>'
+                    + '<div class="dps-row" style="margin-top:10px;"><button class="dps-btn dps-btn-ghost dps-btn-sm" onclick="dnspanel_ssl.show_site_check()">查看详情</button></div>'
+                    + '</div>'
+                : '');
 
         // Auto-renew "真同步" card: shows the panel's own scheduler state and lets
         // the user flip it here — one switch drives both the panel scheduler and
@@ -442,7 +454,8 @@ var dnspanel_ssl = {
         var parts = certVal.split('|');
         var that = this;
         var loadIdx = layer.load(1, { shade: [0.1, '#fff'] });
-        this.request('deploy', { certId: parts[0], credentialId: parts[1], siteName: siteName }, function (rdata) {
+        // force=true: 手动部署是用户的明确选择，跳过降级保护直接替换
+        this.request('deploy', { certId: parts[0], credentialId: parts[1], siteName: siteName, force: true }, function (rdata) {
             layer.close(loadIdx);
             that.handle(rdata, function () { that.showMsg('证书已部署到 ' + siteName, 1); }, function (err) { that.showMsg(err, 2); });
         });
@@ -454,7 +467,8 @@ var dnspanel_ssl = {
         layer.confirm('将证书部署到站点「' + siteName + '」并重载 Web 服务？', { btn: ['确定', '取消'] }, function (index) {
             layer.close(index);
             var loadIdx = layer.load(1, { shade: [0.1, '#fff'] });
-            that.request('deploy', { certId: certId, credentialId: credentialId, siteName: siteName }, function (rdata) {
+            // force=true: 从证书列表点击「部署」属于明确的手动操作
+            that.request('deploy', { certId: certId, credentialId: credentialId, siteName: siteName, force: true }, function (rdata) {
                 layer.close(loadIdx);
                 that.handle(rdata,
                     function () { that.showMsg('已部署到 ' + siteName, 1); that.show_certs(); },
@@ -484,6 +498,89 @@ var dnspanel_ssl = {
                 that.deploy_to(certId, credentialId, matched);
             }, function (err) { that.showMsg(err, 2); });
         });
+    },
+
+    check_certificates: function () {
+        var that = this;
+        var loadIdx = layer.load(1, { shade: [0.1, '#fff'] });
+        that.request('check_certificates', {}, function (rdata) {
+            layer.close(loadIdx);
+            that.handle(rdata, function (d) {
+                var summary = d || {};
+                that.showMsg('检查完成：' + (summary.checked || 0) + ' 个，待续期 ' + (summary.needsRenewal || 0) + ' 个', 1);
+                that.show_overview();
+            }, function (err) { that.showMsg(err, 2); });
+        });
+    },
+
+    // ── Per-site certificate update detection ────────────────────
+    show_site_check: function () {
+        this.setActiveTab(5);
+        this.setContent('<div class="dps-card"><h3>站点证书更新检测</h3><div id="site_check_body">'
+            + this.loadingHtml('正在对比站点证书与面板证书…') + '</div></div>');
+        var that = this;
+        this.request('check_site_certificates', {}, function (rdata) {
+            that.handle(rdata,
+                function (d) { that.render_site_check(d.data || {}); },
+                function (err) { $('#site_check_body').html('<div class="dps-alert error">' + that.esc(err) + '。请先到「连接配置」完成设置。</div>'); });
+        });
+    },
+
+    render_site_check: function (data) {
+        var items = data.items || [];
+        var summary = data.summary || {};
+        if (!items.length) {
+            $('#site_check_body').html('<div class="dps-empty">没有需要检测的站点（或白名单为空）。</div>');
+            return;
+        }
+        var stateMap = {
+            ok:       ['ok',   '已是最新'],
+            update:   ['warn', '建议更新'],
+            expiring: ['warn', '临近到期'],
+            expired:  ['err',  '已过期'],
+            missing:  ['info', '未部署'],
+            none:     ['info', '无可用证书'],
+            error:    ['err',  '读取失败']
+        };
+        var rows = '';
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i];
+            var st = stateMap[it.state] || ['info', it.state];
+            var badge = '<span class="dps-badge ' + st[0] + '">' + st[1] + '</span>';
+            var inst = it.deployed
+                ? (it.installedDaysRemaining == null ? '（无法解析）' : ('剩余 ' + it.installedDaysRemaining + ' 天'))
+                : '未部署证书';
+            var best = it.bestCertDomain
+                ? (this.esc(it.bestCertDomain) + (it.bestCertDaysRemaining == null ? '' : ('（剩余 ' + it.bestCertDaysRemaining + ' 天）')))
+                : '面板暂无';
+            var actionCell = '';
+            if ((it.state === 'update' || it.state === 'missing' || it.state === 'error') && it.bestCertId) {
+                actionCell = '<button class="dps-btn dps-btn-primary dps-btn-sm" onclick="dnspanel_ssl.deploy_to(\''
+                    + this.esc(it.bestCertId) + '\',' + (it.bestCertCredentialId || 0) + ',\'' + this.esc(it.site) + '\')">立即部署</button>';
+            } else if (it.state === 'expired') {
+                actionCell = '<button class="dps-btn dps-btn-ghost dps-btn-sm" onclick="dnspanel_ssl.show_issue()">去申请证书</button>';
+            } else if (it.state === 'expiring') {
+                actionCell = '<button class="dps-btn dps-btn-ghost dps-btn-sm" onclick="dnspanel_ssl.sync_now()">触发续期同步</button>';
+            } else {
+                actionCell = '<span style="color:#94a3b8;font-size:12px">—</span>';
+            }
+            var hostsText = (it.hosts || []).slice(0, 3).join(', ');
+            rows += '<tr>'
+                + '<td><strong>' + this.esc(it.site) + '</strong>'
+                + (it.hosts && it.hosts.length > 1 ? '<div style="font-size:11px;color:#94a3b8">' + this.esc(hostsText) + '</div>' : '')
+                + '</td>'
+                + '<td>' + badge + '<div style="font-size:11px;color:#64748b;margin-top:2px">' + this.esc(it.action || '') + '</div></td>'
+                + '<td>' + this.esc(inst) + '</td>'
+                + '<td>' + best + '</td>'
+                + '<td>' + actionCell + '</td>'
+                + '</tr>';
+        }
+        var summaryHtml = '<div class="dps-alert ' + (summary.needUpdate ? 'warn' : 'info') + '" style="margin-bottom:12px;">'
+            + '共检测 <b>' + (summary.sites || 0) + '</b> 个站点 · 待更新 <b>' + (summary.needUpdate || 0) + '</b> 个 · 已过期 <b>' + (summary.expired || 0) + '</b> 个 · 已是最新 <b>' + (summary.ok || 0) + '</b> 个</div>';
+        $('#site_check_body').html(
+            summaryHtml
+            + '<table class="dps-table"><thead><tr><th>站点</th><th>状态</th><th>已部署证书</th><th>面板最佳证书</th><th>操作</th></tr></thead>'
+            + '<tbody>' + rows + '</tbody></table>');
     },
 
     sync_now: function () {

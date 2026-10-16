@@ -14,6 +14,10 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from modules import acme_api  # noqa: E402
+from modules.tencent_ssl_api import (  # noqa: E402
+    parse_certificate_datetime, certificate_days_remaining, certificate_is_expired,
+    _normalize_status,
+)
 from modules.route_handlers import _ssl_filter_and_summarize, _validate_ssl_notification_url  # noqa: E402
 import migrate as db_migrate  # noqa: E402
 
@@ -44,6 +48,38 @@ class SslListTests(unittest.TestCase):
         self.assertEqual(len(result["certs"]), 1)
         self.assertEqual(result["certs"][0]["source"], "letsencrypt")
         self.assertEqual(result["statusSummary"], {"issued": 1, "failed": 1})
+
+
+class CertificateDateTests(unittest.TestCase):
+    def test_tencent_date_formats_are_compared_as_utc(self) -> None:
+        self.assertEqual(parse_certificate_datetime("2026-07-23 07:59:59").isoformat(), "2026-07-23T07:59:59+00:00")
+        self.assertEqual(parse_certificate_datetime("2026-07-23T07:59:59Z").isoformat(), "2026-07-23T07:59:59+00:00")
+        self.assertFalse(certificate_is_expired("2099-07-23 07:59:59"))
+        self.assertIsNotNone(certificate_days_remaining("2099-07-23 07:59:59"))
+
+    def test_acme_metadata_uses_iso8601(self) -> None:
+        self.assertEqual(acme_api.parse_cert_pem.__name__, "parse_cert_pem")
+
+
+class TencentStatusMapTests(unittest.TestCase):
+    """The official enum: 2=审核失败 3=已过期 4=自动添加DNS记录 7=已取消 10=已吊销.
+
+    Mis-mapping 3 → failed previously hid expired certificates from the
+    auto-renew scanner, so they were never renewed (the reported bug).
+    """
+
+    def test_official_status_enum_is_mapped_correctly(self) -> None:
+        self.assertEqual(_normalize_status(0), "validating")   # 审核中
+        self.assertEqual(_normalize_status(1), "issued")       # 已通过
+        self.assertEqual(_normalize_status(2), "failed")       # 审核失败
+        self.assertEqual(_normalize_status(3), "expired")      # 已过期
+        self.assertEqual(_normalize_status(4), "validating")   # 自动添加 DNS 记录
+        self.assertEqual(_normalize_status(7), "cancelled")    # 已取消
+        self.assertEqual(_normalize_status(9), "revoked")      # 吊销中
+        self.assertEqual(_normalize_status(10), "revoked")     # 已吊销
+        self.assertEqual(_normalize_status(None), "applying")
+        self.assertEqual(_normalize_status("bad"), "applying")
+
 
 
 class AcmeApplyTests(unittest.TestCase):
@@ -87,6 +123,60 @@ class AcmeApplyTests(unittest.TestCase):
         self.assertIn("超时", str(ctx.exception))
 
 
+class AcmeStoreFallbackTests(unittest.TestCase):
+    def test_store_files_prefers_matching_key_type_dir(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            # RSA dir exists with old files; ECC dir is the "matching" one.
+            rsa_dir = home / "example.com"
+            ecc_dir = home / "example.com_ecc"
+            for d in (rsa_dir, ecc_dir):
+                d.mkdir()
+                (d / "fullchain.cer").write_text("CERT-" + d.name, encoding="utf-8")
+                (d / "example.com.key").write_text("KEY-" + d.name, encoding="utf-8")
+            with patch.object(acme_api, "ACME_HOME", str(home)):
+                svc_ecc = acme_api.AcmeService("ec-256")
+                full, key = svc_ecc._store_files("example.com")
+                self.assertEqual(full.read_text(encoding="utf-8"), "CERT-example.com_ecc")
+                self.assertEqual(key.read_text(encoding="utf-8"), "KEY-example.com_ecc")
+                svc_rsa = acme_api.AcmeService("2048")
+                full, key = svc_rsa._store_files("example.com")
+                self.assertEqual(full.read_text(encoding="utf-8"), "CERT-example.com")
+
+    @unittest.skipIf(sys.platform.startswith("win"), "Windows forbids '*' in directory names")
+    def test_store_files_wildcard_dir_uses_literal_star(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            wc_dir = home / "*.example.com"
+            wc_dir.mkdir()
+            (wc_dir / "fullchain.cer").write_text("WC-CERT", encoding="utf-8")
+            (wc_dir / "*.example.com.key").write_text("WC-KEY", encoding="utf-8")
+            with patch.object(acme_api, "ACME_HOME", str(home)):
+                full, key = acme_api.AcmeService("2048")._store_files("*.example.com")
+                self.assertEqual(full.read_text(encoding="utf-8"), "WC-CERT")
+                self.assertEqual(key.read_text(encoding="utf-8"), "WC-KEY")
+
+    def test_read_pem_recovers_from_install_failure_via_store(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            src = home / "example.com"
+            src.mkdir()
+            (src / "fullchain.cer").write_text("STORE-CERT", encoding="utf-8")
+            (src / "example.com.key").write_text("STORE-KEY", encoding="utf-8")
+            with patch.object(acme_api, "ACME_HOME", str(home)), \
+                 patch.object(acme_api, "_run",
+                              side_effect=acme_api.AcmeApiError("install-cert failed", 502)):
+                pem = acme_api.AcmeService().read_pem("example.com")
+            self.assertEqual(pem["publicKey"], "STORE-CERT")
+            self.assertEqual(pem["privateKey"], "STORE-KEY")
+            # deployed copy was repaired for future reads
+            deployed = home / "deployed" / "example.com" / "fullchain.pem"
+            self.assertEqual(deployed.read_text(encoding="utf-8"), "STORE-CERT")
+
+
 class SslNotificationSecurityTests(unittest.TestCase):
     @patch("modules.route_handlers.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("127.0.0.1", 443))])
     def test_webhook_rejects_private_or_loopback_targets(self, _resolve) -> None:
@@ -110,9 +200,29 @@ class SslRouteContractTests(unittest.TestCase):
             'sub == "/certificates/apply"',
             'sub == "/certificates/issue-acme"',
             'r"/certificates/([^/]+)/auto-renew"',
+            'sub == "/certificates/clean-expired"',
         ):
             self.assertIn(route, self.source)
         self.assertIn("获取 Let's Encrypt 证书详情成功", self.source)
+
+    def test_acme_download_has_local_zip_branch(self) -> None:
+        # acme certs live on disk, not on the Tencent API — the /download route
+        # must zip the local PEM pair instead of falling through to the cloud.
+        self.assertIn('r"/certificates/([^/]+)/download"', self.source)
+        self.assertIn('zf.writestr("fullchain.pem"', self.source)
+        self.assertIn('zf.writestr("privkey.pem"', self.source)
+
+    def test_per_cert_auto_renew_toggles_tencent_flag(self) -> None:
+        self.assertIn("set_auto_renew_flag(cert_id, enabled)", self.source)
+        self.assertIn("上传证书不支持开启腾讯云自动续费", self.source)
+
+    def test_renew_expired_keeps_tencent_autorenew_safety_net(self) -> None:
+        self.assertIn("腾讯云自动续费已开启，由腾讯云托管续期", self.source)
+        self.assertIn("safety_days = min(5, max(1, renew_days))", self.source)
+
+    def test_renew_expired_skips_domains_covered_by_healthy_acme(self) -> None:
+        self.assertIn("def _acme_covers", self.source)
+        self.assertIn("已被有效的 Let's Encrypt 证书覆盖，跳过腾讯云续期", self.source)
 
     def test_persisted_jobs_requeue_stale_running_work(self) -> None:
         self.assertIn("CREATE TABLE IF NOT EXISTS ssl_acme_jobs", (BACKEND_DIR / "app.py").read_text(encoding="utf-8"))

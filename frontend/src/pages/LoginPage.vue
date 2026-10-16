@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { onMounted, ref } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { NFormItem, NInput, NButton, NAlert, NTag } from 'naive-ui';
 import { ShieldCheck, LogIn, ArrowLeft, KeyRound, UserRound } from 'lucide-vue-next';
-import { login, verify2FA, saveAuthData } from '@/services/auth';
+import { login, verify2FA, saveAuthData, getRegistrationStatus } from '@/services/auth';
 
 const router = useRouter();
 const route = useRoute();
@@ -12,9 +12,19 @@ const loading = ref(false);
 const errorMsg = ref('');
 const requires2FA = ref(false);
 const tempToken = ref('');
+const registrationOpen = ref(false);
 
 const loginForm = ref({ username: '', password: '' });
 const tfaCode = ref('');
+
+onMounted(async () => {
+  try {
+    const res = await getRegistrationStatus();
+    registrationOpen.value = Boolean(res.data?.open);
+  } catch {
+    registrationOpen.value = false;
+  }
+});
 
 async function handleLogin() {
   if (!loginForm.value.username || !loginForm.value.password) {
@@ -138,6 +148,10 @@ function goBack() {
           </form>
           <p class="mt-5 text-sm text-slate-600">
             首次安装请先完成初始化向导，后续使用管理员账户直接登录。
+          </p>
+          <p v-if="registrationOpen" class="mt-3 text-sm text-slate-600">
+            还没有账户？
+            <router-link to="/register" class="font-bold text-accent hover:text-accent-hover">注册新账户</router-link>
           </p>
         </template>
 

@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
 import { keepPreviousData } from '@tanstack/vue-query';
 import { NButton, NSpin, NTag, useMessage } from 'naive-ui';
-import { Plus, RefreshCw, Globe } from 'lucide-vue-next';
+import { Plus, RefreshCw, Globe, Download, Upload, History, ShieldAlert } from 'lucide-vue-next';
 import {
   getDNSRecords,
   getDNSLines,
@@ -18,6 +18,13 @@ import {
   batchDeleteDNSRecords,
   batchSetDNSRecordStatus,
 } from '@/services/dns';
+import {
+  exportDnsRecords,
+  importDnsRecords,
+  listDnsRecordHistory,
+  detectDnsConflicts,
+  type DnsRecordHistoryItem,
+} from '@/services/dnsExtras';
 import { listAccelerationDomains, listAccelerationSites, updateAccelerationDomainStatus, finalizeAccelerationDomain, autoConfigureAccelerationCname, type AccelerationDomain } from '@/services/accelerations';
 import { getDnsCredentials } from '@/services/dnsCredentials';
 import { getDomainById } from '@/services/domains';
@@ -59,6 +66,14 @@ const statusChangingRecordIds = ref<string[]>([]);
 const accelerationChangingRecordIds = ref<string[]>([]);
 const batchStatusLoading = ref<'enable' | 'disable' | null>(null);
 const batchDeleteLoading = ref(false);
+const exportLoading = ref(false);
+const importLoading = ref(false);
+const historyLoading = ref(false);
+const conflictLoading = ref(false);
+const historyItems = ref<DnsRecordHistoryItem[]>([]);
+const showHistory = ref(false);
+const conflictMessages = ref<string[]>([]);
+const importFileInput = ref<HTMLInputElement | null>(null);
 const currentPage = ref(1);
 const currentPageSize = ref(TABLE_PAGE_SIZE);
 const pageSizeOptions = [10, 20, 50, 100, 200];
@@ -488,6 +503,98 @@ async function handleRefresh() {
   }
 }
 
+function downloadText(filename: string, content: string) {
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function handleExport(format: 'json' | 'csv' | 'bind' = 'json') {
+  if (exportLoading.value) return;
+  exportLoading.value = true;
+  try {
+    const res = await exportDnsRecords({
+      zoneId: zoneId.value,
+      credentialId: credentialId.value,
+      format,
+    });
+    const content = res.data?.content || '';
+    const filename = res.data?.filename || `${zoneName.value || zoneId.value}.${format}`;
+    downloadText(filename, content);
+    message.success('导出成功');
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    exportLoading.value = false;
+  }
+}
+
+function triggerImport() {
+  importFileInput.value?.click();
+}
+
+async function handleImportFile(ev: Event) {
+  const input = ev.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file || importLoading.value) return;
+  importLoading.value = true;
+  try {
+    const content = await file.text();
+    const lower = file.name.toLowerCase();
+    const format = lower.endsWith('.csv') ? 'csv' : lower.endsWith('.zone') || lower.endsWith('.txt') ? 'bind' : 'json';
+    const res = await importDnsRecords({
+      zoneId: zoneId.value,
+      credentialId: credentialId.value,
+      format,
+      content,
+    });
+    const created = Number(res.data?.created || 0);
+    const failed = Number(res.data?.failed || 0);
+    if (failed) message.warning(`导入完成：成功 ${created}，失败 ${failed}`);
+    else message.success(`导入成功 ${created} 条`);
+    await refetchRecords();
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    importLoading.value = false;
+  }
+}
+
+async function handleShowHistory() {
+  if (historyLoading.value) return;
+  historyLoading.value = true;
+  try {
+    const res = await listDnsRecordHistory({ zoneId: zoneId.value, limit: 50 });
+    historyItems.value = res.data?.items || [];
+    showHistory.value = true;
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    historyLoading.value = false;
+  }
+}
+
+async function handleDetectConflicts() {
+  if (conflictLoading.value) return;
+  conflictLoading.value = true;
+  try {
+    const res = await detectDnsConflicts({ zoneId: zoneId.value, credentialId: credentialId.value });
+    const conflicts = res.data?.conflicts || [];
+    conflictMessages.value = conflicts.map((c) => c.message || `${c.name}: ${(c.types || []).join(',')}`);
+    if (!conflicts.length) message.success('未发现记录冲突');
+    else message.warning(`发现 ${conflicts.length} 处潜在冲突`);
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    conflictLoading.value = false;
+  }
+}
+
 function openCreate() {
   editingRecord.value = null;
   editorDefaultOpenAcceleration.value = false;
@@ -898,6 +1005,22 @@ onUnmounted(() => {
             <template #icon><Globe :size="14" /></template>
             Hostnames
           </NButton>
+          <NButton size="small" secondary :loading="exportLoading" @click="handleExport('json')">
+            <template #icon><Download :size="14" /></template>
+            导出
+          </NButton>
+          <NButton size="small" secondary :loading="importLoading" @click="triggerImport">
+            <template #icon><Upload :size="14" /></template>
+            导入
+          </NButton>
+          <NButton size="small" secondary :loading="historyLoading" @click="handleShowHistory">
+            <template #icon><History :size="14" /></template>
+            历史
+          </NButton>
+          <NButton size="small" secondary :loading="conflictLoading" @click="handleDetectConflicts">
+            <template #icon><ShieldAlert :size="14" /></template>
+            冲突检测
+          </NButton>
           <NButton size="small" type="primary" @click="openCreate">
             <template #icon><Plus :size="14" /></template>
             添加记录
@@ -905,6 +1028,23 @@ onUnmounted(() => {
           <NButton size="small" secondary :loading="refreshing" @click="handleRefresh">
             <template #icon><RefreshCw :size="14" /></template>
           </NButton>
+          <input ref="importFileInput" type="file" accept=".json,.csv,.zone,.txt" class="hidden" @change="handleImportFile" />
+        </div>
+        <div v-if="conflictMessages.length" class="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <p v-for="(msg, idx) in conflictMessages" :key="idx">{{ msg }}</p>
+        </div>
+        <div v-if="showHistory" class="mt-3 max-h-48 overflow-y-auto rounded-xl border border-panel-border bg-panel-surface px-3 py-2 text-xs">
+          <div class="mb-2 flex items-center justify-between">
+            <span class="font-semibold text-slate-600">最近变更历史</span>
+            <button class="text-slate-400 hover:text-slate-700" type="button" @click="showHistory = false">关闭</button>
+          </div>
+          <div v-if="!historyItems.length" class="text-slate-400">暂无历史</div>
+          <div v-for="item in historyItems" :key="item.id" class="border-t border-panel-border py-1.5 first:border-0">
+            <span class="font-semibold">{{ item.action }}</span>
+            · {{ item.recordName || item.recordId || '-' }}
+            · {{ item.recordType || '' }}
+            <span class="text-slate-400"> · {{ item.createdAt }}</span>
+          </div>
         </div>
       </div>
 

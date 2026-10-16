@@ -28,6 +28,10 @@ export interface SslCertificate {
   isUploaded?: boolean;
   remoteCreatedAt?: string;
   syncedAt?: string;
+  daysRemaining?: number | null;
+  isExpired?: boolean;
+  autoRenewFlag?: number | boolean;
+  hostingStatus?: number;
   /** acme.sh certs only — auto-renew tracking. */
   autoRenew?: boolean;
   globalAutoRenew?: boolean;

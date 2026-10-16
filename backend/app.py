@@ -36,6 +36,7 @@ from modules.acceleration_registry import build_acceleration_plugin, validate_ac
 from modules.two_factor import generate_base32_secret, make_otpauth_url, make_qr_data_url, verify_totp
 from modules.cloudflare_api import CloudflareApi, CloudflareApiError
 from modules.dnspod_api import DnspodApi, DnspodApiError
+from modules.dns_provider_api import DnsProviderApiError, build_dns_provider_api
 
 # ── Application version ─────────────────────────────────────────
 # Fallback version for local/offline environments. GitHub Releases are the
@@ -64,7 +65,10 @@ from modules.aliyun_esa_api import (
     update_site_tags as esa_update_site_tags,
     verify_site as esa_verify_site,
 )
-from modules.tencent_ssl_api import TencentSslApi, TencentSslApiError
+from modules.tencent_ssl_api import (
+    TencentSslApi, TencentSslApiError, parse_certificate_datetime,
+    certificate_days_remaining, certificate_is_expired,
+)
 from migrate import migrate as run_db_migrations
 from modules.route_handlers import attach_route_methods
 
@@ -344,8 +348,10 @@ def should_write_backup_server_copy() -> bool:
 
 
 def system_settings_payload() -> Dict[str, Any]:
+    reg_raw = str(get_system_setting("registration_open", "0") or "0").strip().lower()
+    registration_open = reg_raw in {"1", "true", "yes", "on"}
     return {
-        "registrationOpen": False,
+        "registrationOpen": registration_open,
         "setupComplete": setup_status_dict()["setupComplete"],
         "logRetentionDays": get_log_retention_days(),
         "retryMaxAttempts": get_retry_max_attempts(),
@@ -392,11 +398,12 @@ def cleanup_logs_older_than(retention_days: int | None = None) -> int:
 def setup_status_dict() -> Dict[str, Any]:
     complete = has_any_users()
     stored = get_system_setting("setup_complete", "1" if complete else "0")
+    reg_raw = str(get_system_setting("registration_open", "0") or "0").strip().lower()
     return {
         "setupComplete": complete or stored == "1",
         "hasUsers": complete,
         "logRetentionDays": get_log_retention_days(),
-        "registrationOpen": False,
+        "registrationOpen": reg_raw in {"1", "true", "yes", "on"},
     }
 
 
@@ -779,6 +786,65 @@ def init_db() -> None:
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_task_logs_filters ON ssl_task_logs(userId, taskType, status, source)")
         c.execute(
             """
+            CREATE TABLE IF NOT EXISTS notification_settings (
+              userId INTEGER PRIMARY KEY,
+              channels TEXT NOT NULL DEFAULT '[]',
+              enabled BOOLEAN NOT NULL DEFAULT 1,
+              updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE ON UPDATE CASCADE
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dns_record_history (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              userId INTEGER NOT NULL,
+              credentialId INTEGER,
+              zoneId TEXT,
+              zoneName TEXT,
+              recordId TEXT,
+              recordName TEXT,
+              recordType TEXT,
+              action TEXT NOT NULL,
+              oldValue TEXT,
+              newValue TEXT,
+              createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_dns_record_history_user ON dns_record_history(userId, createdAt)")
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dns_record_templates (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              userId INTEGER NOT NULL,
+              name TEXT NOT NULL,
+              description TEXT,
+              records TEXT NOT NULL,
+              createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_dns_record_templates_user ON dns_record_templates(userId)")
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inapp_notifications (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              userId INTEGER NOT NULL,
+              level TEXT NOT NULL DEFAULT 'info',
+              title TEXT NOT NULL,
+              message TEXT,
+              status TEXT NOT NULL DEFAULT 'unread',
+              meta TEXT,
+              createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_inapp_notifications_user ON inapp_notifications(userId, status, createdAt)")
+        c.execute(
+            """
             CREATE TABLE IF NOT EXISTS system_settings (
               key TEXT PRIMARY KEY,
               value TEXT NOT NULL,
@@ -803,6 +869,18 @@ def init_db() -> None:
             "UPDATE system_settings SET value = ?, updatedAt = CURRENT_TIMESTAMP WHERE key = 'setup_complete'",
             ("1" if has_any_users() else "0",),
         )
+        # One-time backfill (marker-guarded so a later user opt-out survives):
+        # ACME certs issued before autoRenew was tracked defaulted to 0, which
+        # the renewal scanner treats identically to a deliberate "关闭续期" —
+        # so they were silently never renewed and eventually expired.
+        _backfill = c.execute(
+            "SELECT value FROM system_settings WHERE key = 'sslAcmeAutoRenewBackfill'"
+        ).fetchone()
+        if not _backfill:
+            c.execute("UPDATE ssl_certificates SET autoRenew = 1 WHERE provider = 'acme'")
+            c.execute(
+                "INSERT OR REPLACE INTO system_settings (key, value, updatedAt) VALUES ('sslAcmeAutoRenewBackfill', '1', CURRENT_TIMESTAMP)"
+            )
         c.commit()
     cleanup_logs_older_than(get_log_retention_days())
 
@@ -1448,10 +1526,43 @@ class H(BaseHTTPRequestHandler):
         if not user:
             return False
         scopes = set(user.get("_api_scopes") or [])
-        if "*" in scopes or path.startswith("/api/ssl"):
+        if "*" in scopes:
             return True
-        if self.command == "GET" and path.startswith("/api/dns-credentials") and "ssl:read" in scopes:
+        if path.startswith("/api/ssl") and (
+            "ssl:*" in scopes or "ssl:read" in scopes or "ssl:pem" in scopes or "ssl:issue" in scopes or "ssl:renew" in scopes or "ssl:deploy" in scopes
+        ):
             return True
+        # SSL tokens may only list DNS credentials (for DNS-01), not full DNS records.
+        if path.startswith("/api/dns-credentials"):
+            if self.command in {"GET", "HEAD"} and (
+                "dns:read" in scopes or "dns:write" in scopes or "ssl:read" in scopes or "ssl:*" in scopes
+            ):
+                return True
+            if self.command not in {"GET", "HEAD"} and "dns:write" in scopes:
+                return True
+        if path.startswith("/api/dns-records"):
+            if self.command in {"GET", "HEAD"} and ("dns:read" in scopes or "dns:write" in scopes):
+                return True
+            if self.command not in {"GET", "HEAD"} and "dns:write" in scopes:
+                return True
+        if path.startswith("/api/dashboard") and "dashboard:read" in scopes:
+            return True
+        if path.startswith("/api/logs") and "logs:read" in scopes:
+            return True
+        if path.startswith("/api/accelerations") and ("accel:read" in scopes or "accel:write" in scopes):
+            if self.command in {"GET", "HEAD"} or "accel:write" in scopes:
+                return True
+        if path.startswith("/api/domain-expiry"):
+            if self.command in {"GET", "HEAD"} and ("dns:read" in scopes or "dashboard:read" in scopes):
+                return True
+            if self.command not in {"GET", "HEAD"} and "dns:write" in scopes:
+                return True
+        if path.startswith("/api/notifications"):
+            # Read inbox/settings with dashboard:read; mutations require dns:write (admin JWT bypasses this guard).
+            if self.command in {"GET", "HEAD"} and ("dashboard:read" in scopes or "dns:read" in scopes):
+                return True
+            if self.command not in {"GET", "HEAD"} and "dns:write" in scopes:
+                return True
         self._err("当前 API Token 无权访问该模块", 403)
         return False
 
@@ -1483,12 +1594,17 @@ class H(BaseHTTPRequestHandler):
                         "/api/domain-expiry/*",
                         "/api/dashboard/*",
                         "/api/ssl/*",
+                        "/api/notifications/*",
+                        "/api/api-tokens/*",
+                        "/api/openapi.json",
                     ],
                     "proxyBase": LEGACY,
                     "databasePath": str(DB),
                 },
                 "Python migration gateway is running",
             )
+            return
+        if path.startswith("/api/") and path not in {"/api/version", "/api/openapi.json", "/api/docs", "/api/_python/migration-status"} and not path.startswith("/api/auth") and not self._guard_scoped_api_token(path):
             return
         if path.startswith("/api/auth"):
             self._auth_routes(path, q, b)
@@ -1525,6 +1641,26 @@ class H(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/api-tokens"):
             self._api_tokens_routes(path, q, b)
+            return
+        if path.startswith("/api/notifications"):
+            self._notifications_routes(path, q, b)
+            return
+        if path in ("/api/openapi.json", "/api/docs"):
+            self._json(200, {
+                "openapi": "3.0.3",
+                "info": {"title": "DNS Panel API", "version": APP_VERSION if "APP_VERSION" in globals() else "0.24"},
+                "paths": {
+                    "/api/auth/login": {"post": {"summary": "登录"}},
+                    "/api/dns-records/zones": {"get": {"summary": "域名列表"}},
+                    "/api/dns-records/zones/{zoneId}/records": {"get": {"summary": "记录列表"}, "post": {"summary": "创建记录"}},
+                    "/api/dns-records/history": {"get": {"summary": "记录变更历史"}},
+                    "/api/dns-records/search": {"get": {"summary": "全局搜索记录"}},
+                    "/api/ssl/certificates": {"get": {"summary": "证书列表"}},
+                    "/api/domain-expiry/scan": {"post": {"summary": "域名到期巡检"}},
+                    "/api/notifications/settings": {"get": {"summary": "通知设置"}, "put": {"summary": "更新通知设置"}},
+                    "/api/dashboard/summary": {"get": {"summary": "仪表盘摘要"}},
+                },
+            })
             return
         # Non-API GET/HEAD: serve the built frontend (SPA) when available, so the
         # panel runs from this single process instead of the Vite dev server.
@@ -1918,17 +2054,25 @@ class H(BaseHTTPRequestHandler):
             raise ValueError(f"当前 Python 版本暂不支持 {provider} 的 DNS 记录操作")
         secrets = self._credential_secrets(row)
 
+        try:
+            api = build_dns_provider_api(provider, secrets)
+        except DnsProviderApiError as e:
+            raise ValueError(str(e)) from e
+        except Exception as e:
+            raise ValueError(f"初始化 {provider} DNS 客户端失败: {e}") from e
+
+        out: Dict[str, Any] = {"credential": row, "provider": provider, "api": api}
+        # Backward-compat for CF hostnames/tunnels and legacy SSL DNS-01 paths
         if provider == "cloudflare":
             token = str(secrets.get("apiToken") or "").strip()
-            if not token:
-                raise ValueError("缺少 Cloudflare API Token")
-            return {"credential": row, "provider": provider, "cf": CloudflareApi(token)}
-
+            if token:
+                out["cf"] = CloudflareApi(token)
         if provider in ("dnspod", "dnspod_token"):
-            api = DnspodApi(secrets)
-            return {"credential": row, "provider": provider, "dnspod": api}
-
-        raise ValueError(f"当前 Python 版本暂不支持 {provider} 的 DNS 记录操作")
+            try:
+                out["dnspod"] = DnspodApi(secrets)
+            except Exception:
+                pass
+        return out
 
     @staticmethod
     def _parse_domains(input_value: Any) -> List[str]:
@@ -2019,6 +2163,36 @@ class H(BaseHTTPRequestHandler):
             "updatedAt": row.get("updatedAt"),
             "meta": {"raw": row},
         }
+
+    def _map_generic_zone(self, zone: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": str(zone.get("id") or ""),
+            "name": str(zone.get("name") or ""),
+            "status": str(zone.get("status") or "active"),
+            "recordCount": zone.get("recordCount"),
+            "updatedAt": zone.get("updatedAt"),
+            "nameServers": zone.get("nameServers"),
+        }
+
+    def _map_generic_record(self, zone_id: str, zone_name: str, row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": str(row.get("id") or ""),
+            "zoneId": str(zone_id or ""),
+            "zoneName": str(zone_name or ""),
+            "name": str(row.get("name") or ""),
+            "type": str(row.get("type") or ""),
+            "value": str(row.get("value") or row.get("content") or ""),
+            "ttl": row.get("ttl"),
+            "line": row.get("line"),
+            "weight": row.get("weight"),
+            "priority": row.get("priority"),
+            "status": row.get("status"),
+            "remark": row.get("remark") if row.get("remark") is not None else row.get("comment"),
+            "proxied": bool(row.get("proxied")) if row.get("proxied") is not None else False,
+            "updatedAt": row.get("updatedAt") or row.get("modified_on"),
+            "meta": {"raw": row},
+        }
+
 
     def _normalize_txt_for_cf(self, record_type: str, value: Any) -> str:
         t = str(record_type or "").upper()
@@ -2214,11 +2388,11 @@ class H(BaseHTTPRequestHandler):
     def _append_sync_alert(self, uid: int, job: Dict[str, Any]) -> None:
         if job.get("status") != "failed":
             return
-        if path.startswith("/api/") and not self._guard_scoped_api_token(path):
-            return
-        ev = with_default_list(read_state(uid, "alert-events", []))
         title = "同步任务失败"
         message = str(job.get("error") or "DNS 同步任务执行失败")
+
+        # Always write dashboard alert-event
+        ev = with_default_list(read_state(uid, "alert-events", []))
         ev.insert(
             0,
             {
@@ -2227,10 +2401,61 @@ class H(BaseHTTPRequestHandler):
                 "status": "open",
                 "title": title,
                 "message": message,
+                "type": "sync_failure",
                 "createdAt": now_iso(),
             },
         )
         write_state(uid, "alert-events", ev[:MAX_EVENTS])
+
+        # Fire alert rules of type sync_failure via unified notification service
+        try:
+            rules = with_default_list(read_state(uid, "alert-rules", []))
+            if not rules:
+                rules = dflt_rules()
+                write_state(uid, "alert-rules", rules)
+            matching = [
+                r for r in rules
+                if isinstance(r, dict)
+                and r.get("enabled", True)
+                and str(r.get("type") or "") == "sync_failure"
+            ]
+            if not matching:
+                return
+            from modules.notification import notify_user
+
+            with conn() as c:
+                user_row = c.execute(
+                    """
+                    SELECT id, username, email,
+                           domainExpiryThresholdDays, domainExpiryNotifyEnabled,
+                           domainExpiryNotifyWebhookUrl, domainExpiryNotifyEmailEnabled,
+                           domainExpiryNotifyEmailTo, smtpHost, smtpPort, smtpSecure,
+                           smtpUser, smtpPass, smtpFrom
+                    FROM users WHERE id = ? LIMIT 1
+                    """,
+                    (uid,),
+                ).fetchone()
+            if not user_row:
+                return
+            rule_name = str(matching[0].get("name") or title)
+            # inapp alert-event already written above — only fan out external channels
+            notify_user(
+                user_row,
+                "sync_failure",
+                rule_name,
+                message,
+                level="error",
+                meta={
+                    "event": "sync_failure",
+                    "jobId": job.get("id"),
+                    "scope": job.get("scope"),
+                    "provider": job.get("provider"),
+                    "error": job.get("error"),
+                },
+                include_inapp=False,
+            )
+        except Exception:
+            pass
 
     def _execute_sync_job(self, uid: int, base_job: Dict[str, Any]) -> Dict[str, Any]:
         from modules.cache import cache_delete_pattern, cache_set, dashboard_summary_key, zones_key
@@ -2262,14 +2487,10 @@ class H(BaseHTTPRequestHandler):
                 cache_delete_pattern(f"dns:zones:cred:{cred_id}:*")
                 cache_delete_pattern(f"dns:records:cred:{cred_id}:*")
                 ctx = self._dns_context(uid, {"credentialId": [str(cred_id)]})
-                if provider == "cloudflare":
-                    result = ctx["cf"].list_zones(1, 100, None)
-                    zones_raw = result.get("zones") if isinstance(result, dict) else []
-                    zones = [self._map_cf_zone(z) for z in zones_raw if isinstance(z, dict)]
-                else:
-                    result = ctx["dnspod"].list_zones(1, 100, None)
-                    zones_raw = result.get("zones") if isinstance(result, dict) else []
-                    zones = [self._map_dnspod_zone(z) for z in zones_raw if isinstance(z, dict)]
+                api = ctx.get("api")
+                result = api.list_zones(1, 100, None) if api is not None else {"zones": [], "total": 0}
+                zones_raw = result.get("zones") if isinstance(result, dict) else []
+                zones = [z for z in zones_raw if isinstance(z, dict)]
                 total = int(result.get("total")) if isinstance(result, dict) and result.get("total") is not None else len(zones)
                 cache_set(
                     zones_key(cred_id, page=1, pageSize=100, keyword=None),
@@ -2524,8 +2745,8 @@ def _ssl_autorenew_worker() -> None:
     while True:
         slept = 6 * 3600
         try:
-            if get_system_setting("sslAutoRenewEnabled", "0") == "1":
-                days = int(get_system_setting("sslAutoRenewDays", "7") or 7)
+            if get_system_setting("sslAutoRenewEnabled", "1") == "1":
+                days = int(get_system_setting("sslAutoRenewDays", "30") or 30)
                 with conn() as c:
                     users = c.execute("SELECT id, username FROM users").fetchall()
                 done = []
@@ -2543,9 +2764,19 @@ def _ssl_autorenew_worker() -> None:
                             return json.loads(r.read().decode("utf-8", errors="replace"))
 
                     try:
-                        _post("/api/ssl/certificates/renew-expired", {"renewDays": days})
+                        reconcile = _post("/api/ssl/certificates/reconcile", {})
+                        renew = _post("/api/ssl/certificates/renew-expired", {"renewDays": days})
                         _post("/api/ssl/certificates/prune-superseded", {"keepDays": days})
-                        done.append(str(u["username"]))
+                        failed = int((reconcile.get("data") or {}).get("failed") or 0) + len((renew.get("data") or {}).get("failed") or [])
+                        done.append(str(u["username"]) + (f"(失败{failed})" if failed else ""))
+                        # Remove cloud-side dead certificates (expired/revoked/
+                        # failed) whose domain already has a healthy cert.
+                        # Independent of the renew result so a cleanup hiccup
+                        # never obscures the renewal run.
+                        try:
+                            _post("/api/ssl/certificates/clean-expired", {"staleDays": 0})
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 set_system_setting("sslAutoRenewLastRunAt", now_iso())
@@ -2553,6 +2784,121 @@ def _ssl_autorenew_worker() -> None:
         except Exception:
             pass
         time.sleep(slept)
+
+
+class _InternalDomainExpiryHandler:
+    """Lightweight stand-in that reuses H's DNS/RDAP helpers without binding a socket."""
+
+    def __init__(self) -> None:
+        self._lookup_domain_expiry_single = H._lookup_domain_expiry_single.__get__(self, _InternalDomainExpiryHandler)
+        self._dns_context = H._dns_context.__get__(self, _InternalDomainExpiryHandler)
+        self._map_cf_zone = H._map_cf_zone.__get__(self, _InternalDomainExpiryHandler)
+        self._map_dnspod_zone = H._map_dnspod_zone.__get__(self, _InternalDomainExpiryHandler)
+        self._get_credential_row = H._get_credential_row.__get__(self, _InternalDomainExpiryHandler)
+        self._credential_secrets = H._credential_secrets.__get__(self, _InternalDomainExpiryHandler)
+
+
+def _domain_expiry_worker() -> None:
+    """Background domain-expiry scanner.
+
+    Sleeps 30s on start, then runs every 6 hours. For each user, lists DNS zones,
+    performs RDAP lookup, upserts tracking rows and sends notifications.
+    """
+    time.sleep(30)
+    while True:
+        summary_parts: List[str] = []
+        try:
+            with conn() as c:
+                users = c.execute(
+                    """
+                    SELECT id, username,
+                           domainExpiryNotifyEnabled, domainExpiryNotifyEmailEnabled,
+                           domainExpiryNotifyWebhookUrl, domainExpiryThresholdDays
+                    FROM users
+                    """
+                ).fetchall()
+            handler = _InternalDomainExpiryHandler()
+            from modules.route_handlers import _scan_user_domain_expiry
+
+            for user in users:
+                uid = int(user["id"])
+                try:
+                    result = _scan_user_domain_expiry(handler, uid)
+                    scanned = int(result.get("scanned") or 0)
+                    notified = int((result.get("notify") or {}).get("notified") or 0)
+                    tracked = int((result.get("notify") or {}).get("tracked") or 0)
+                    summary_parts.append(
+                        f"{user['username']}:扫描{scanned}/跟踪{tracked}/通知{notified}"
+                    )
+                except Exception as exc:
+                    summary_parts.append(f"{user['username']}:失败({exc})")
+            set_system_setting("domainExpiryLastRunAt", now_iso())
+            set_system_setting(
+                "domainExpiryLastResult",
+                "已执行: " + ("; ".join(summary_parts) if summary_parts else "无用户"),
+            )
+        except Exception as exc:
+            try:
+                set_system_setting("domainExpiryLastRunAt", now_iso())
+                set_system_setting("domainExpiryLastResult", f"失败: {exc}")
+            except Exception:
+                pass
+        time.sleep(6 * 3600)
+
+
+def _alert_rules_worker() -> None:
+    """Daily evaluation of dashboard alert rules (expiry_warning safety net).
+
+    Domain-expiry worker already fires expiry_warning rules; this re-evaluates
+    tracked domains that fall into alert windows and were not notified in 24h.
+    """
+    time.sleep(90)
+    while True:
+        try:
+            with conn() as c:
+                users = c.execute("SELECT id, username FROM users").fetchall()
+            from modules.route_handlers import (
+                DOMAIN_EXPIRY_ALERT_WINDOWS,
+                _domain_expiry_days_remaining,
+                _domain_expiry_notified_recently,
+                _fire_expiry_warning_alert_rules,
+            )
+
+            for user in users:
+                uid = int(user["id"])
+                try:
+                    with conn() as c:
+                        rows = c.execute(
+                            """
+                            SELECT domain, expiresAt, daysRemaining, lastNotifiedAt
+                            FROM domain_expiry_notifications
+                            WHERE userId = ? AND datetime(expiresAt) >= datetime('now')
+                            """,
+                            (uid,),
+                        ).fetchall()
+                    due: List[Dict[str, Any]] = []
+                    max_window = max(DOMAIN_EXPIRY_ALERT_WINDOWS)
+                    for row in rows:
+                        days = _domain_expiry_days_remaining(row["expiresAt"])
+                        if days is None or days > max_window:
+                            continue
+                        if _domain_expiry_notified_recently(row["lastNotifiedAt"], hours=24):
+                            continue
+                        due.append(
+                            {
+                                "domain": row["domain"],
+                                "expiresAt": row["expiresAt"],
+                                "daysRemaining": days,
+                            }
+                        )
+                    if due:
+                        _fire_expiry_warning_alert_rules(uid, due)
+                except Exception:
+                    pass
+            set_system_setting("alertRulesLastRunAt", now_iso())
+        except Exception:
+            pass
+        time.sleep(24 * 3600)
 
 
 def _ssl_acme_job_worker() -> None:
@@ -2612,12 +2958,23 @@ def _ssl_task_cleanup_worker() -> None:
 
 
 def main() -> None:
+    # Warn (or hard-fail in production) when crypto secrets still look like defaults.
+    _jwt = str(os.getenv("JWT_SECRET") or "")
+    _enc = str(os.getenv("ENCRYPTION_KEY") or "")
+    _defaultish = (len(_jwt) < 32) or ("change" in _jwt.lower()) or ("dev" in _jwt.lower()) or (len(_enc) != 32) or ("change" in _enc.lower())
+    if _defaultish:
+        msg = "WARNING: JWT_SECRET / ENCRYPTION_KEY 仍像开发默认值，生产环境请立即更换"
+        print(msg)
+        if str(os.getenv("NODE_ENV") or "").lower() == "production":
+            raise SystemExit("生产环境禁止使用默认 JWT_SECRET / ENCRYPTION_KEY")
     init_db()
     from modules.cache import cache_ping
     redis_ok = cache_ping()
     threading.Thread(target=_ssl_autorenew_worker, daemon=True).start()
     threading.Thread(target=_ssl_acme_job_worker, daemon=True).start()
     threading.Thread(target=_ssl_task_cleanup_worker, daemon=True).start()
+    threading.Thread(target=_domain_expiry_worker, daemon=True).start()
+    threading.Thread(target=_alert_rules_worker, daemon=True).start()
     s = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     print(json.dumps({"message": "Python Backend V2 started", "port": PORT, "legacyProxy": LEGACY, "databasePath": str(DB), "redis": "connected" if redis_ok else "unavailable (degraded mode)", "frontend": str(FRONTEND_DIST) if FRONTEND_DIST.is_dir() else "not built (dev server / proxy)"}, ensure_ascii=False))
     try:

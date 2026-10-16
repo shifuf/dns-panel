@@ -1,18 +1,19 @@
 <script setup lang="ts">
 import { ref, computed, watch, h, onUnmounted } from 'vue';
+import { useRoute } from 'vue-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
 import { keepPreviousData } from '@tanstack/vue-query';
 import {
   NButton, NTag, NDataTable, NModal, NFormItem, NInput, NSelect, NAlert,
   NEmpty, NSpin, NPagination, NDrawer, NDrawerContent, NDescriptions,
-  NDescriptionsItem, NSwitch, NTooltip, NTabs, NTabPane, NInputNumber, useMessage, useDialog,
+  NDescriptionsItem, NSwitch, NTooltip, NTabs, NTabPane, NInputNumber, NDropdown, useMessage, useDialog,
 } from 'naive-ui';
 import { RefreshCw, Search, Plus, Upload, Download, Trash2, Eye, CheckCircle, KeyRound, Pencil, AlertTriangle, RotateCw, ArrowUpDown, FileDown, ListChecks } from 'lucide-vue-next';
 import {
   getSslCredentials, createSslCredential, updateSslCredential, deleteSslCredential as deleteSslCred,
   getSslCertificates, getSslCertificateDetail, applySslCertificate,
   completeSslCertificate, downloadSslCertificate, uploadSslCertificate,
-  deleteSslCertificate, syncSslCertificates, renewExpiredCertificates,
+  deleteSslCertificate, syncSslCertificates, reconcileSslCertificates, cleanExpiredSslCertificates, renewExpiredCertificates,
   autoDnsSslCertificate, cleanupDnsSslCertificate,
   getSslAutoRenew, setSslAutoRenew, issueAcmeCertificate, setCertificateAutoRenew,
   getSslAcmeJobs, retrySslAcmeJob, cancelSslAcmeJob, getSslDeploymentEvents,
@@ -28,6 +29,8 @@ import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import type { SslCertificate, SslCertificateDetail, SslCertificateStatus } from '@/types/ssl';
 import type { Domain } from '@/types';
 
+const route = useRoute();
+const isLetsEncryptPage = computed(() => route.path === '/letsencrypt');
 const message = useMessage();
 const dialog = useDialog();
 const queryClient = useQueryClient();
@@ -37,7 +40,7 @@ const { isMobile } = useResponsive();
 const SSL_CRED_STORAGE_KEY = 'ssl_selected_credential';
 const savedCredId = localStorage.getItem(SSL_CRED_STORAGE_KEY);
 const selectedCredentialId = ref<number | 'all' | null>(
-  savedCredId === 'all' ? 'all' : savedCredId ? parseInt(savedCredId, 10) || 'all' : 'all',
+  isLetsEncryptPage.value ? 'all' : (savedCredId === 'all' ? 'all' : savedCredId ? parseInt(savedCredId, 10) || 'all' : 'all'),
 );
 
 watch(selectedCredentialId, (id) => {
@@ -55,7 +58,7 @@ const { data: sslCredentials, isLoading: credsLoading, error: credsError } = use
 
 const credentialOptions = computed(() => {
   const opts: Array<{ label: string; value: number | 'all' }> = [
-    { label: '全部证书（腾讯云 + Let\'s Encrypt）', value: 'all' },
+    { label: isLetsEncryptPage.value ? "全部 Let's Encrypt 证书" : '全部腾讯云证书', value: 'all' },
   ];
   const list = sslCredentials.value || [];
   for (const c of list) {
@@ -180,7 +183,7 @@ const pageSize = TABLE_PAGE_SIZE;
 const searchKeyword = ref('');
 const filterCredentialId = ref<number | null>(null);
 const statusFilter = ref<SslCertificateStatus | null>(null);
-const sourceFilter = ref<'tencent' | 'letsencrypt' | null>(null);
+const sourceFilter = ref<'tencent' | 'letsencrypt' | null>(isLetsEncryptPage.value ? 'letsencrypt' : 'tencent');
 const hasActiveApplying = ref(false);
 
 
@@ -208,7 +211,7 @@ const {
       search: searchKeyword.value || undefined,
       filterCredentialId: filterCredentialId.value || undefined,
       status: selectedCredentialId.value === 'all' ? (statusFilter.value || undefined) : undefined,
-      source: selectedCredentialId.value === 'all' ? (sourceFilter.value || undefined) : undefined,
+      source: selectedCredentialId.value === 'all' ? (sourceFilter.value || (isLetsEncryptPage.value ? 'letsencrypt' : 'tencent')) : undefined,
     });
     return {
       data: res.data || [],
@@ -344,9 +347,25 @@ const deploymentRetryMutation = useMutation({
   onError: (err: any) => message.error(String(err)),
 });
 
+function parseCertDate(v?: string): Date | null {
+  if (!v) return null;
+  let raw = String(v).trim();
+  if (!raw) return null;
+  // Backend stores UTC. Legacy rows may lack the timezone designator
+  // ("2026-04-24 08:00:00"); JS would parse those as *local* time, shifting
+  // the displayed date/time. Normalize to explicit UTC before parsing.
+  if (!/[zZ]$|[+-]\d{2}:?\d{2}$/.test(raw)) {
+    raw = raw.replace(' ', 'T') + 'Z';
+  }
+  const d = new Date(raw);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 function formatDateTime(v?: string) {
   if (!v) return '-';
-  try { return new Date(v).toLocaleString('zh-CN'); } catch { return v; }
+  const d = parseCertDate(v);
+  if (!d) return v;
+  return d.toLocaleString('zh-CN');
 }
 
 const jobStatusLabel: Record<SslAcmeJob['status'], string> = {
@@ -361,8 +380,9 @@ const expiringCerts = computed(() => {
   const now = new Date();
   const threshold = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
   return certificates.value.filter(c => {
-    if (!c.notAfter || c.status !== 'issued') return false;
-    return new Date(c.notAfter) <= threshold;
+    if (!c.notAfter || (c.status !== 'issued' && c.status !== 'expired')) return false;
+    const d = parseCertDate(c.notAfter);
+    return d ? d <= threshold : false;
   });
 });
 
@@ -380,15 +400,17 @@ const statusConfig: Record<SslCertificateStatus, { type: 'success' | 'warning' |
 
 function formatDate(v?: string) {
   if (!v) return '-';
-  try {
-    return new Date(v).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' });
-  } catch { return v; }
+  const d = parseCertDate(v);
+  if (!d) return v;
+  return d.toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' });
 }
 
 function expiryDaysText(notAfter?: string): { text: string; type: 'success' | 'warning' | 'error' | 'default' } | null {
   if (!notAfter) return null;
+  const d = parseCertDate(notAfter);
+  if (!d) return null;
   try {
-    const diff = Math.floor((new Date(notAfter).getTime() - Date.now()) / 86400000);
+    const diff = Math.floor((d.getTime() - Date.now()) / 86400000);
     if (diff < 0) return { text: `已过期 ${Math.abs(diff)} 天`, type: 'error' };
     if (diff <= 7) return { text: `剩余 ${diff} 天`, type: 'error' };
     if (diff <= 30) return { text: `剩余 ${diff} 天`, type: 'warning' };
@@ -396,8 +418,19 @@ function expiryDaysText(notAfter?: string): { text: string; type: 'success' | 'w
   } catch { return null; }
 }
 
+function withinDays(notAfter?: string, days = 30): boolean {
+  const d = parseCertDate(notAfter);
+  if (!d) return false;
+  return d.getTime() - Date.now() < days * 86400000;
+}
+
 // ── Status filter ───────────────────────────────────────────────
-watch([selectedCredentialId, searchKeyword, filterCredentialId, statusFilter, sourceFilter], () => { page.value = 1; });
+watch([selectedCredentialId, searchKeyword, filterCredentialId, statusFilter, sourceFilter, isLetsEncryptPage], () => { page.value = 1; });
+watch(isLetsEncryptPage, (isAcme) => {
+  sourceFilter.value = isAcme ? 'letsencrypt' : 'tencent';
+  selectedCredentialId.value = 'all';
+  applyChannel.value = isAcme ? 'acme' : 'tencent';
+});
 
 const statusCounts = computed(() => certsResponse.value?.statusSummary || certificates.value.reduce((counts, cert) => {
   counts[cert.status] = (counts[cert.status] || 0) + 1;
@@ -407,11 +440,13 @@ const sourceCounts = computed(() => certsResponse.value?.sourceSummary || {});
 const statusTotal = computed(() => Object.values(statusCounts.value).reduce((sum, count) => sum + count, 0));
 
 async function toggleCertificateAutoRenew(cert: SslCertificate) {
-  if (cert.provider !== 'acme' || !cert.credentialId) return;
-  const enabled = cert.autoRenew === false;
+  if (!cert.credentialId) return;
+  const enabled = !cert.autoRenew;
   try {
     await setCertificateAutoRenew(cert.credentialId, cert.remoteCertId, enabled);
-    message.success(`该证书自动续期已${enabled ? '开启' : '关闭'}`);
+    message.success(cert.provider === 'acme'
+      ? `该证书自动续期已${enabled ? '开启' : '关闭'}`
+      : `腾讯云自动续费已${enabled ? '开启' : '关闭'}`);
     queryClient.invalidateQueries({ queryKey: ['ssl-certificates'] });
   } catch (err) {
     message.error(String(err));
@@ -447,11 +482,15 @@ const sortedCertificates = computed(() => {
     if (sortBy.value === 'domain') {
       cmp = (a.domain || '').localeCompare(b.domain || '');
     } else if (sortBy.value === 'notAfter') {
-      cmp = (a.notAfter || '9999').localeCompare(b.notAfter || '9999');
+      const ta = parseCertDate(a.notAfter)?.getTime() ?? Number.MAX_SAFE_INTEGER;
+      const tb = parseCertDate(b.notAfter)?.getTime() ?? Number.MAX_SAFE_INTEGER;
+      cmp = ta - tb;
     } else if (sortBy.value === 'status') {
       cmp = (statusOrder[a.status] ?? 99) - (statusOrder[b.status] ?? 99);
     } else if (sortBy.value === 'remoteCreatedAt') {
-      cmp = (a.remoteCreatedAt || '').localeCompare(b.remoteCreatedAt || '');
+      const ta = parseCertDate(a.remoteCreatedAt)?.getTime() ?? 0;
+      const tb = parseCertDate(b.remoteCreatedAt)?.getTime() ?? 0;
+      cmp = ta - tb;
     }
     return cmp * dir;
   });
@@ -672,7 +711,7 @@ function openAddZoneForDomain(domain: string) {
 // ── Apply modal ────────────────────────────────────────────────
 const showApply = ref(false);
 // Issuance channel: 'tencent' = 腾讯云 DV, 'acme' = Let's Encrypt (acme.sh).
-const applyChannel = ref<'tencent' | 'acme'>('tencent');
+const applyChannel = ref<'tencent' | 'acme'>(isLetsEncryptPage.value ? 'acme' : 'tencent');
 const applyDomain = ref('');
 const applyDomainMode = ref<'managed' | 'manual'>('managed');
 const applyManagedRoot = ref<string | null>(null);
@@ -884,7 +923,9 @@ function quickReapply(cert: SslCertificate) {
 }
 
 function openApply() {
-  applyChannel.value = (sslCredentials.value || []).length > 0 ? 'tencent' : 'acme';
+  applyChannel.value = isLetsEncryptPage.value
+    ? 'acme'
+    : ((sslCredentials.value || []).length > 0 ? 'tencent' : 'acme');
   applyDomain.value = '';
   applyDomainMode.value = managedDomainOptions.value.length > 0 ? 'managed' : 'manual';
   applyManagedRoot.value = managedDomainOptions.value.length > 0 ? managedDomainOptions.value[0].value : null;
@@ -932,6 +973,59 @@ const uploadMutation = useMutation({
 });
 
 // ── Sync ───────────────────────────────────────────────────────
+const reconcileMutation = useMutation({
+  mutationFn: () => reconcileSslCertificates(selectedCredentialId.value === 'all' ? 'all' : (selectedCredentialId.value || undefined)),
+  onSuccess: (res) => {
+    const d = res.data;
+    message.success(`状态检查完成${d?.failed ? `，${d.failed} 个账号失败` : ''}`);
+    queryClient.invalidateQueries({ queryKey: ['ssl-certificates'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+// ── Clean dead cloud certificates (expired / revoked / failed) ──
+const cleanExpiredOptions = [
+  { label: '预览（不删除）', key: 'preview' },
+  { label: '清理已被替代的失效证书', key: 'clean' },
+  { label: `仅清理失效超过 30 天的`, key: 'stale30' },
+];
+
+const cleanExpiredMutation = useMutation({
+  mutationFn: (payload: { dryRun?: boolean; staleDays?: number }) => cleanExpiredSslCertificates(payload),
+  onSuccess: (res, variables) => {
+    const d = res.data;
+    if (variables.dryRun) {
+      const count = d?.cleaned?.length || 0;
+      const kept = d?.kept?.length || 0;
+      if (count) {
+        dialog.info({
+          title: '清理预览',
+          content: `将清理 ${count} 个失效证书${kept ? `，保留 ${kept} 个（域名暂无有效证书）` : ''}。确认后可点击「清理已被替代的失效证书」执行。`,
+          positiveText: '知道了',
+        });
+      } else {
+        message.success(`没有可清理的失效证书${kept ? `（${kept} 个因域名暂无有效证书被保留）` : ''}`);
+      }
+      return;
+    }
+    const count = d?.cleaned?.length || 0;
+    const failed = d?.errors?.length || 0;
+    message.success(`已清理 ${count} 个失效证书${failed ? `，${failed} 个失败` : ''}`);
+    queryClient.invalidateQueries({ queryKey: ['ssl-certificates'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+function handleCleanExpired(key: string) {
+  if (key === 'preview') {
+    cleanExpiredMutation.mutate({ dryRun: true });
+  } else if (key === 'stale30') {
+    cleanExpiredMutation.mutate({ staleDays: 30, dryRun: false });
+  } else {
+    cleanExpiredMutation.mutate({ dryRun: false });
+  }
+}
+
 const syncMutation = useMutation({
   mutationFn: () => {
     const credId = applyEffectiveCredId.value;
@@ -1394,8 +1488,14 @@ const columns = computed(() => {
                 type: row.autoRenew === false ? 'default' : 'success',
                 onClick: () => toggleCertificateAutoRenew(row),
               }, { default: () => row.autoRenew === false ? '开启续期' : '关闭续期' })
-            : null,
-          (row.status === 'expired' || (row.status === 'issued' && row.notAfter && new Date(row.notAfter).getTime() - Date.now() < 30 * 86400000))
+            : (row.status !== 'expired' && !row.isUploaded && row.status !== 'revoked'
+              ? h(NButton, {
+                  size: 'tiny', secondary: true,
+                  type: row.autoRenew ? 'success' : 'default',
+                  onClick: () => toggleCertificateAutoRenew(row),
+                }, { default: () => row.autoRenew ? '关闭自动续费' : '开启自动续费' })
+              : null),
+          (row.status === 'expired' || (row.status === 'issued' && withinDays(row.notAfter)))
             ? h(NButton, { size: 'tiny', secondary: true, type: 'warning', onClick: () => quickReapply(row) },
                 { icon: () => h(RotateCw, { size: 13 }), default: () => '续期' })
             : null,
@@ -1415,9 +1515,9 @@ const columns = computed(() => {
     <section class="panel p-4">
       <div class="toolbar-row">
         <div>
-          <h1 class="page-title">SSL 证书管理</h1>
+          <h1 class="page-title">{{ isLetsEncryptPage ? "Let's Encrypt 证书" : '腾讯云 SSL 证书管理' }}</h1>
           <p class="page-subtitle">
-            腾讯云 DV / Let's Encrypt 证书申请、自动续期、查看、下载与上传
+            {{ isLetsEncryptPage ? "Let's Encrypt / acme.sh 证书" : '腾讯云 SSL 证书' }}申请、自动续期、查看、下载与上传
             <span v-if="hasActiveApplying" class="inline-flex items-center gap-1 ml-2 text-blue-500">
               <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
               <span class="text-xs">自动刷新中</span>
@@ -1427,17 +1527,17 @@ const columns = computed(() => {
         <div class="flex-1" />
 
         <NSelect
-          v-if="credentialOptions.length > 0"
+          v-if="credentialOptions.length > 0 && !isLetsEncryptPage"
           v-model:value="selectedCredentialId"
           :options="credentialOptions"
           placeholder="选择凭证"
           size="small"
           class="!w-52"
         />
-        <NButton size="small" quaternary @click="openAddCred" title="添加 SSL 凭证">
+        <NButton v-if="!isLetsEncryptPage" size="small" quaternary @click="openAddCred" title="添加 SSL 凭证">
           <template #icon><KeyRound :size="14" /></template>
         </NButton>
-        <NButton size="small" quaternary @click="showCredList = !showCredList" title="管理凭证">
+        <NButton v-if="!isLetsEncryptPage" size="small" quaternary @click="showCredList = !showCredList" title="管理凭证">
           <template #icon><Pencil :size="14" /></template>
         </NButton>
         <NInput
@@ -1453,11 +1553,12 @@ const columns = computed(() => {
           <template #icon><Plus :size="14" /></template>
           申请
         </NButton>
-        <NButton size="small" secondary :disabled="!selectedCredentialId || selectedCredentialId === 'all'" @click="showUpload = true">
+        <NButton v-if="!isLetsEncryptPage" size="small" secondary :disabled="!selectedCredentialId || selectedCredentialId === 'all'" @click="showUpload = true">
           <template #icon><Upload :size="14" /></template>
           上传
         </NButton>
         <NButton
+          v-if="!isLetsEncryptPage"
           size="small"
           secondary
           :disabled="!selectedCredentialId || selectedCredentialId === 'all'"
@@ -1467,6 +1568,26 @@ const columns = computed(() => {
           <template #icon><RefreshCw :size="14" /></template>
           同步
         </NButton>
+        <NButton
+          v-if="!isLetsEncryptPage"
+          size="small"
+          secondary
+          :loading="reconcileMutation.isPending.value"
+          @click="reconcileMutation.mutate()"
+          title="检查腾讯云远端证书并清理失效本地记录"
+        >
+          检查失效
+        </NButton>
+        <NDropdown
+          v-if="!isLetsEncryptPage"
+          trigger="click"
+          :options="cleanExpiredOptions"
+          @select="handleCleanExpired"
+        >
+          <NButton size="small" secondary :loading="cleanExpiredMutation.isPending.value" title="删除腾讯云上已过期/吊销/失败的失效证书">
+            清理失效
+          </NButton>
+        </NDropdown>
         <NButton size="small" secondary @click="showTaskDrawer = true" title="查看持久化签发任务与自动部署事件">
           <template #icon><ListChecks :size="14" /></template>
           任务
@@ -1613,7 +1734,7 @@ const columns = computed(() => {
       </div>
 
       <!-- Issuance source filters use backend full-set counts. -->
-      <div v-if="isAllMode && Object.keys(sourceCounts).length > 0" class="mb-3 flex flex-wrap items-center gap-2">
+      <div v-if="!isLetsEncryptPage && isAllMode && Object.keys(sourceCounts).length > 0" class="mb-3 flex flex-wrap items-center gap-2">
         <span class="text-xs text-slate-500">来源：</span>
         <NButton size="tiny" :type="sourceFilter === null ? 'primary' : 'default'" :secondary="sourceFilter !== null" @click="sourceFilter = null">
           全部 ({{ Object.values(sourceCounts).reduce((sum, count) => sum + count, 0) }})
@@ -1794,7 +1915,7 @@ const columns = computed(() => {
         <NAlert v-if="applyOldCertId" type="info" :bordered="false">
           正在续期证书 {{ applyOldCertId }}，将使用腾讯云官方续期流程。
         </NAlert>
-        <NFormItem v-if="!applyOldCertId" label="签发渠道">
+        <NFormItem v-if="!applyOldCertId && !isLetsEncryptPage" label="签发渠道">
           <NSelect v-model:value="applyChannel" :options="channelOptions" />
         </NFormItem>
         <NFormItem v-if="applyChannel === 'tencent' && selectedCredentialId === 'all'" label="腾讯云 SSL 凭证" required>
@@ -2407,7 +2528,7 @@ const columns = computed(() => {
               下载证书
             </NButton>
             <NButton
-              v-if="detailData.status === 'expired' || (detailData.status === 'issued' && detailData.notAfter && new Date(detailData.notAfter).getTime() - Date.now() < 30 * 86400000)"
+              v-if="detailData.status === 'expired' || (detailData.status === 'issued' && withinDays(detailData.notAfter))"
               type="warning"
               size="small"
               @click="quickReapply(detailData)"

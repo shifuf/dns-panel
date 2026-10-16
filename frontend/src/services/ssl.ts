@@ -288,6 +288,29 @@ export async function deleteSslCertificate(
   return res as unknown as ApiResponse;
 }
 
+export async function reconcileSslCertificates(
+  credentialId?: number | 'all',
+): Promise<ApiResponse<{ results: any[]; failed: number }>> {
+  const res = await api.post('/ssl/certificates/reconcile', credentialId ? { credentialId } : {});
+  return res as unknown as ApiResponse<{ results: any[]; failed: number }>;
+}
+
+export interface CleanExpiredResult {
+  cleaned: Array<{ domain: string; certId: string; status: string; dryRun?: boolean }>;
+  kept: Array<{ domain: string; certId: string; status: string; reason: string }>;
+  errors: Array<{ domain?: string; certId?: string; credential?: string; error: string }>;
+  dryRun: boolean;
+}
+
+export async function cleanExpiredSslCertificates(params?: {
+  staleDays?: number;
+  domain?: string;
+  dryRun?: boolean;
+}): Promise<ApiResponse<CleanExpiredResult>> {
+  const res = await api.post('/ssl/certificates/clean-expired', params || {});
+  return res as unknown as ApiResponse<CleanExpiredResult>;
+}
+
 export async function syncSslCertificates(
   credentialId: number,
 ): Promise<ApiResponse<{ synced: number }>> {

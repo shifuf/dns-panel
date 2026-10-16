@@ -3,7 +3,21 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, List
 
-RECORD_MANAGEMENT_PROVIDER_TYPES = frozenset({"cloudflare", "dnspod", "dnspod_token"})
+RECORD_MANAGEMENT_PROVIDER_TYPES = frozenset({
+    "cloudflare",
+    "dnspod",
+    "dnspod_token",
+    "aliyun",
+    "huawei",
+    "baidu",
+    "west",
+    "huoshan",
+    "jdcloud",
+    "dnsla",
+    "namesilo",
+    "powerdns",
+    "spaceship",
+})
 
 PROVIDER_CAPABILITIES: List[Dict[str, Any]] = [
     {

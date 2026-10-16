@@ -204,7 +204,7 @@ def parse_cert_pem(pem_text: str) -> Dict[str, Any]:
             return ""
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     not_before = getattr(cert, "not_valid_before_utc", None) or cert.not_valid_before
     not_after = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after
@@ -301,27 +301,55 @@ class AcmeService:
         provider: str = "",
         secrets: Optional[Dict[str, Any]] = None,
         account_id: str = "",
+        domains: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Force-renew an existing cert and re-read the refreshed PEM."""
+        """Force-renew an existing cert and re-read the refreshed PEM.
+
+        Falls back to a fresh ``--issue`` when acme.sh has no renewal config
+        for the domain (state wiped / cert only exists as files), so renewals
+        never get stuck on a missing conf.
+        """
         p = validate_domain(primary)
         if not p:
             raise AcmeApiError("缺少域名", 400)
         env: Dict[str, str] = {}
+        plugin = ""
         if provider and secrets is not None:
             # Re-supply creds in case acme.sh's saved conf is stale.
             try:
-                _, env = dns_plugin_env(provider, secrets, account_id)
+                plugin, env = dns_plugin_env(provider, secrets, account_id)
             except AcmeApiError:
                 env = {}
         args = ["--renew", "-d", p, "--force"] + self._ecc_args()
         with _ACME_LOCK:
             proc = _run(args, env, timeout=600)
             if proc.returncode not in (0, 2):
+                # No renewal conf (or corrupt) → issue anew with the same names
+                # and credentials instead of failing the renewal outright.
+                if plugin:
+                    names = [validate_domain(d) for d in (domains or [p])] or [p]
+                    if p not in names:
+                        names.insert(0, p)
+                    issue_args = ["--issue", "--dns", plugin, "--server", ACME_CA_SERVER, "--keylength", self.key_length]
+                    for d in names:
+                        issue_args += ["-d", d]
+                    retry = _run(issue_args, env, timeout=600)
+                    if retry.returncode in (0, 2):
+                        return self._install_and_read(p, env)
+                    raise AcmeApiError(f"续期失败（且无法重新签发）：{_tail(retry.stdout + chr(10) + retry.stderr)}", 502)
                 raise AcmeApiError(f"续期失败：{_tail(proc.stdout + chr(10) + proc.stderr)}", 502)
             return self._install_and_read(p, env)
 
-    def _install_and_read(self, primary: str, env: Dict[str, str]) -> Dict[str, Any]:
-        """Copy issued cert to a deterministic dir we control, then parse it."""
+    def _install_files(self, primary: str, env: Dict[str, str]) -> Tuple[Path, Path]:
+        """Materialize acme.sh's current certificate into the panel-owned path.
+
+        acme.sh keeps the source certificate under ``ACME_HOME`` while the panel
+        serves a stable copy under ``deployed``.  Re-running ``--install-cert``
+        is intentionally idempotent and repairs the common case where the
+        deployed copy was removed during a container upgrade.  When
+        ``--install-cert`` itself fails (saved conf lost its hooks), the files
+        are copied straight from acme.sh's cert store instead.
+        """
         out_dir = _deployed_dir(primary)
         out_dir.mkdir(parents=True, exist_ok=True)
         fullchain = out_dir / "fullchain.pem"
@@ -331,22 +359,90 @@ class AcmeService:
             "--key-file", str(privkey),
             "--fullchain-file", str(fullchain),
         ] + self._ecc_args()
-        proc = _run(args, env, timeout=120)
-        if proc.returncode != 0 or not fullchain.exists() or not privkey.exists():
-            raise AcmeApiError(f"证书安装失败：{_tail(proc.stdout + chr(10) + proc.stderr)}", 502)
+        proc: Optional[subprocess.CompletedProcess] = None
+        try:
+            proc = _run(args, env, timeout=120)
+        except AcmeApiError:
+            proc = None
+        done = (
+            proc is not None
+            and proc.returncode == 0
+            and fullchain.is_file() and privkey.is_file()
+            and fullchain.stat().st_size > 0 and privkey.stat().st_size > 0
+        )
+        if not done:
+            store = self._store_files(primary)
+            if store is not None:
+                src_full, src_key = store
+                try:
+                    fullchain.write_text(src_full.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+                    privkey.write_text(src_key.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+                    done = True
+                except Exception:
+                    done = False
+        if not done:
+            tail = _tail((proc.stdout + chr(10) + proc.stderr) if proc is not None else "acme.sh 执行失败")
+            raise AcmeApiError(f"证书安装失败：{tail}", 502)
+        return fullchain, privkey
+
+    def _install_and_read(self, primary: str, env: Dict[str, str]) -> Dict[str, Any]:
+        """Copy issued cert to a deterministic dir we control, then parse it."""
+        fullchain, _ = self._install_files(primary, env)
         pub = fullchain.read_text(encoding="utf-8", errors="replace")
         meta = parse_cert_pem(pub)
         meta["primary"] = primary
         return meta
 
-    def read_pem(self, primary: str) -> Dict[str, str]:
-        """Return {publicKey, privateKey} for a previously issued cert."""
+    def files_exist(self, primary: str) -> bool:
+        """Whether the panel-managed PEM pair is present and non-empty."""
         p = validate_domain(primary)
         out_dir = _deployed_dir(p)
         fullchain = out_dir / "fullchain.pem"
         privkey = out_dir / "privkey.pem"
-        if not fullchain.exists() or not privkey.exists():
-            raise AcmeApiError("证书文件不存在（可能尚未签发成功）", 404)
+        return bool(fullchain.is_file() and privkey.is_file() and fullchain.stat().st_size and privkey.stat().st_size)
+
+    def _store_files(self, primary: str) -> Optional[Tuple[Path, Path]]:
+        """Locate the certificate straight inside acme.sh's own state dir.
+
+        acme.sh keeps the issued files at ``ACME_HOME/<domain>[_ecc]/`` —
+        ``fullchain.cer`` plus ``<domain>.key``. Reading them directly makes
+        downloads work even when ``--install-cert`` cannot run (e.g. the saved
+        conf lost its install hooks or the deployed copy was pruned), which is
+        what previously produced a misleading "证书不存在" on valid certs.
+        """
+        p = validate_domain(primary)
+        base = Path(ACME_HOME)
+        # Search the directory matching this service's key type first; a stale
+        # directory from the other key type could otherwise shadow it.
+        dirs = [base / f"{p}_ecc", base / p] if self.is_ecc else [base / p, base / f"{p}_ecc"]
+        for d in dirs:
+            if not d.is_dir():
+                continue
+            full = next((f for f in (d / "fullchain.cer", d / f"{p}.cer", d / "fullchain.pem")
+                         if f.is_file() and f.stat().st_size), None)
+            key = next((f for f in (d / f"{p}.key", d / "privkey.pem")
+                        if f.is_file() and f.stat().st_size), None)
+            if full is not None and key is not None:
+                return full, key
+        return None
+
+    def read_pem(self, primary: str) -> Dict[str, str]:
+        """Return {publicKey, privateKey} for a previously issued cert.
+
+        Recovery order: the panel-owned deployed copy → ``--install-cert``
+        re-materialization (which itself falls back to acme.sh's own cert
+        store). Works after container upgrades without re-issuing.
+        """
+        p = validate_domain(primary)
+        out_dir = _deployed_dir(p)
+        fullchain = out_dir / "fullchain.pem"
+        privkey = out_dir / "privkey.pem"
+        if not fullchain.is_file() or not privkey.is_file() or fullchain.stat().st_size == 0 or privkey.stat().st_size == 0:
+            # Recover the stable copy from acme.sh's persistent account/state.
+            try:
+                fullchain, privkey = self._install_files(p, {})
+            except AcmeApiError as exc:
+                raise AcmeApiError("证书文件不存在，且无法从 acme.sh 状态恢复（可能尚未签发成功）", 404) from exc
         return {
             "publicKey": fullchain.read_text(encoding="utf-8", errors="replace"),
             "privateKey": privkey.read_text(encoding="utf-8", errors="replace"),

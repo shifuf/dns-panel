@@ -10,11 +10,14 @@ import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import TwoFactorSettings from '@/components/Settings/TwoFactorSettings.vue';
 import DnsCredentialManagement from '@/components/Settings/DnsCredentialManagement.vue';
 import ApiTokenManagement from '@/components/Settings/ApiTokenManagement.vue';
+import NotificationSettings from '@/components/Settings/NotificationSettings.vue';
 import api from '@/services/api';
 import { useProviderStore } from '@/stores/provider';
+import { useRoute } from 'vue-router';
 
 // Tab state
-const activeTab = ref('general');
+const route = useRoute();
+const activeTab = ref(String(route.query.tab || 'general'));
 
 const message = useMessage();
 const queryClient = useQueryClient();
@@ -50,6 +53,7 @@ const versionCheckedAtLabel = computed(() => {
 const retrySettingsLoading = ref(false);
 const storageSettingsLoading = ref(false);
 const logRetentionDays = ref('90');
+const registrationOpen = ref(false);
 const retryMaxAttempts = ref('3');
 const retryIntervalSeconds = ref('2');
 const retryTimeoutSeconds = ref('15');
@@ -79,6 +83,16 @@ function applySystemSettings(settings: any) {
   backupFilePrefix.value = String(settings?.backupFilePrefix || 'dns-panel-backup');
   backupWriteServerCopy.value = settings?.backupWriteServerCopy !== false;
   databasePath.value = String(settings?.databasePath || '');
+  registrationOpen.value = Boolean(settings?.registrationOpen);
+}
+
+async function saveRegistrationOpen() {
+  try {
+    await updateSystemSettings({ registrationOpen: registrationOpen.value } as any);
+    message.success('公开注册设置已保存');
+  } catch (err: any) {
+    message.error(String(err));
+  }
 }
 
 async function fetchVersionInfo(forceRefresh = false, silent = false) {
@@ -401,9 +415,10 @@ async function handleRestoreBackup() {
       <NTab name="general" label="常规" />
       <NTab name="retry" label="重试" />
       <NTab name="storage" label="存储" />
-<NTab name="backup" label="备份" />
-<NTab name="api-token" label="API Token" />
-<NTab name="about" label="关于" />
+      <NTab name="backup" label="备份" />
+      <NTab name="notifications" label="通知" />
+      <NTab name="api-token" label="API Token" />
+      <NTab name="about" label="关于" />
     </NTabs>
 
     <div class="settings-content">
@@ -585,6 +600,16 @@ async function handleRestoreBackup() {
                 </NButton>
               </div>
             </div>
+
+            <div class="bento-card mt-6">
+              <p class="bento-section-title">公开注册</p>
+              <p class="bento-section-meta">开启后允许通过 /register 创建账户（单管理员场景一般保持关闭）</p>
+              <div class="mt-3 flex items-center gap-3">
+                <NSwitch v-model:value="registrationOpen" size="small" />
+                <span class="text-sm text-slate-600">允许公开注册</span>
+                <NButton size="small" type="primary" @click="saveRegistrationOpen">保存</NButton>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -601,6 +626,13 @@ async function handleRestoreBackup() {
       </div>
 
 
+
+      <!-- 通知选项卡 -->
+      <div v-if="activeTab === 'notifications'" class="settings-tab-content">
+        <div class="bento-card">
+          <NotificationSettings />
+        </div>
+      </div>
 
       <!-- 重试选项卡 -->
       <div v-if="activeTab === 'retry'" class="settings-tab-content">

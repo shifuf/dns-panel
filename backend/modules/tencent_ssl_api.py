@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 import re
 
@@ -21,20 +21,30 @@ class TencentSslApiError(Exception):
 
 
 # ── Status mapping: Tencent numeric → generic string ──────────────
+# Official enum (DescribeCertificates / Certificates data structure):
+#   0 审核中 · 1 已通过(签发) · 2 审核失败 · 3 已过期 · 4 自动添加DNS记录
+#   5 企业证书待提交资料 · 6 订单取消中 · 7 已取消 · 8 已提交资料待上传确认函
+#   9 证书吊销中 · 10 已吊销 · 11 重颁发中 · 12 待上传吊销确认函
+#   13 免费证书待提交资料 · 14 证书已退款 · 15 证书迁移中
+# Getting 3 (expired) wrong used to hide genuinely expired certificates from
+# the auto-renew scanner, so they were never renewed.
 _STATUS_MAP: Dict[int, str] = {
-    0: "validating",
-    1: "issued",
-    2: "validating",   # 审核中
-    3: "failed",
-    4: "expired",
-    5: "cancelled",
-    6: "validating",   # 待提交
-    7: "applying",     # 已提交
-    8: "applying",     # 待上传确认函
-    9: "revoked",
-    10: "validating",  # 待提交资料
-    11: "cancelled",   # 已取消
-    12: "validating",  # 待吊销
+    0: "validating",   # 审核中
+    1: "issued",       # 已通过/已签发
+    2: "failed",       # 审核失败
+    3: "expired",      # 已过期
+    4: "validating",   # 自动添加 DNS 记录中
+    5: "validating",   # 企业证书，待提交资料
+    6: "cancelled",    # 订单取消中
+    7: "cancelled",    # 已取消
+    8: "applying",     # 已提交资料，待上传确认函
+    9: "revoked",      # 证书吊销中
+    10: "revoked",     # 已吊销
+    11: "applying",    # 重颁发中
+    12: "revoked",     # 待上传吊销确认函
+    13: "validating",  # 免费证书待提交资料
+    14: "cancelled",   # 证书已退款
+    15: "applying",    # 证书迁移中
 }
 
 
@@ -45,6 +55,75 @@ def _normalize_status(raw_status: Any) -> str:
         return _STATUS_MAP.get(int(raw_status), "applying")
     except (ValueError, TypeError):
         return "applying"
+
+
+def parse_certificate_datetime(value: Any) -> Optional[datetime]:
+    """Parse Tencent/ISO certificate timestamps into an aware UTC datetime.
+
+    Tencent responses have historically used both ``YYYY-mm-dd HH:MM:SS`` and
+    ISO-8601 forms. Never compare those strings lexicographically: doing so
+    makes an expiring certificate look expired (or vice versa) around the
+    ``T``/space boundary. Naive Tencent timestamps are treated as UTC because
+    the API's certificate fields represent an absolute service timestamp.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        # Tencent occasionally emits a space before an offset.
+        raw = re.sub(r"\s+(?=[+-]\d{2}:?\d{2}$)", "", raw)
+        dt = None
+        for candidate in (raw, raw.replace("/", "-")):
+            try:
+                dt = datetime.fromisoformat(candidate)
+                break
+            except ValueError:
+                pass
+        if dt is None:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+                try:
+                    dt = datetime.strptime(raw, fmt)
+                    break
+                except ValueError:
+                    pass
+        if dt is None:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def certificate_days_remaining(not_after: Any, now: Optional[datetime] = None) -> Optional[int]:
+    expires = parse_certificate_datetime(not_after)
+    if expires is None:
+        return None
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return int((expires - current.astimezone(timezone.utc)).total_seconds() // 86400)
+
+
+def certificate_is_expired(not_after: Any, now: Optional[datetime] = None) -> bool:
+    expires = parse_certificate_datetime(not_after)
+    if expires is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return expires <= current.astimezone(timezone.utc)
+
+
+def _format_certificate_datetime(value: Any) -> str:
+    parsed = parse_certificate_datetime(value)
+    if parsed is None:
+        return str(value or "")
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class TencentSslApi:
@@ -219,6 +298,17 @@ class TencentSslApi:
         resp = self._tc3_request("CompleteCertificate", {"CertificateId": certificate_id})
         return resp
 
+    def set_auto_renew_flag(self, certificate_id: str, enabled: bool) -> Dict[str, Any]:
+        """Toggle Tencent Cloud's own auto-renew flag (SetAutoRenewFlag).
+
+        Note: Tencent only honors this for cloud-issued certificates that are
+        still eligible (paid certs / within the allowed window); for free DV
+        certs the flag round-trips but renewal is still driven by re-application,
+        which is what the panel scheduler does via ApplyCertificate.
+        """
+        payload = {"CertId": str(certificate_id).strip(), "AutoRenewFlag": 1 if enabled else 0}
+        return self._tc3_request("SetAutoRenewFlag", payload)
+
     def download_certificate(self, certificate_id: str) -> Dict[str, Any]:
         resp = self._tc3_request("DownloadCertificate", {"CertificateId": certificate_id})
         return {
@@ -255,13 +345,18 @@ class TencentSslApi:
             "san": c.get("CertificateExtra", {}).get("DomainNumber") if isinstance(c.get("CertificateExtra"), dict) else None,
             "certType": c.get("CertificateType", ""),
             "productName": c.get("ProductZhName", ""),
-            "status": _normalize_status(c.get("Status")),
+            "status": ("expired" if _normalize_status(c.get("Status")) == "issued" and certificate_is_expired(c.get("CertEndTime")) else _normalize_status(c.get("Status"))),
             "statusMsg": c.get("StatusMsg", ""),
             "issuer": c.get("ProductZhName", ""),
-            "notBefore": c.get("CertBeginTime", ""),
-            "notAfter": c.get("CertEndTime", ""),
+            "notBefore": _format_certificate_datetime(c.get("CertBeginTime", "")),
+            "notAfter": _format_certificate_datetime(c.get("CertEndTime", "")),
+            "daysRemaining": certificate_days_remaining(c.get("CertEndTime", "")),
+            "isExpired": certificate_is_expired(c.get("CertEndTime", "")),
+            "autoRenew": bool(c.get("AutoRenewFlag") in (1, "1", True)),
+            "autoRenewFlag": c.get("AutoRenewFlag"),
+            "hostingStatus": c.get("HostingStatus"),
             "isUploaded": c.get("IsUpload", False),
-            "remoteCreatedAt": c.get("InsertTime", ""),
+            "remoteCreatedAt": _format_certificate_datetime(c.get("InsertTime", "")),
         }
 
     @staticmethod
@@ -272,13 +367,18 @@ class TencentSslApi:
             "san": resp.get("SubjectAltName") or [],
             "certType": resp.get("CertificateType", ""),
             "productName": resp.get("ProductZhName", ""),
-            "status": _normalize_status(resp.get("Status")),
+            "status": ("expired" if _normalize_status(resp.get("Status")) == "issued" and certificate_is_expired(resp.get("CertEndTime")) else _normalize_status(resp.get("Status"))),
             "statusMsg": resp.get("StatusMsg", ""),
             "issuer": resp.get("ProductZhName", ""),
-            "notBefore": resp.get("CertBeginTime", ""),
-            "notAfter": resp.get("CertEndTime", ""),
+            "notBefore": _format_certificate_datetime(resp.get("CertBeginTime", "")),
+            "notAfter": _format_certificate_datetime(resp.get("CertEndTime", "")),
+            "daysRemaining": certificate_days_remaining(resp.get("CertEndTime", "")),
+            "isExpired": certificate_is_expired(resp.get("CertEndTime", "")),
+            "autoRenew": bool(resp.get("AutoRenewFlag") in (1, "1", True)),
+            "autoRenewFlag": resp.get("AutoRenewFlag"),
+            "hostingStatus": resp.get("HostingStatus"),
             "isUploaded": resp.get("IsUpload", False),
-            "remoteCreatedAt": resp.get("InsertTime", ""),
+            "remoteCreatedAt": _format_certificate_datetime(resp.get("InsertTime", "")),
         }
         dv_auths = resp.get("DvAuths")
         if isinstance(dv_auths, list):
