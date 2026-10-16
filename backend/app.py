@@ -751,6 +751,9 @@ def init_db() -> None:
               domain TEXT NOT NULL,
               domains TEXT NOT NULL,
               keyLength TEXT NOT NULL DEFAULT '2048',
+              ca TEXT NOT NULL DEFAULT '',
+              eabKid TEXT NOT NULL DEFAULT '',
+              eabHmac TEXT NOT NULL DEFAULT '',
               operation TEXT NOT NULL DEFAULT 'issue',
               status TEXT NOT NULL DEFAULT 'queued',
               attempts INTEGER NOT NULL DEFAULT 0,
@@ -763,6 +766,16 @@ def init_db() -> None:
             )
             """
         )
+        # CA/EAB columns for pre-existing databases (idempotent ADD COLUMN).
+        acme_job_cols = {str(row["name"]) for row in c.execute("PRAGMA table_info(ssl_acme_jobs)").fetchall()}
+        if "ca" not in acme_job_cols:
+            c.execute("ALTER TABLE ssl_acme_jobs ADD COLUMN ca TEXT NOT NULL DEFAULT ''")
+        if "eabKid" not in acme_job_cols:
+            c.execute("ALTER TABLE ssl_acme_jobs ADD COLUMN eabKid TEXT NOT NULL DEFAULT ''")
+        if "eabHmac" not in acme_job_cols:
+            c.execute("ALTER TABLE ssl_acme_jobs ADD COLUMN eabHmac TEXT NOT NULL DEFAULT ''")
+        if "acmeCa" not in ssl_cols:
+            c.execute("ALTER TABLE ssl_certificates ADD COLUMN acmeCa TEXT NOT NULL DEFAULT ''")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_acme_jobs_status ON ssl_acme_jobs(status, updatedAt)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_acme_jobs_user ON ssl_acme_jobs(userId, status)")
         c.execute(
@@ -795,6 +808,26 @@ def init_db() -> None:
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS acceleration_cert_requests (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              userId INTEGER NOT NULL,
+              provider TEXT NOT NULL DEFAULT 'edgeone',
+              credentialId INTEGER NOT NULL,
+              siteId TEXT NOT NULL,
+              domainNames TEXT NOT NULL DEFAULT '[]',
+              status TEXT NOT NULL DEFAULT 'pending',
+              attempts INTEGER NOT NULL DEFAULT 0,
+              lastError TEXT,
+              verification TEXT,
+              createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              completedAt DATETIME
+            )
+            """
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_accel_cert_requests_pending ON acceleration_cert_requests(userId, status, updatedAt)")
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS dns_record_history (
@@ -2777,6 +2810,16 @@ def _ssl_autorenew_worker() -> None:
                             _post("/api/ssl/certificates/clean-expired", {"staleDays": 0})
                         except Exception:
                             pass
+                        # Proactive expiry alerts (30/7/1 days + expired), sent
+                        # through the user's SSL notification channels. Runs
+                        # AFTER renewal so certs renewed today don't warn.
+                        try:
+                            from modules.route_handlers import _check_ssl_expiry_notifications
+                            outcome = _check_ssl_expiry_notifications(int(u["id"]))
+                            if outcome.get("notified"):
+                                done.append(f"{u['username']}(到期提醒{outcome['notified']})")
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 set_system_setting("sslAutoRenewLastRunAt", now_iso())
@@ -2901,6 +2944,43 @@ def _alert_rules_worker() -> None:
         time.sleep(24 * 3600)
 
 
+def _acceleration_cert_worker() -> None:
+    """Background worker for EdgeOne free-certificate applications.
+
+    Polls CheckFreeCertificateVerification for pending requests, auto-adds
+    DNS verification records via the user's DNS credentials and marks
+    completion. Keeps issuance progressing even when the browser is closed.
+    """
+    import urllib.request
+    time.sleep(45)  # let the server bind first
+    while True:
+        try:
+            with conn() as c:
+                users = c.execute(
+                    """SELECT DISTINCT u.id, u.username
+                       FROM users u JOIN acceleration_cert_requests r ON r.userId = u.id
+                       WHERE r.status IN ('pending', 'verifying') AND r.attempts < 40"""
+                ).fetchall()
+            for u in users:
+                tok = sign_access_token(
+                    {"id": u["id"], "sub": u["id"], "username": u["username"], "_internal": True},
+                    expires_seconds=600,
+                )
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{PORT}/api/accelerations/certificates/process-pending",
+                    data=b"{}",
+                    headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(req, timeout=120).read()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(60)
+
+
 def _ssl_acme_job_worker() -> None:
     """Process persisted ACME jobs. Queued jobs survive process/container restarts."""
     import urllib.request
@@ -2973,6 +3053,7 @@ def main() -> None:
     threading.Thread(target=_ssl_autorenew_worker, daemon=True).start()
     threading.Thread(target=_ssl_acme_job_worker, daemon=True).start()
     threading.Thread(target=_ssl_task_cleanup_worker, daemon=True).start()
+    threading.Thread(target=_acceleration_cert_worker, daemon=True).start()
     threading.Thread(target=_domain_expiry_worker, daemon=True).start()
     threading.Thread(target=_alert_rules_worker, daemon=True).start()
     s = ThreadingHTTPServer(("0.0.0.0", PORT), H)

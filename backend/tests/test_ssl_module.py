@@ -224,6 +224,38 @@ class SslRouteContractTests(unittest.TestCase):
         self.assertIn("def _acme_covers", self.source)
         self.assertIn("已被有效的 Let's Encrypt 证书覆盖，跳过腾讯云续期", self.source)
 
+    def test_expiry_notification_scan_targets_30_7_1_days(self) -> None:
+        self.assertIn("def _check_ssl_expiry_notifications", self.source)
+        self.assertIn("thresholds = (30, 7, 1)", self.source)
+        self.assertIn('"event": "ssl_expiry_warning"', self.source)
+        # dedup marker keyed by band + exact expiry so a renewed cert re-alerts
+        self.assertIn('marker = f"expiry:{band}"', self.source)
+
+    def test_batch_routes_exist_and_are_scoped(self) -> None:
+        self.assertIn('sub == "/certificates/batch-deploy"', self.source)
+        self.assertIn('sub == "/certificates/batch-auto-renew"', self.source)
+        self.assertIn('"/certificates/batch-deploy", "/certificates/batch-auto-renew"', self.source)
+        self.assertIn('sub == "/certificates/check-expiry"', self.source)
+        self.assertIn('sub == "/deployments/by-site"', self.source)
+        self.assertIn('sub == "/acme-cas"', self.source)
+        self.assertIn('sub == "/plugin-version"', self.source)
+
+    def test_acme_multi_ca_and_eab_are_supported(self) -> None:
+        acme_source = (BACKEND_DIR / "modules" / "acme_api.py").read_text(encoding="utf-8")
+        self.assertIn("ACME_SUPPORTED_CAS", acme_source)
+        self.assertIn('"zerossl"', acme_source)
+        self.assertIn("def resolve_ca_server", acme_source)
+        self.assertIn("--eab-kid", acme_source)
+        self.assertIn("--eab-hmac-key", acme_source)
+        # jobs carry the CA/EAB choice through to the worker
+        self.assertIn("ca, eabKid, eabHmac, operation", self.source)
+
+    def test_acme_private_key_stored_encrypted(self) -> None:
+        acme_source = (BACKEND_DIR / "modules" / "acme_api.py").read_text(encoding="utf-8")
+        self.assertIn("def _encrypt_pem_text", acme_source)
+        self.assertIn("def _read_private_key", acme_source)
+        self.assertIn("_write_private_key(privkey, raw_key)", acme_source)
+
     def test_persisted_jobs_requeue_stale_running_work(self) -> None:
         self.assertIn("CREATE TABLE IF NOT EXISTS ssl_acme_jobs", (BACKEND_DIR / "app.py").read_text(encoding="utf-8"))
         self.assertIn("任务中断，已自动重新排队", self.source)

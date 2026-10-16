@@ -63,8 +63,7 @@ const breadcrumbNameMap: Record<string, string> = {
   logs: '操作日志',
   settings: '设置中心',
   tunnels: 'Cloudflare Tunnel',
-  ssl: '腾讯云 SSL 证书管理',
-  letsencrypt: "Let's Encrypt 证书管理",
+  ssl: 'SSL 证书管理',
 };
 
 const breadcrumbs = computed(() => {
@@ -108,8 +107,7 @@ const breadcrumbs = computed(() => {
 
 const scopeHint = computed(() => {
   if (route.path.startsWith('/settings')) return '当前范围：全局设置';
-  if (route.path.startsWith('/letsencrypt')) return "当前范围：Let's Encrypt 证书管理";
-  if (route.path.startsWith('/ssl')) return '当前范围：腾讯云 SSL 证书管理';
+  if (route.path.startsWith('/ssl') || route.path.startsWith('/letsencrypt')) return '当前范围：SSL 证书管理';
   if (!providerStore.selectedProvider) return '当前范围：全部服务商';
   return `当前范围：${selectedProviderName.value || providerStore.selectedProvider}`;
 });

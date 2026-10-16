@@ -22,6 +22,10 @@ import public
 __plugin_path = "/www/server/panel/plugin/dnspanel_ssl/"
 __config = None
 
+# Keep in step with info.json "versions" — the overview compares this against
+# the panel's /ssl/plugin-version so stale installs notice updates.
+PLUGIN_VERSION = "1.6.0"
+
 
 def _get_config(key=None, force=False):
     """Read plugin config from config.json."""
@@ -659,6 +663,7 @@ class dnspanel_ssl_main:
         # side is actually off (or vice-versa) — this is the "真同步" the user
         # wants: one status, read live from the panel each time.
         panel_renew = None
+        plugin_update = None
         if server_url and has_token:
             try:
                 data = _panel_get("/ssl/certificates?credentialId=all&page=1&limit=200")
@@ -690,6 +695,22 @@ class dnspanel_ssl_main:
                     }
             except Exception:
                 panel_renew = None
+            # Check whether a newer plugin release is expected by the panel.
+            try:
+                pv = _panel_get("/ssl/plugin-version")
+                if pv.get("success"):
+                    expected = str((pv.get("data") or {}).get("expectedVersion") or "").strip()
+                    if expected and expected != PLUGIN_VERSION:
+                        def _vtuple(text):
+                            return tuple(int(x) for x in re.findall(r"\d+", text)[:4]) or (0,)
+                        if _vtuple(expected) > _vtuple(PLUGIN_VERSION):
+                            plugin_update = {
+                                "expectedVersion": expected,
+                                "currentVersion": PLUGIN_VERSION,
+                                "releaseNotes": str((pv.get("data") or {}).get("releaseNotes") or ""),
+                            }
+            except Exception:
+                pass
 
         # Effective auto-renew = panel scheduler OR the local BaoTa cron. When we
         # can read the panel state, it is authoritative; fall back to the local
@@ -712,6 +733,8 @@ class dnspanel_ssl_main:
             "lastCheckResult": cfg.get("lastCertificateCheckResult", ""),
             "lastSiteCheckAt": cfg.get("lastSiteCheckAt", ""),
             "lastSiteCheckResult": cfg.get("lastSiteCheckResult", ""),
+            "pluginVersion": PLUGIN_VERSION,
+            "pluginUpdate": plugin_update,
             "error": error_msg,
             "allowedSites": cfg.get("allowedSites") or [],
             "allowedSources": cfg.get("allowedSources") or ["tencent", "letsencrypt"],
@@ -1027,10 +1050,47 @@ class dnspanel_ssl_main:
         # plus a human-readable issuance source and auto-renew status (the panel
         # returns provider/source/autoRenew/lastRenewedAt on each cert).
         sites = _list_bt_sites()
+        deployed_fingerprints = cfg.get("deployedFingerprints") or {}
+        # Memoize the (openssl-backed) installed-cert inspection per site so a
+        # wildcard cert matching N sites costs one inspection each, not per-cert.
+        installed_cache = {}
+
+        def _installed_for(site_name):
+            if site_name not in installed_cache:
+                installed_cache[site_name] = _installed_cert_summary(site_name)
+            return installed_cache[site_name]
+
         for c in issued:
-            site = _match_site_for_domain(c.get("domain"), sites)
-            c["matchedSite"] = site["name"] if site else ""
-            c["deployed"] = _cert_deployed(site["name"]) if site else False
+            cert_names = _cert_names_from_panel_cert(c)
+            cert_expiry = _parse_expiry(c.get("notAfter"))
+            # Which sites could this cert serve (wildcards serve many sites)?
+            all_matches = _match_sites_for_domain(c.get("domain"), sites)
+            matched_names = [str(s.get("name") or "") for s in all_matches if s.get("name")]
+            c["matchedSite"] = matched_names[0] if matched_names else ""
+            c["matchedSites"] = matched_names
+            # Deployment status per site: the site's installed cert must (a)
+            # cover at least one of this cert's names and (b) not be OLDER than
+            # this certificate — otherwise it's a stale cert from a previous
+            # issuance and the site still shows as pending (needs deploy).
+            deployed_sites = []
+            pending_sites = []
+            for name in matched_names:
+                installed = _installed_for(name)
+                if installed and installed.get("names"):
+                    covers = _names_coverage_score(installed.get("names") or [], cert_names) > 0
+                    installed_expiry = installed.get("expiry")
+                    fresh_enough = (
+                        cert_expiry is None
+                        or installed_expiry is None  # can't compare — assume ok
+                        or installed_expiry >= cert_expiry
+                    )
+                    if covers and fresh_enough:
+                        deployed_sites.append(name)
+                        continue
+                pending_sites.append(name)
+            c["deployedSites"] = deployed_sites
+            c["pendingSites"] = pending_sites
+            c["deployed"] = len(deployed_sites) > 0 and not pending_sites
             c["sourceLabel"] = _source_label(c)
             c["autoRenewLabel"] = _auto_renew_label(c)
         return {"success": True, "data": issued, "total": len(issued)}

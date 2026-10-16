@@ -38,6 +38,8 @@ export interface SslCertificate {
   effectiveAutoRenew?: boolean;
   lastRenewedAt?: string;
   renewError?: string;
+  /** ACME certs: issuing CA key (letsencrypt / zerossl / buypass...). */
+  ca?: string;
   keyLength?: string;
 }
 
@@ -77,6 +79,11 @@ export interface IssueAcmeParams {
   altNames?: string[];
   /** Key type/length: '2048' | '4096' | 'ec-256' | 'ec-384'. */
   keyLength?: string;
+  /** CA choice: 'letsencrypt' | 'letsencrypt_test' | 'zerossl' | 'buypass'. */
+  ca?: string;
+  /** External Account Binding (required by ZeroSSL and friends). */
+  eabKid?: string;
+  eabHmac?: string;
 }
 
 export interface UploadCertificateParams {

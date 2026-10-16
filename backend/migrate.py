@@ -192,6 +192,9 @@ MIGRATIONS: list[str] = [
       domain TEXT NOT NULL,
       domains TEXT NOT NULL,
       keyLength TEXT NOT NULL DEFAULT '2048',
+      ca TEXT NOT NULL DEFAULT '',
+      eabKid TEXT NOT NULL DEFAULT '',
+      eabHmac TEXT NOT NULL DEFAULT '',
       operation TEXT NOT NULL DEFAULT 'issue',
       status TEXT NOT NULL DEFAULT 'queued',
       attempts INTEGER NOT NULL DEFAULT 0,
@@ -203,6 +206,10 @@ MIGRATIONS: list[str] = [
       FOREIGN KEY (certificateId) REFERENCES ssl_certificates(id) ON DELETE CASCADE
     )
     """,
+    "ALTER TABLE ssl_acme_jobs ADD COLUMN ca TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE ssl_acme_jobs ADD COLUMN eabKid TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE ssl_acme_jobs ADD COLUMN eabHmac TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE ssl_certificates ADD COLUMN acmeCa TEXT NOT NULL DEFAULT ''",
     "CREATE INDEX IF NOT EXISTS idx_ssl_acme_jobs_status ON ssl_acme_jobs(status, updatedAt)",
     "CREATE INDEX IF NOT EXISTS idx_ssl_acme_jobs_user ON ssl_acme_jobs(userId, status)",
     """
@@ -361,6 +368,30 @@ MIGRATIONS: list[str] = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_inapp_notifications_user ON inapp_notifications(userId, status, createdAt)",
+
+    # ── EdgeOne free-certificate application tracking (poll worker) ──
+    # One row per ApplyFreeCertificate request; the background worker polls
+    # CheckFreeCertificateVerification, auto-adds DNS verification records
+    # and marks completion so issuance doesn't depend on the user visiting
+    # the page again.
+    """
+    CREATE TABLE IF NOT EXISTS acceleration_cert_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'edgeone',
+      credentialId INTEGER NOT NULL,
+      siteId TEXT NOT NULL,
+      domainNames TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      lastError TEXT,
+      verification TEXT,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      completedAt DATETIME
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_accel_cert_requests_pending ON acceleration_cert_requests(userId, status, updatedAt)",
 ]
 
 TABLE_NAME_RE = re.compile(r"CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)

@@ -64,9 +64,9 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/pages/SSLCertificatesPage.vue'),
       },
       {
+        // Legacy deep-link: Let's Encrypt is a channel tab inside the SSL page now.
         path: 'letsencrypt',
-        name: 'LetsEncryptCertificates',
-        component: () => import('@/pages/SSLCertificatesPage.vue'),
+        redirect: (to) => ({ path: '/ssl', query: { ...to.query, channel: 'letsencrypt' } }),
       },
       {
         path: 'edgeone',

@@ -181,11 +181,6 @@ function goToSsl() {
   navigate('/ssl');
 }
 
-function goToLetsEncrypt() {
-  providerStore.selectProvider(null);
-  navigate('/letsencrypt');
-}
-
 function goToEdgeOne() {
   providerStore.selectProvider(null);
   navigate('/edgeone');
@@ -233,14 +228,9 @@ async function navigate(path: string) {
       总览仪表盘
     </button>
 
-    <button class="nav-btn" :class="{ active: route.path === '/ssl' }" @click="goToSsl">
+    <button class="nav-btn" :class="{ active: route.path === '/ssl' || route.path === '/letsencrypt' }" @click="goToSsl">
       <ShieldCheck :size="18" />
-      腾讯云 SSL
-    </button>
-
-    <button class="nav-btn" :class="{ active: route.path === '/letsencrypt' }" @click="goToLetsEncrypt">
-      <ShieldCheck :size="18" />
-      Let's Encrypt
+      SSL 证书管理
     </button>
 
     <button class="nav-btn" :class="{ active: route.path === '/edgeone' }" @click="goToEdgeOne">

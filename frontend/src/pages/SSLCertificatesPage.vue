@@ -1,14 +1,13 @@
 <script setup lang="ts">
 import { ref, computed, watch, h, onUnmounted } from 'vue';
-import { useRoute } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
 import { keepPreviousData } from '@tanstack/vue-query';
 import {
   NButton, NTag, NDataTable, NModal, NFormItem, NInput, NSelect, NAlert,
   NEmpty, NSpin, NPagination, NDrawer, NDrawerContent, NDescriptions,
   NDescriptionsItem, NSwitch, NTooltip, NTabs, NTabPane, NInputNumber, NDropdown, useMessage, useDialog,
-} from 'naive-ui';
-import { RefreshCw, Search, Plus, Upload, Download, Trash2, Eye, CheckCircle, KeyRound, Pencil, AlertTriangle, RotateCw, ArrowUpDown, FileDown, ListChecks } from 'lucide-vue-next';
+} from 'naive-ui';import { RefreshCw, Search, Plus, Upload, Download, Trash2, Eye, CheckCircle, KeyRound, Pencil, AlertTriangle, RotateCw, ArrowUpDown, FileDown, ListChecks, FileText, Rocket, Copy } from 'lucide-vue-next';
 import {
   getSslCredentials, createSslCredential, updateSslCredential, deleteSslCredential as deleteSslCred,
   getSslCertificates, getSslCertificateDetail, applySslCertificate,
@@ -19,7 +18,11 @@ import {
   getSslAcmeJobs, retrySslAcmeJob, cancelSslAcmeJob, getSslDeploymentEvents,
   retrySslDeploymentEvent, getSslNotificationSettings, saveSslNotificationSettings,
   testSslNotification, getSslTaskLogs, getSslTaskStats, downloadSslTaskLogs,
+  viewSslCertificate, deploySslCertificate,
+  batchDeploySslCertificates, batchSetSslAutoRenew, checkSslExpiry,
+  getSslAcmeCas, getSslDeploymentsBySite,
 } from '@/services/ssl';
+import type { SslCaOption, SiteDeploymentOverview } from '@/services/ssl';
 import { getDnsCredentials } from '@/services/dnsCredentials';
 import { getDomains } from '@/services/domains';
 import AddZoneDialog from '@/components/Dashboard/AddZoneDialog.vue';
@@ -30,7 +33,12 @@ import type { SslCertificate, SslCertificateDetail, SslCertificateStatus } from 
 import type { Domain } from '@/types';
 
 const route = useRoute();
-const isLetsEncryptPage = computed(() => route.path === '/letsencrypt');
+const router = useRouter();
+// Channel tabs: 'all' | 'tencent' | 'letsencrypt'. Deep links (?channel=) and
+// the legacy /letsencrypt route select the initial tab.
+type ChannelTab = 'all' | 'tencent' | 'letsencrypt';
+const channelTab = ref<ChannelTab>('all');
+const isLetsEncryptPage = computed(() => channelTab.value === 'letsencrypt');
 const message = useMessage();
 const dialog = useDialog();
 const queryClient = useQueryClient();
@@ -40,7 +48,7 @@ const { isMobile } = useResponsive();
 const SSL_CRED_STORAGE_KEY = 'ssl_selected_credential';
 const savedCredId = localStorage.getItem(SSL_CRED_STORAGE_KEY);
 const selectedCredentialId = ref<number | 'all' | null>(
-  isLetsEncryptPage.value ? 'all' : (savedCredId === 'all' ? 'all' : savedCredId ? parseInt(savedCredId, 10) || 'all' : 'all'),
+  savedCredId === 'all' ? 'all' : savedCredId ? parseInt(savedCredId, 10) || 'all' : 'all',
 );
 
 watch(selectedCredentialId, (id) => {
@@ -58,7 +66,7 @@ const { data: sslCredentials, isLoading: credsLoading, error: credsError } = use
 
 const credentialOptions = computed(() => {
   const opts: Array<{ label: string; value: number | 'all' }> = [
-    { label: isLetsEncryptPage.value ? "全部 Let's Encrypt 证书" : '全部腾讯云证书', value: 'all' },
+    { label: isLetsEncryptPage.value ? "全部 Let's Encrypt 证书" : (channelTab.value === 'tencent' ? '全部腾讯云证书' : '全部证书'), value: 'all' },
   ];
   const list = sslCredentials.value || [];
   for (const c of list) {
@@ -80,6 +88,61 @@ function credNameById(id?: number) {
   const c = (sslCredentials.value || []).find(x => x.id === id);
   return c ? c.name : `#${id}`;
 }
+
+// ── Channel tabs ───────────────────────────────────────────────
+// "全部" is always available; 腾讯云 shows when the account has Tencent SSL
+// credentials; Let's Encrypt shows when ACME-capable DNS credentials exist.
+const acmeDnsCredsAvailable = computed(() =>
+  (dnsCredentials.value || []).some(c =>
+    ['cloudflare', 'dnspod', 'dnspod_token', 'aliyun'].includes(String(c.provider))),
+);
+
+const channelTabs = computed(() => {
+  const tabs: Array<{ key: ChannelTab; label: string; count?: number }> = [
+    { key: 'all', label: '全部', count: sourceCountsAll.value },
+  ];
+  const hasTencentCreds = (sslCredentials.value || []).length > 0
+    || (sourceCounts.value.tencent || 0) > 0;
+  if (hasTencentCreds) {
+    tabs.push({ key: 'tencent', label: '腾讯云', count: sourceCounts.value.tencent });
+  }
+  const hasAcme = acmeDnsCredsAvailable.value || (sourceCounts.value.letsencrypt || 0) > 0;
+  if (hasAcme) {
+    tabs.push({ key: 'letsencrypt', label: "Let's Encrypt", count: sourceCounts.value.letsencrypt });
+  }
+  return tabs;
+});
+
+const sourceCountsAll = computed(() => {
+  const counts = sourceCounts.value;
+  return Object.values(counts).reduce((sum, n) => sum + (n || 0), 0);
+});
+
+function selectChannelTab(tab: ChannelTab) {
+  if (channelTab.value === tab) return;
+  channelTab.value = tab;
+  statusFilter.value = null;
+  filterCredentialId.value = null;
+  selectedCredentialId.value = 'all';
+  page.value = 1;
+  // Keep the URL shareable: /ssl?channel=letsencrypt
+  router.replace({ path: '/ssl', query: tab === 'all' ? {} : { channel: tab } }).catch(() => undefined);
+}
+
+// Initialize the tab from the URL (?channel=), then keep it in sync when the
+// user follows a deep link / back-forward navigation.
+function syncChannelFromRoute() {
+  const q = String(route.query.channel || '').toLowerCase();
+  if (q === 'tencent' || q === 'letsencrypt') {
+    channelTab.value = q;
+  } else if (route.path === '/letsencrypt') {
+    channelTab.value = 'letsencrypt';
+  } else {
+    channelTab.value = 'all';
+  }
+}
+syncChannelFromRoute();
+watch(() => route.query.channel, syncChannelFromRoute);
 
 // ── Add credential dialog ──────────────────────────────────────
 const showAddCred = ref(false);
@@ -183,7 +246,10 @@ const pageSize = TABLE_PAGE_SIZE;
 const searchKeyword = ref('');
 const filterCredentialId = ref<number | null>(null);
 const statusFilter = ref<SslCertificateStatus | null>(null);
-const sourceFilter = ref<'tencent' | 'letsencrypt' | null>(isLetsEncryptPage.value ? 'letsencrypt' : 'tencent');
+// Source filter follows the active channel tab: the tab IS the source scope.
+const sourceFilter = computed<'tencent' | 'letsencrypt' | null>(() =>
+  channelTab.value === 'all' ? null : channelTab.value,
+);
 const hasActiveApplying = ref(false);
 
 
@@ -211,7 +277,7 @@ const {
       search: searchKeyword.value || undefined,
       filterCredentialId: filterCredentialId.value || undefined,
       status: selectedCredentialId.value === 'all' ? (statusFilter.value || undefined) : undefined,
-      source: selectedCredentialId.value === 'all' ? (sourceFilter.value || (isLetsEncryptPage.value ? 'letsencrypt' : 'tencent')) : undefined,
+      source: selectedCredentialId.value === 'all' ? (sourceFilter.value || undefined) : undefined,
     });
     return {
       data: res.data || [],
@@ -219,6 +285,7 @@ const {
       errors: res.errors,
       statusSummary: res.statusSummary,
       sourceSummary: res.sourceSummary,
+      credentialSummary: res.credentialSummary,
     };
   },
   enabled: computed(() => !!selectedCredentialId.value),
@@ -234,7 +301,6 @@ const certsErrorMsg = computed(() => certsError.value ? String(certsError.value)
 watch(certificates, (list) => {
   hasActiveApplying.value = list.some(c => c.status === 'applying' || c.status === 'validating');
 }, { immediate: true });
-
 // ── Persistent ACME jobs and incremental deployment events ─────
 const showTaskDrawer = ref(false);
 const deploymentStatusFilter = ref<string | null>(null);
@@ -271,6 +337,14 @@ const { data: taskStats } = useQuery({
   refetchInterval: computed(() => showTaskDrawer.value ? 10000 : false),
 });
 
+// ── Per-site deployment trend (task drawer "站点部署" tab) ─────
+const { data: siteDeployments, isFetching: siteDeploymentsFetching } = useQuery({
+  queryKey: ['ssl-deployments-by-site'],
+  queryFn: async () => (await getSslDeploymentsBySite()).data || [] as SiteDeploymentOverview[],
+  enabled: computed(() => showTaskDrawer.value),
+  refetchInterval: computed(() => showTaskDrawer.value ? 15000 : false),
+});
+
 const showNotificationSettings = ref(false);
 const notificationLoading = ref(false);
 const notificationForm = ref<SslNotificationSettings>({
@@ -300,6 +374,16 @@ const testNotificationMutation = useMutation({
     const failed = (res.data?.deliveries || []).filter(item => !item.success);
     if (failed.length) message.warning(`测试完成，${failed.length} 个通道发送失败`);
     else message.success('所有已启用通知通道测试成功');
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+// Run the 30/7/1-day expiry scan immediately (same logic as the daily worker).
+const checkExpiryMutation = useMutation({
+  mutationFn: () => checkSslExpiry(),
+  onSuccess: (res) => {
+    const d = res.data;
+    message.success(`到期检查完成：检查 ${d?.checked || 0} 个证书，已推送 ${d?.notified || 0} 条提醒`
+      + (d?.expired ? `（含已过期 ${d.expired} 个）` : ''));
   },
   onError: (err: any) => message.error(String(err)),
 });
@@ -425,12 +509,7 @@ function withinDays(notAfter?: string, days = 30): boolean {
 }
 
 // ── Status filter ───────────────────────────────────────────────
-watch([selectedCredentialId, searchKeyword, filterCredentialId, statusFilter, sourceFilter, isLetsEncryptPage], () => { page.value = 1; });
-watch(isLetsEncryptPage, (isAcme) => {
-  sourceFilter.value = isAcme ? 'letsencrypt' : 'tencent';
-  selectedCredentialId.value = 'all';
-  applyChannel.value = isAcme ? 'acme' : 'tencent';
-});
+watch([selectedCredentialId, searchKeyword, filterCredentialId, statusFilter, sourceFilter, channelTab], () => { page.value = 1; });
 
 const statusCounts = computed(() => certsResponse.value?.statusSummary || certificates.value.reduce((counts, cert) => {
   counts[cert.status] = (counts[cert.status] || 0) + 1;
@@ -532,6 +611,56 @@ async function handleBatchDelete() {
       message.success(`批量删除完成：成功 ${ok}${fail > 0 ? `，失败 ${fail}` : ''}`);
     },
   });
+}
+
+// ── Batch deploy / batch auto-renew ────────────────────────────
+const batchDeployMutation = useMutation({
+  mutationFn: (certIds: string[]) => batchDeploySslCertificates(certIds),
+  onSuccess: (res) => {
+    const d = res.data;
+    message.success(`批量部署：${d?.queued?.length || 0} 个已入队`
+      + (d?.skipped?.length ? `，${d.skipped.length} 个跳过` : '')
+      + (d?.errors?.length ? `，${d.errors.length} 个失败` : ''));
+    checkedRowKeys.value = [];
+    queryClient.invalidateQueries({ queryKey: ['ssl-deployment-events'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+const batchAutoRenewMutation = useMutation({
+  mutationFn: (vars: { certIds: string[]; enabled: boolean }) => batchSetSslAutoRenew(vars.certIds, vars.enabled),
+  onSuccess: (res, vars) => {
+    const d = res.data;
+    message.success(`批量${vars.enabled ? '开启' : '关闭'}自动续费：${d?.updated?.length || 0} 个成功`
+      + (d?.skipped?.length ? `，${d.skipped.length} 个跳过` : '')
+      + (d?.errors?.length ? `，${d.errors.length} 个失败` : ''));
+    checkedRowKeys.value = [];
+    queryClient.invalidateQueries({ queryKey: ['ssl-certificates'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+function handleBatchDeploy() {
+  const deployable = checkedRowKeys.value.filter((id) => {
+    const cert = certificates.value.find(c => c.remoteCertId === id);
+    return cert && cert.status === 'issued';
+  });
+  if (!deployable.length) {
+    message.warning('选中的证书中没有可部署（已签发）的证书');
+    return;
+  }
+  dialog.info({
+    title: '批量部署证书',
+    content: `将 ${deployable.length} 个证书加入部署队列？宝塔插件下次同步时自动部署到匹配站点。`,
+    positiveText: '加入部署队列',
+    negativeText: '取消',
+    onPositiveClick: () => batchDeployMutation.mutate(deployable),
+  });
+}
+
+function handleBatchAutoRenew(enabled: boolean) {
+  if (!checkedRowKeys.value.length) return;
+  batchAutoRenewMutation.mutate({ certIds: [...checkedRowKeys.value], enabled });
 }
 
 // ── CSV export ──────────────────────────────────────────────────
@@ -740,6 +869,23 @@ const acmeKeyLengthOptions = [
   { label: 'ECC 384（ec-384）', value: 'ec-384' },
 ];
 
+// ── CA selection (Let's Encrypt / ZeroSSL / Buypass) ──────────
+const applyAcmeCa = ref<string>('letsencrypt');
+const applyAcmeEabKid = ref('');
+const applyAcmeEabHmac = ref('');
+const { data: acmeCasData } = useQuery({
+  queryKey: ['ssl-acme-cas'],
+  queryFn: async () => (await getSslAcmeCas()).data,
+  staleTime: 3600_000,
+});
+const acmeCaOptions = computed(() =>
+  (acmeCasData.value?.cas || [{ value: 'letsencrypt', label: "Let's Encrypt" }])
+    .map((c: SslCaOption) => ({ label: c.label, value: c.value })),
+);
+const applyAcmeCaRequiresEab = computed(() =>
+  !!acmeCasData.value?.cas?.find(c => c.value === applyAcmeCa.value)?.requiresEab,
+);
+
 // acme.sh can drive Cloudflare / DNSPod / 阿里云 for the DNS-01 challenge.
 const acmeDnsCredentials = computed(() =>
   (dnsCredentials.value || []).filter(c =>
@@ -864,10 +1010,16 @@ const acmeMutation = useMutation({
     const finalDomain = applyFinalDomain.value;
     if (!finalDomain) throw new Error('请选择或输入域名');
     if (!applyAcmeDnsCredId.value) throw new Error('请选择用于 DNS 验证的 DNS 凭证（Cloudflare / DNSPod / 阿里云）');
+    if (applyAcmeCaRequiresEab.value && (!applyAcmeEabKid.value.trim() || !applyAcmeEabHmac.value.trim())) {
+      throw new Error('该 CA（如 ZeroSSL）需要 EAB 凭据，请填写 EAB Key ID 和 HMAC Key');
+    }
     return issueAcmeCertificate({
       dnsCredentialId: applyAcmeDnsCredId.value,
       domain: finalDomain,
       keyLength: applyAcmeKeyLength.value,
+      ca: applyAcmeCa.value || undefined,
+      eabKid: applyAcmeEabKid.value.trim() || undefined,
+      eabHmac: applyAcmeEabHmac.value.trim() || undefined,
     });
   },
   onSuccess: (res) => {
@@ -916,6 +1068,10 @@ function quickReapply(cert: SslCertificate) {
   applyAcmeDnsCredId.value = cert.provider === 'acme' && typeof cert.credentialId === 'number'
     ? cert.credentialId : (acmeDnsCredentialOptions.value[0]?.value ?? null);
   applyAcmeKeyLength.value = cert.provider === 'acme' && cert.keyLength ? cert.keyLength : '2048';
+  // Preserve the certificate's original CA on re-issue (defaults to LE).
+  applyAcmeCa.value = cert.provider === 'acme' && cert.ca ? cert.ca : 'letsencrypt';
+  applyAcmeEabKid.value = '';
+  applyAcmeEabHmac.value = '';
   // Pass old cert ID for Tencent renewal flow (only for issued tencent certs).
   // acme re-issue ignores it, so never set it for acme certs.
   applyOldCertId.value = cert.provider !== 'acme' && cert.status === 'issued' ? cert.remoteCertId : null;
@@ -923,9 +1079,15 @@ function quickReapply(cert: SslCertificate) {
 }
 
 function openApply() {
-  applyChannel.value = isLetsEncryptPage.value
-    ? 'acme'
-    : ((sslCredentials.value || []).length > 0 ? 'tencent' : 'acme');
+  // Channel follows the active tab: within 腾讯云 tab apply via Tencent DV,
+  // within Let's Encrypt tab via acme.sh; on 全部 let the user choose.
+  if (channelTab.value === 'tencent') {
+    applyChannel.value = 'tencent';
+  } else if (channelTab.value === 'letsencrypt') {
+    applyChannel.value = 'acme';
+  } else {
+    applyChannel.value = (sslCredentials.value || []).length > 0 ? 'tencent' : 'acme';
+  }
   applyDomain.value = '';
   applyDomainMode.value = managedDomainOptions.value.length > 0 ? 'managed' : 'manual';
   applyManagedRoot.value = managedDomainOptions.value.length > 0 ? managedDomainOptions.value[0].value : null;
@@ -940,6 +1102,9 @@ function openApply() {
     ? (sslCredentials.value?.[0]?.id ?? null)
     : selectedCredentialId.value;
   applyAcmeKeyLength.value = '2048';
+  applyAcmeCa.value = 'letsencrypt';
+  applyAcmeEabKid.value = '';
+  applyAcmeEabHmac.value = '';
   applyAcmeDnsCredId.value = acmeDnsCredentialOptions.value[0]?.value ?? null;
   showApply.value = true;
 }
@@ -1283,6 +1448,72 @@ function handleDownload(cert: SslCertificate) {
   downloadSslCertificate(credId, cert.remoteCertId).catch((err: any) => message.error(String(err)));
 }
 
+// ── Online certificate viewer (no download) ────────────────────
+const showCertView = ref(false);
+const certViewLoading = ref(false);
+const certViewData = ref<{ certId: string; domain: string; credentialId: number; publicKey: string; meta: Record<string, any> } | null>(null);
+
+async function openCertView(cert: SslCertificate) {
+  const credId = getCredIdForCert(cert) || (typeof cert.credentialId === 'number' ? cert.credentialId : 0);
+  if (!credId) { message.error('无法确定凭证'); return; }
+  showCertView.value = true;
+  certViewLoading.value = true;
+  certViewData.value = null;
+  try {
+    const res = await viewSslCertificate(credId, cert.remoteCertId);
+    certViewData.value = {
+      certId: cert.remoteCertId,
+      domain: cert.domain || cert.remoteCertId,
+      credentialId: credId,
+      publicKey: res.data?.publicKey || '',
+      meta: (res.data?.meta || {}) as Record<string, any>,
+    };
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    certViewLoading.value = false;
+  }
+}
+
+function downloadViewedCert() {
+  const d = certViewData.value;
+  if (!d) return;
+  downloadSslCertificate(d.credentialId, d.certId).catch((err: any) => message.error(String(err)));
+}
+
+async function copyCertPem() {
+  const pem = certViewData.value?.publicKey;
+  if (!pem) return;
+  try {
+    await navigator.clipboard.writeText(pem);
+    message.success('证书内容已复制到剪贴板');
+  } catch {
+    message.error('复制失败，请手动选择复制');
+  }
+}
+
+// ── Manual deploy (queues a deployment event for the BaoTa plugin) ──
+const deployMutation = useMutation({
+  mutationFn: (certId: string) => deploySslCertificate(certId),
+  onSuccess: (res) => {
+    message.success(res.message || '已加入部署队列：宝塔插件下次同步时自动部署到匹配站点');
+    queryClient.invalidateQueries({ queryKey: ['ssl-deployment-events'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+function handleDeploy(cert: SslCertificate) {
+  dialog.info({
+    title: '部署证书',
+    content: cert.provider === 'acme'
+      ? `将 ${cert.domain} 加入部署队列：宝塔插件下次同步时自动部署到匹配站点（可在「任务」中查看部署结果与目标站点）。`
+      : `将 ${cert.domain} 加入部署队列：宝塔插件下次同步时自动部署到匹配站点（可在「任务」中查看部署结果与目标站点）。`,
+    positiveText: '加入部署队列',
+    negativeText: '取消',
+    onPositiveClick: () => deployMutation.mutate(cert.remoteCertId),
+  });
+}
+
 function handleComplete(cert: SslCertificate) {
   const credId = getCredIdForCert(cert);
   if (!credId) { message.error('无法确定凭证'); return; }
@@ -1323,16 +1554,23 @@ function handleDelete(cert: SslCertificate) {
   });
 }
 
-// ── Filter chips for "all" mode ────────────────────────────────
+// ── Filter chips: accounts that ACTUALLY have certificates in view ──
+// Sourced from the backend credentialSummary (joined with live certificate
+// rows and scoped to the active channel), so the chips never list unused
+// credentials and each name carries its true channel suffix.
+const credentialSummary = computed(() =>
+  certsResponse.value?.credentialSummary || [],
+);
+
 const filterOptions = computed(() => {
-  const seen = new Set<number>();
-  const list = [
-    ...(sslCredentials.value || []).map(c => ({ id: c.id, name: `${c.name} · 腾讯云` })),
-    ...(acmeDnsCredentials.value || []).map(c => ({ id: c.id, name: `${c.name} · Let's Encrypt` })),
-  ].filter(c => !seen.has(c.id) && !!seen.add(c.id));
+  const list = credentialSummary.value.map(item => ({
+    id: item.credentialId,
+    name: `${item.credentialName || `#${item.credentialId}`} · ${item.source === 'letsencrypt' ? "Let's Encrypt" : '腾讯云'}`,
+    count: item.count,
+  }));
   return [
-    { label: '全部', value: null as number | null },
-    ...list.map(c => ({ label: c.name, value: c.id })),
+    { label: '全部', value: null as number | null, count: undefined as number | undefined },
+    ...list.map(c => ({ label: c.name, value: c.id, count: c.count })),
   ];
 });
 
@@ -1366,9 +1604,22 @@ const columns = computed(() => {
     cols.push({
       title: '账号',
       key: 'credentialName',
-      width: 120,
-      render: (row: SslCertificate) =>
-        h(NTag, { size: 'tiny', bordered: false, type: 'info' }, () => row.credentialName || credNameById(row.credentialId) || '-'),
+      width: 160,
+      render: (row: SslCertificate) => {
+        const isAcme = row.provider === 'acme' || row.source === 'letsencrypt';
+        // Channel-correct name: ACME certs belong to a DNS credential (used for
+        // DNS-01), Tencent certs to a Tencent SSL credential. The old code
+        // fell back to the Tencent credential list for both, mislabelling LE
+        // rows as "腾讯云xxx".
+        const acmeCred = (dnsCredentials.value || []).find(c => c.id === row.credentialId);
+        const shownName = isAcme
+          ? (acmeCred?.name || row.credentialName || credNameById(row.credentialId) || `#${row.credentialId}`)
+          : (row.credentialName || credNameById(row.credentialId) || (row.credentialId ? `#${row.credentialId}` : '-'));
+        return h('div', { class: 'flex items-center gap-1' }, [
+          h(NTag, { size: 'tiny', bordered: false, type: isAcme ? 'success' : 'info' }, () => shownName),
+          h('span', { class: 'text-xs text-slate-400' }, isAcme ? 'Let\'s Encrypt' : '腾讯云'),
+        ]);
+      },
     });
   }
 
@@ -1430,18 +1681,48 @@ const columns = computed(() => {
     {
       title: '部署',
       key: 'deployment',
-      width: 120,
+      width: 150,
       render: (row: SslCertificate) => {
         const event = deploymentFor(row);
-        if (!event) return h('span', { class: 'text-xs text-slate-400' }, '暂无事件');
+        if (!event) {
+          // Deployable but never queued — tell the user how it gets deployed.
+          return row.status === 'issued'
+            ? h('span', { class: 'text-xs text-slate-400' }, '未入队（宝塔插件同步时自动部署）')
+            : h('span', { class: 'text-xs text-slate-400' }, '暂无事件');
+        }
         const type = event.status === 'success' ? 'success' : event.status === 'failed' ? 'error'
           : event.status === 'running' ? 'info' : event.status === 'skipped' ? 'default' : 'warning';
         const tag = h(NTag, { size: 'tiny', bordered: false, type }, () => deploymentStatusLabel[event.status]);
-        const detail = event.targetName || event.error;
-        return detail ? h(NTooltip, { trigger: 'hover' }, {
-          trigger: () => h('div', { class: 'cursor-help space-y-0.5' }, [tag, event.targetName ? h('div', { class: 'text-xs text-slate-400 truncate' }, event.targetName) : null]),
-          default: () => event.error || `目标站点：${event.targetName}`,
-        }) : tag;
+        // Show WHICH sites the certificate landed on (a wildcard like
+        // *.shifuf.com may be deployed to several sites) plus timing, so the
+        //判定依据 (target/fingerprint/error) is visible without opening 任务.
+        const targets = (event.targetName || '').split(',').map(s => s.trim()).filter(Boolean);
+        const lines: any[] = [tag];
+        if (targets.length) {
+          lines.push(h('div', { class: 'text-xs text-slate-500 mt-0.5 break-all' },
+            targets.length === 1 ? targets[0] : `${targets[0]} 等 ${targets.length} 个站点`));
+        }
+        if (event.status === 'success' && event.completedAt) {
+          lines.push(h('div', { class: 'text-xs text-slate-400' }, formatDateTime(event.completedAt)));
+        }
+        const tooltipText = (() => {
+          const parts: string[] = [];
+          if (targets.length) parts.push(`目标站点：${targets.join('、')}`);
+          if (event.fingerprint) {
+            try {
+              const fp = JSON.parse(event.fingerprint);
+              const entries = Object.entries(fp).filter(([, v]) => v);
+              if (entries.length) parts.push('已部署指纹：' + entries.map(([site, v]) => `${site} ${String(v).slice(0, 12)}…`).join('；'));
+            } catch { /* fingerprint may be a raw string (legacy) */ }
+          }
+          if (event.error) parts.push(`说明：${event.error}`);
+          parts.push(`判定依据：${deploymentStatusLabel[event.status]}（事件 #${event.id}，尝试 ${event.attempts} 次）`);
+          return parts.join('\n');
+        })();
+        return h(NTooltip, { trigger: 'hover' }, {
+          trigger: () => h('div', { class: 'cursor-help space-y-0.5' }, lines),
+          default: () => tooltipText,
+        });
       },
     },
     {
@@ -1462,9 +1743,17 @@ const columns = computed(() => {
       width: 300,
       fixed: 'right' as const,
       render: (row: SslCertificate) =>
-        h('div', { class: 'flex items-center gap-2' }, [
+        h('div', { class: 'flex items-center gap-2 flex-wrap' }, [
           h(NButton, { size: 'tiny', secondary: true, onClick: () => openDetail(row) },
             { icon: () => h(Eye, { size: 13 }), default: () => '详情' }),
+          row.status === 'issued'
+            ? h(NButton, { size: 'tiny', secondary: true, onClick: () => openCertView(row) },
+                { icon: () => h(FileText, { size: 13 }), default: () => '查看' })
+            : null,
+          row.status === 'issued'
+            ? h(NButton, { size: 'tiny', secondary: true, type: 'info', onClick: () => handleDeploy(row) },
+                { icon: () => h(Rocket, { size: 13 }), default: () => '部署' })
+            : null,
           !isManagedDomain(row.domain || '') && (row.domain || '').trim()
             ? h(NButton, { size: 'tiny', secondary: true, onClick: () => openAddZoneForDomain(row.domain) },
                 { icon: () => h(Plus, { size: 13 }), default: () => '添加域名' })
@@ -1515,9 +1804,9 @@ const columns = computed(() => {
     <section class="panel p-4">
       <div class="toolbar-row">
         <div>
-          <h1 class="page-title">{{ isLetsEncryptPage ? "Let's Encrypt 证书" : '腾讯云 SSL 证书管理' }}</h1>
+          <h1 class="page-title">SSL 证书管理</h1>
           <p class="page-subtitle">
-            {{ isLetsEncryptPage ? "Let's Encrypt / acme.sh 证书" : '腾讯云 SSL 证书' }}申请、自动续期、查看、下载与上传
+            腾讯云 DV / Let's Encrypt (acme.sh) 证书申请、自动续期、在线查看、下载与上传
             <span v-if="hasActiveApplying" class="inline-flex items-center gap-1 ml-2 text-blue-500">
               <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse" />
               <span class="text-xs">自动刷新中</span>
@@ -1527,17 +1816,17 @@ const columns = computed(() => {
         <div class="flex-1" />
 
         <NSelect
-          v-if="credentialOptions.length > 0 && !isLetsEncryptPage"
+          v-if="sslCredentials && sslCredentials.length > 0 && channelTab !== 'letsencrypt'"
           v-model:value="selectedCredentialId"
           :options="credentialOptions"
           placeholder="选择凭证"
           size="small"
           class="!w-52"
         />
-        <NButton v-if="!isLetsEncryptPage" size="small" quaternary @click="openAddCred" title="添加 SSL 凭证">
+        <NButton v-if="channelTab !== 'letsencrypt'" size="small" quaternary @click="openAddCred" title="添加 SSL 凭证">
           <template #icon><KeyRound :size="14" /></template>
         </NButton>
-        <NButton v-if="!isLetsEncryptPage" size="small" quaternary @click="showCredList = !showCredList" title="管理凭证">
+        <NButton v-if="channelTab !== 'letsencrypt'" size="small" quaternary @click="showCredList = !showCredList" title="管理凭证">
           <template #icon><Pencil :size="14" /></template>
         </NButton>
         <NInput
@@ -1553,12 +1842,12 @@ const columns = computed(() => {
           <template #icon><Plus :size="14" /></template>
           申请
         </NButton>
-        <NButton v-if="!isLetsEncryptPage" size="small" secondary :disabled="!selectedCredentialId || selectedCredentialId === 'all'" @click="showUpload = true">
+        <NButton v-if="channelTab !== 'letsencrypt'" size="small" secondary :disabled="!selectedCredentialId || selectedCredentialId === 'all'" @click="showUpload = true">
           <template #icon><Upload :size="14" /></template>
           上传
         </NButton>
         <NButton
-          v-if="!isLetsEncryptPage"
+          v-if="channelTab !== 'letsencrypt'"
           size="small"
           secondary
           :disabled="!selectedCredentialId || selectedCredentialId === 'all'"
@@ -1569,7 +1858,7 @@ const columns = computed(() => {
           同步
         </NButton>
         <NButton
-          v-if="!isLetsEncryptPage"
+          v-if="channelTab !== 'letsencrypt'"
           size="small"
           secondary
           :loading="reconcileMutation.isPending.value"
@@ -1579,7 +1868,7 @@ const columns = computed(() => {
           检查失效
         </NButton>
         <NDropdown
-          v-if="!isLetsEncryptPage"
+          v-if="channelTab !== 'letsencrypt'"
           trigger="click"
           :options="cleanExpiredOptions"
           @select="handleCleanExpired"
@@ -1608,6 +1897,24 @@ const columns = computed(() => {
             {{ autoRenewEnabled ? '自动续期已开启' : '自动续期未开启' }}
           </span>
         </div>
+      </div>
+
+      <!-- Channel tabs: 全部 / 腾讯云 / Let's Encrypt. Tabs only appear for
+           channels that have credentials or certificates in the account. -->
+      <div class="mt-3 flex flex-wrap items-center gap-2 border-t border-panel-border pt-3">
+        <NButton
+          v-for="tab in channelTabs"
+          :key="tab.key"
+          size="small"
+          :type="channelTab === tab.key ? 'primary' : 'default'"
+          :secondary="channelTab !== tab.key"
+          @click="selectChannelTab(tab.key)"
+        >
+          {{ tab.label }}<span v-if="tab.count !== undefined"> ({{ tab.count }})</span>
+        </NButton>
+        <div class="flex-1" />
+        <span v-if="channelTab === 'tencent'" class="text-xs text-slate-400">仅显示腾讯云签发的证书</span>
+        <span v-else-if="channelTab === 'letsencrypt'" class="text-xs text-slate-400">仅显示 Let's Encrypt (acme.sh) 签发的证书</span>
       </div>
     </section>
 
@@ -1733,19 +2040,7 @@ const columns = computed(() => {
         </template>
       </div>
 
-      <!-- Issuance source filters use backend full-set counts. -->
-      <div v-if="!isLetsEncryptPage && isAllMode && Object.keys(sourceCounts).length > 0" class="mb-3 flex flex-wrap items-center gap-2">
-        <span class="text-xs text-slate-500">来源：</span>
-        <NButton size="tiny" :type="sourceFilter === null ? 'primary' : 'default'" :secondary="sourceFilter !== null" @click="sourceFilter = null">
-          全部 ({{ Object.values(sourceCounts).reduce((sum, count) => sum + count, 0) }})
-        </NButton>
-        <NButton v-if="sourceCounts.tencent" size="tiny" :type="sourceFilter === 'tencent' ? 'primary' : 'default'" :secondary="sourceFilter !== 'tencent'" @click="sourceFilter = sourceFilter === 'tencent' ? null : 'tencent'">
-          腾讯云 ({{ sourceCounts.tencent }})
-        </NButton>
-        <NButton v-if="sourceCounts.letsencrypt" size="tiny" :type="sourceFilter === 'letsencrypt' ? 'success' : 'default'" :secondary="sourceFilter !== 'letsencrypt'" @click="sourceFilter = sourceFilter === 'letsencrypt' ? null : 'letsencrypt'">
-          Let's Encrypt ({{ sourceCounts.letsencrypt }})
-        </NButton>
-      </div>
+      <!-- Issuance source is now controlled by the channel tabs above. -->
 
       <!-- Sort controls + batch toolbar + export -->
       <div v-if="certificates.length > 0" class="mb-3 flex flex-wrap items-center gap-2">
@@ -1765,6 +2060,16 @@ const columns = computed(() => {
         </NButton>
         <template v-if="checkedRowKeys.length > 0">
           <span class="text-xs text-slate-500 ml-2">已选 {{ checkedRowKeys.length }} 项</span>
+          <NButton size="tiny" type="primary" secondary :loading="batchDeployMutation.isPending.value" @click="handleBatchDeploy">
+            <template #icon><Rocket :size="13" /></template>
+            批量部署
+          </NButton>
+          <NButton size="tiny" type="success" secondary :loading="batchAutoRenewMutation.isPending.value" @click="handleBatchAutoRenew(true)">
+            批量开启续期
+          </NButton>
+          <NButton size="tiny" secondary :loading="batchAutoRenewMutation.isPending.value" @click="handleBatchAutoRenew(false)">
+            批量关闭续期
+          </NButton>
           <NButton size="tiny" type="error" :loading="batchDeleting" @click="handleBatchDelete">
             <template #icon><Trash2 :size="13" /></template>
             批量删除
@@ -1787,7 +2092,11 @@ const columns = computed(() => {
           </div>
           <div class="mb-1 flex items-center gap-2 text-xs text-slate-500">
             <span>{{ cert.productName || cert.certType || '-' }}</span>
-            <NTag v-if="isAllMode && cert.credentialName" size="tiny" :bordered="false" type="info">{{ cert.credentialName }}</NTag>
+            <NTag v-if="isAllMode" size="tiny" :bordered="false" :type="(cert.provider === 'acme' || cert.source === 'letsencrypt') ? 'success' : 'info'">
+              {{ (cert.provider === 'acme' || cert.source === 'letsencrypt')
+                ? `${(dnsCredentials || []).find(c => c.id === cert.credentialId)?.name || cert.credentialName || ''} · Let's Encrypt`
+                : `${cert.credentialName || credNameById(cert.credentialId)} · 腾讯云` }}
+            </NTag>
           </div>
           <div class="flex items-center justify-between text-xs text-slate-500">
             <div>
@@ -1804,12 +2113,14 @@ const columns = computed(() => {
             </div>
             <div class="flex gap-3">
               <NButton text size="tiny" @click="openDetail(cert)">详情</NButton>
+              <NButton v-if="cert.status === 'issued'" text size="tiny" @click="openCertView(cert)">查看</NButton>
+              <NButton v-if="cert.status === 'issued'" text size="tiny" @click="handleDeploy(cert)">部署</NButton>
               <NButton v-if="cert.status === 'issued'" text size="tiny" type="primary" @click="handleDownload(cert)">
                 <template #icon><Download :size="12" /></template>
                 下载
               </NButton>
               <NButton
-                v-if="cert.status === 'expired' || (cert.status === 'issued' && cert.notAfter && new Date(cert.notAfter).getTime() - Date.now() < 30 * 86400000)"
+                v-if="cert.status === 'expired' || (cert.status === 'issued' && withinDays(cert.notAfter))"
                 text size="tiny" type="warning"
                 @click="quickReapply(cert)"
               >
@@ -1915,7 +2226,7 @@ const columns = computed(() => {
         <NAlert v-if="applyOldCertId" type="info" :bordered="false">
           正在续期证书 {{ applyOldCertId }}，将使用腾讯云官方续期流程。
         </NAlert>
-        <NFormItem v-if="!applyOldCertId && !isLetsEncryptPage" label="签发渠道">
+        <NFormItem v-if="!applyOldCertId && channelTab === 'all'" label="签发渠道">
           <NSelect v-model:value="applyChannel" :options="channelOptions" />
         </NFormItem>
         <NFormItem v-if="applyChannel === 'tencent' && selectedCredentialId === 'all'" label="腾讯云 SSL 凭证" required>
@@ -2022,7 +2333,7 @@ const columns = computed(() => {
           DNS 自动验证要求域名的 NS 记录已指向 DNSPod（腾讯云）。如果域名使用 Cloudflare、阿里云或其他 DNS 服务商解析，请选择「DNS 验证」并开启自动添加记录——只需在下方选择对应的 DNS 凭证即可自动完成验证。
         </NAlert>
 
-        <!-- acme.sh (Let's Encrypt) channel fields -->
+        <!-- acme.sh channel fields -->
         <template v-if="applyChannel === 'acme'">
           <NFormItem label="DNS 凭证" required>
             <NSelect
@@ -2032,6 +2343,20 @@ const columns = computed(() => {
               filterable
             />
           </NFormItem>
+          <NFormItem label="证书颁发机构 (CA)">
+            <NSelect v-model:value="applyAcmeCa" :options="acmeCaOptions" />
+          </NFormItem>
+          <template v-if="applyAcmeCaRequiresEab">
+            <NFormItem label="EAB Key ID" required>
+              <NInput v-model:value="applyAcmeEabKid" placeholder="ZeroSSL 等 CA 提供的外锚凭据 Key ID" />
+            </NFormItem>
+            <NFormItem label="EAB HMAC Key" required>
+              <NInput v-model:value="applyAcmeEabHmac" type="password" show-password-on="click" placeholder="与 Key ID 配对的 HMAC 密钥" />
+            </NFormItem>
+            <NAlert type="warning" :bordered="false">
+              该 CA 需要外部账户绑定（EAB）。请在 CA 控制台生成 Key ID 与 HMAC 密钥后填入，留空将无法完成账户注册。
+            </NAlert>
+          </template>
           <NFormItem label="密钥类型">
             <NSelect v-model:value="applyAcmeKeyLength" :options="acmeKeyLengthOptions" />
           </NFormItem>
@@ -2039,7 +2364,7 @@ const columns = computed(() => {
             暂无可用于 DNS 验证的凭证。请先在设置中添加 Cloudflare、DNSPod 或阿里云凭证。
           </NAlert>
           <NAlert type="info" :bordered="false">
-            由 acme.sh 通过 Let's Encrypt 签发，全程自动完成 DNS 验证（加记录 → 验证 → 清理），签发后默认开启自动续期。主域名和所有 SAN 必须由同一个 DNS 凭证管理；Cloudflare / DNSPod 会在提交时校验管理范围。DNS 传播通常需要 1-3 分钟。支持通配符域名（如 *.example.com）。
+            由 acme.sh 通过所选 CA 签发，全程自动完成 DNS 验证（加记录 → 验证 → 清理），签发后默认开启自动续期。主域名和所有 SAN 必须由同一个 DNS 凭证管理；Cloudflare / DNSPod 会在提交时校验管理范围。DNS 传播通常需要 1-3 分钟。支持通配符域名（如 *.example.com）。
           </NAlert>
         </template>
       </div>
@@ -2314,6 +2639,36 @@ const columns = computed(() => {
               </div>
             </div>
           </NTabPane>
+          <NTabPane name="sites" tab="站点部署">
+            <div v-if="siteDeploymentsFetching && !(siteDeployments || []).length" class="flex justify-center py-12"><NSpin /></div>
+            <NEmpty v-else-if="!(siteDeployments || []).length" description="暂无站点部署记录" class="py-12" />
+            <div v-else class="space-y-3">
+              <div v-for="site in siteDeployments" :key="site.site" class="rounded-xl border border-panel-border p-3">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="font-medium text-slate-700">{{ site.site }}</span>
+                  <NTag size="tiny" :bordered="false" :type="site.latestStatus === 'success' ? 'success' : site.latestStatus === 'failed' ? 'error' : site.latestStatus === 'running' ? 'info' : site.latestStatus === 'skipped' ? 'default' : 'warning'">
+                    {{ deploymentStatusLabel[site.latestStatus as SslDeploymentEvent['status']] || site.latestStatus }}
+                  </NTag>
+                  <span class="text-xs text-slate-400">{{ site.latestDomain }}</span>
+                  <span class="ml-auto text-xs text-slate-400">{{ formatDateTime(site.latestAt) }}</span>
+                </div>
+                <p v-if="site.latestFingerprint" class="mt-1 break-all text-xs text-slate-500">
+                  指纹：{{ site.latestFingerprint.slice(0, 24) }}…
+                </p>
+                <p v-if="site.latestError" class="mt-1 break-all text-xs text-red-500">{{ site.latestError }}</p>
+                <div v-if="site.history.length > 1" class="mt-2 space-y-1 border-t border-panel-border pt-2">
+                  <p class="text-xs font-medium text-slate-500">最近部署历史</p>
+                  <div v-for="h in site.history" :key="h.eventId" class="flex items-center gap-2 text-xs text-slate-500">
+                    <NTag size="tiny" :bordered="false" :type="h.status === 'success' ? 'success' : h.status === 'failed' ? 'error' : h.status === 'skipped' ? 'default' : 'warning'" style="min-width:48px;text-align:center;">
+                      {{ deploymentStatusLabel[h.status as SslDeploymentEvent['status']] || h.status }}
+                    </NTag>
+                    <span class="truncate">{{ h.domain }}</span>
+                    <span class="ml-auto shrink-0 text-slate-400">{{ formatDateTime(h.at) }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </NTabPane>
         </NTabs>
       </NDrawerContent>
     </NDrawer>
@@ -2342,6 +2697,7 @@ const columns = computed(() => {
       </div>
       <template #action>
         <div class="flex justify-end gap-2">
+          <NButton :loading="checkExpiryMutation.isPending.value" @click="checkExpiryMutation.mutate()" title="立即检查证书到期情况并向已启用通道推送 30/7/1 天提醒">检测并推送到期提醒</NButton>
           <NButton :loading="testNotificationMutation.isPending.value" @click="testNotificationMutation.mutate()">测试通知</NButton>
           <NButton @click="showNotificationSettings = false">取消</NButton>
           <NButton type="primary" :loading="saveNotificationMutation.isPending.value" @click="saveNotificationMutation.mutate()">保存</NButton>
@@ -2528,6 +2884,26 @@ const columns = computed(() => {
               下载证书
             </NButton>
             <NButton
+              v-if="detailData.status === 'issued'"
+              size="small"
+              secondary
+              @click="openCertView(detailData)"
+            >
+              <template #icon><FileText :size="14" /></template>
+              在线查看
+            </NButton>
+            <NButton
+              v-if="detailData.status === 'issued'"
+              size="small"
+              secondary
+              type="info"
+              :loading="deployMutation.isPending.value"
+              @click="handleDeploy(detailData)"
+            >
+              <template #icon><Rocket :size="14" /></template>
+              部署
+            </NButton>
+            <NButton
               v-if="detailData.status === 'expired' || (detailData.status === 'issued' && withinDays(detailData.notAfter))"
               type="warning"
               size="small"
@@ -2563,5 +2939,44 @@ const columns = computed(() => {
         </template>
       </NDrawerContent>
     </NDrawer>
+
+    <!-- Online Certificate Viewer — full public PEM + parsed metadata -->
+    <NModal v-model:show="showCertView" preset="card" style="max-width: 760px;" :title="`证书内容 · ${certViewData?.domain || ''}`">
+      <div v-if="certViewLoading" class="flex justify-center py-16"><NSpin size="large" /></div>
+      <template v-else-if="certViewData">
+        <NDescriptions :column="2" label-placement="left" size="small" bordered class="mb-4">
+          <NDescriptionsItem label="公用名 (CN)">{{ certViewData.meta.subjectCN || '-' }}</NDescriptionsItem>
+          <NDescriptionsItem label="颁发者">{{ certViewData.meta.issuer || '-' }}</NDescriptionsItem>
+          <NDescriptionsItem label="生效时间">{{ formatDateTime(certViewData.meta.notBefore) }}</NDescriptionsItem>
+          <NDescriptionsItem label="到期时间">{{ formatDateTime(certViewData.meta.notAfter) }}</NDescriptionsItem>
+          <NDescriptionsItem label="签名算法">{{ certViewData.meta.signatureAlgorithm || '-' }}</NDescriptionsItem>
+          <NDescriptionsItem label="序列号">
+            <span class="break-all text-xs">{{ certViewData.meta.serialNumber || '-' }}</span>
+          </NDescriptionsItem>
+          <NDescriptionsItem label="SHA-256 指纹" :span="2">
+            <span class="break-all text-xs">{{ certViewData.meta.fingerprintSha256 || '-' }}</span>
+          </NDescriptionsItem>
+          <NDescriptionsItem label="SAN 域名" :span="2">
+            <div class="flex flex-wrap gap-1">
+              <NTag v-for="n in (certViewData.meta.san || [])" :key="n" size="tiny" :bordered="false">{{ n }}</NTag>
+              <span v-if="!certViewData.meta.san?.length" class="text-xs text-slate-400">无</span>
+            </div>
+          </NDescriptionsItem>
+        </NDescriptions>
+        <div class="mb-2 flex items-center justify-between">
+          <span class="text-sm font-semibold text-slate-700">证书内容（PEM）</span>
+          <NButton size="tiny" secondary @click="copyCertPem">
+            <template #icon><Copy :size="12" /></template>
+            复制
+          </NButton>
+        </div>
+        <pre class="max-h-96 overflow-auto rounded-lg border border-panel-border bg-slate-50 p-3 text-xs leading-relaxed break-all whitespace-pre-wrap">{{ certViewData.publicKey }}</pre>
+        <p class="mt-2 text-xs text-slate-400">仅显示公钥证书（包含完整证书链）；私钥不会在此展示。</p>
+      </template>
+      <template #footer>
+        <NButton @click="showCertView = false">关闭</NButton>
+        <NButton type="primary" @click="downloadViewedCert">下载 ZIP</NButton>
+      </template>
+    </NModal>
   </div>
 </template>

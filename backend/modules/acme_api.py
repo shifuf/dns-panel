@@ -43,8 +43,31 @@ _ACME_BIN_CANDIDATES = [
 ]
 # Persisted state dir (account keys + issued certs). Lives on the db volume.
 ACME_HOME = (os.getenv("ACME_HOME", "").strip() or "/app/db/acme")
-# CA: Let's Encrypt (no email/registration friction).
+# CA: default Let's Encrypt; users may select another CA per certificate.
 ACME_CA_SERVER = (os.getenv("ACME_CA_SERVER", "").strip() or "letsencrypt")
+
+# Supported CA choices → acme.sh --server values. "letsencrypt_test" is the
+# LE staging endpoint (untrusted certs — useful for experimenting).
+ACME_SUPPORTED_CAS: Dict[str, Dict[str, str]] = {
+    "letsencrypt": {"server": "letsencrypt", "label": "Let's Encrypt"},
+    "letsencrypt_test": {"server": "letsencrypt_test", "label": "Let's Encrypt (测试)"},
+    "zerossl": {"server": "zerossl", "label": "ZeroSSL"},
+    "buypass": {"server": "buypass", "label": "Buypass Go SSL"},
+}
+
+
+def resolve_ca_server(ca: str) -> str:
+    """Map a UI CA key to the acme.sh --server value (falls back to env default)."""
+    key = str(ca or "").strip().lower()
+    if not key:
+        return ACME_CA_SERVER
+    entry = ACME_SUPPORTED_CAS.get(key)
+    if entry:
+        return entry["server"]
+    # Allow raw server URLs for advanced users (acme.sh accepts them directly).
+    if key.startswith("https://"):
+        return key
+    return ACME_CA_SERVER
 
 # Panel DNS providers we can map to an acme.sh DNS plugin.
 ACME_SUPPORTED_DNS_PROVIDERS: Tuple[str, ...] = (
@@ -122,6 +145,66 @@ def _deployed_dir(primary: str) -> Path:
 def _tail(text: str, lines: int = 12) -> str:
     parts = [ln for ln in (text or "").splitlines() if ln.strip()]
     return "\n".join(parts[-lines:]).strip() or "（无输出）"
+
+
+# ── At-rest encryption for the deployed private key ───────────────────
+# The deployed copy of the private key used to sit on disk as plain PEM
+# (0600). It is now stored encrypted with the panel's ENCRYPTION_KEY so a
+# volume/backup leak doesn't expose keys. Legacy plaintext files remain
+# readable and are transparently migrated on first read.
+
+def _encrypt_pem_text(text: str) -> str:
+    try:
+        from app import encrypt_text  # lazy: avoids circular import at module load
+        cipher = encrypt_text(text)
+        if cipher:
+            return cipher
+    except Exception:
+        pass
+    return text
+
+
+def _decrypt_pem_text(text: str) -> str:
+    """Return plaintext PEM; the input may be legacy plaintext or ciphertext.
+
+    Heuristic: real PEM contains dashes but no "iv:hex" structure, so a
+    successful decrypt means the file was encrypted; any failure (or an empty
+    result) falls back to treating the content as legacy plaintext.
+    """
+    if not text:
+        return text
+    if "-----BEGIN PRIVATE KEY-----" in text or "-----BEGIN RSA PRIVATE KEY-----" in text \
+            or "-----BEGIN EC PRIVATE KEY-----" in text:
+        return text  # legacy plaintext
+    try:
+        from app import decrypt_text  # lazy
+        plain = decrypt_text(text)
+        if plain:
+            return plain
+    except Exception:
+        pass
+    return text
+
+
+def _private_key_is_encrypted(text: str) -> bool:
+    return bool(text) and "-----BEGIN" not in text
+
+
+def _read_private_key(path: Path) -> str:
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    plain = _decrypt_pem_text(raw)
+    if plain != raw or "-----BEGIN" in raw:
+        return plain
+    # Unrecognized content — return as-is (caller validates).
+    return raw
+
+
+def _write_private_key(path: Path, pem_text: str) -> None:
+    path.write_text(_encrypt_pem_text(pem_text), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
 
 
 # ── DNS credential → acme.sh plugin + env mapping ─────────────────────
@@ -228,11 +311,38 @@ def parse_cert_pem(pem_text: str) -> Dict[str, Any]:
     except Exception:
         issuer = ""
 
+    subject_cn = ""
+    try:
+        from cryptography.x509.oid import NameOID
+        cn_attrs = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        subject_cn = str(cn_attrs[0].value) if cn_attrs else ""
+    except Exception:
+        subject_cn = ""
+
+    try:
+        from cryptography.hazmat.primitives import hashes as _hashes
+        fingerprint = cert.fingerprint(_hashes.SHA256()).hex()
+        fingerprint = ":".join(fingerprint[i:i + 2] for i in range(0, len(fingerprint), 2)).upper()
+    except Exception:
+        fingerprint = ""
+    try:
+        sig_alg = cert.signature_hash_algorithm.name if cert.signature_hash_algorithm else ""
+    except Exception:
+        sig_alg = ""
+    try:
+        serial = format(cert.serial_number, "X")
+    except Exception:
+        serial = ""
+
     return {
         "notBefore": _fmt(not_before),
         "notAfter": _fmt(not_after),
         "san": san,
         "issuer": issuer or "Let's Encrypt",
+        "subjectCN": subject_cn,
+        "serialNumber": serial,
+        "fingerprintSha256": fingerprint,
+        "signatureAlgorithm": sig_alg,
     }
 
 
@@ -260,13 +370,38 @@ def _run(args: List[str], env_extra: Dict[str, str], timeout: int = 600) -> subp
 class AcmeService:
     """Stateless helper around acme.sh for one panel user/credential."""
 
-    def __init__(self, key_length: str = "2048") -> None:
+    def __init__(self, key_length: str = "2048", ca: str = "", eab_kid: str = "", eab_hmac: str = "") -> None:
         kl = str(key_length or "2048").strip() or "2048"
         self.key_length = kl
         self.is_ecc = kl.lower().startswith("ec")
+        self.ca_server = resolve_ca_server(ca)
+        self.eab_kid = str(eab_kid or "").strip()
+        self.eab_hmac = str(eab_hmac or "").strip()
 
     def _ecc_args(self) -> List[str]:
         return ["--ecc"] if self.is_ecc else []
+
+    def _ca_args(self) -> List[str]:
+        return ["--server", self.ca_server] if self.ca_server else []
+
+    def _eab_args(self) -> List[str]:
+        """External Account Binding flags (required by ZeroSSL & friends)."""
+        if not self.eab_kid or not self.eab_hmac:
+            return []
+        return ["--eab-kid", self.eab_kid, "--eab-hmac-key", self.eab_hmac]
+
+    def _ensure_account(self, env: Dict[str, str]) -> None:
+        """Register/refresh the CA account, including EAB credentials.
+
+        acme.sh implicitly registers on --issue, but EAB CAs need the keys to
+        be registered up front; failures here are non-fatal (issue retries).
+        """
+        if not (self.eab_kid and self.eab_hmac):
+            return
+        try:
+            _run(["--register-account"] + self._ca_args() + self._eab_args(), env, timeout=120)
+        except AcmeApiError:
+            pass
 
     def issue(
         self,
@@ -283,8 +418,9 @@ class AcmeService:
             raise AcmeApiError("缺少有效域名", 400)
         primary = norm[0]
         plugin, env = dns_plugin_env(provider, secrets, account_id)
+        self._ensure_account(env)
 
-        args = ["--issue", "--dns", plugin, "--server", ACME_CA_SERVER, "--keylength", self.key_length]
+        args = ["--issue", "--dns", plugin, "--keylength", self.key_length] + self._ca_args() + self._eab_args()
         for d in norm:
             args += ["-d", d]
         with _ACME_LOCK:
@@ -330,7 +466,7 @@ class AcmeService:
                     names = [validate_domain(d) for d in (domains or [p])] or [p]
                     if p not in names:
                         names.insert(0, p)
-                    issue_args = ["--issue", "--dns", plugin, "--server", ACME_CA_SERVER, "--keylength", self.key_length]
+                    issue_args = ["--issue", "--dns", plugin, "--keylength", self.key_length] + self._ca_args() + self._eab_args()
                     for d in names:
                         issue_args += ["-d", d]
                     retry = _run(issue_args, env, timeout=600)
@@ -376,13 +512,22 @@ class AcmeService:
                 src_full, src_key = store
                 try:
                     fullchain.write_text(src_full.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-                    privkey.write_text(src_key.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-                    done = True
+                    key_text = src_key.read_text(encoding="utf-8", errors="replace")
+                    _write_private_key(privkey, key_text)  # encrypted at rest
+                    done = privkey.is_file() and privkey.stat().st_size > 0
                 except Exception:
                     done = False
         if not done:
             tail = _tail((proc.stdout + chr(10) + proc.stderr) if proc is not None else "acme.sh 执行失败")
             raise AcmeApiError(f"证书安装失败：{tail}", 502)
+        # --install-cert writes the key as plaintext PEM; encrypt it in place
+        # so the deployed copy is never at rest unencrypted.
+        try:
+            raw_key = privkey.read_text(encoding="utf-8", errors="replace")
+            if "-----BEGIN" in raw_key:
+                _write_private_key(privkey, raw_key)
+        except Exception:
+            pass
         return fullchain, privkey
 
     def _install_and_read(self, primary: str, env: Dict[str, str]) -> Dict[str, Any]:
@@ -445,7 +590,7 @@ class AcmeService:
                 raise AcmeApiError("证书文件不存在，且无法从 acme.sh 状态恢复（可能尚未签发成功）", 404) from exc
         return {
             "publicKey": fullchain.read_text(encoding="utf-8", errors="replace"),
-            "privateKey": privkey.read_text(encoding="utf-8", errors="replace"),
+            "privateKey": _read_private_key(privkey),
         }
 
     def remove(self, primary: str) -> None:

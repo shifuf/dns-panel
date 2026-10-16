@@ -27,7 +27,14 @@ class TencentEdgeOneApi:
         self._secret_id = str(secret_id or "").strip()
         self._secret_key = str(secret_key or "").strip()
         self._plan_id = str(plan_id or "").strip()
-        self._host = (str(endpoint or self.HOST).strip() or self.HOST)
+        resolved_host = str(endpoint or self.HOST).strip() or self.HOST
+        # SSRF guard: requests carry a TC3 signature, so a user-supplied
+        # endpoint could probe internal hosts with signed requests. Restrict
+        # to Tencent Cloud API hostnames.
+        host_lower = resolved_host.lower().split("/")[0].split(":")[0]
+        if not (host_lower == self.HOST or host_lower.endswith(".tencentcloudapi.com") or host_lower.endswith(".tencentcloud.com")):
+            raise TencentEdgeOneApiError("自定义 endpoint 仅允许腾讯云 API 域名（*.tencentcloudapi.com）", 400)
+        self._host = resolved_host
         if not self._secret_id or not self._secret_key:
             raise TencentEdgeOneApiError("缺少腾讯云 SecretId / SecretKey")
 
@@ -50,7 +57,19 @@ class TencentEdgeOneApi:
     def normalize_domain_name(domain_name: str) -> str:
         return TencentEdgeOneApi.normalize_zone_name(domain_name)
 
-    def _tc3_request(self, action: str, payload: Dict[str, Any], version: str | None = None) -> Dict[str, Any]:
+    # Transient failures worth retrying with backoff (matches the declared
+    # capabilities: retryableErrors/maxRetries). Rate limiting is the common
+    # one — full-zone traversals can easily hit TEO's 20 req/s ceiling.
+    _RETRYABLE_CODES = (
+        "RequestLimitExceeded",
+        "InternalError",
+        "ServiceUnavailable",
+        "ResourceUnavailable",
+        "FailedOperation",
+    )
+    _MAX_RETRIES = 2
+
+    def _tc3_request_once(self, action: str, payload: Dict[str, Any], version: str | None = None) -> Dict[str, Any]:
         payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         timestamp = int(time.time())
         date = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -123,8 +142,29 @@ class TencentEdgeOneApi:
             msg = str(err.get("Message") or code or "EdgeOne API 错误")
             if code and code not in msg:
                 msg = f"{code}: {msg}"
-            raise TencentEdgeOneApiError(msg, 400, errors=[err])
+            error = TencentEdgeOneApiError(msg, 400, errors=[err])
+            error.code = code  # used by the retry classifier below
+            raise error
         return response
+
+    def _tc3_request(self, action: str, payload: Dict[str, Any], version: str | None = None) -> Dict[str, Any]:
+        """TC3 request with bounded exponential backoff on transient errors."""
+        attempt = 0
+        while True:
+            try:
+                return self._tc3_request_once(action, payload, version)
+            except TencentEdgeOneApiError as exc:
+                code = str(getattr(exc, "code", "") or "")
+                retryable = (
+                    code in self._RETRYABLE_CODES
+                    or (exc.status or 0) >= 500
+                    or "RequestLimitExceeded" in str(exc)
+                    or "网络请求失败" in str(exc)
+                )
+                if not retryable or attempt >= self._MAX_RETRIES:
+                    raise
+                time.sleep(0.8 * (2 ** attempt) + (attempt * 0.37))
+                attempt += 1
 
     def list_zones(self, offset: int = 0, limit: int = 100) -> Dict[str, Any]:
         payload = {"Offset": max(0, int(offset)), "Limit": max(1, min(int(limit), 100))}
@@ -137,6 +177,28 @@ class TencentEdgeOneApi:
             "requestId": resp.get("RequestId"),
         }
 
+    # Instance-level TTL cache for zone pages. find_zone_by_name / describe_zone
+    # can walk up to 20 DescribeZones pages PER CALL; repeated calls in one
+    # request chain (auto-CNAME + finalize + status) are the main source of
+    # rate-limit pressure. A short TTL collapses them into one traversal.
+    _ZONE_CACHE_TTL = 30.0
+
+    def _cached_zone_page(self, offset: int, limit: int) -> Dict[str, Any]:
+        cache = getattr(self, "_zone_page_cache", None)
+        if cache is None:
+            cache = {}
+            self._zone_page_cache = cache
+        key = (int(offset), int(limit))
+        hit = cache.get(key)
+        if hit is not None and (time.time() - hit[0]) < self._ZONE_CACHE_TTL:
+            return hit[1]
+        data = self.list_zones(offset=offset, limit=limit)
+        cache[key] = (time.time(), data)
+        return data
+
+    def invalidate_zone_cache(self) -> None:
+        self._zone_page_cache = {}
+
     def find_zone_by_name(self, zone_name: str) -> Dict[str, Any] | None:
         target = self.normalize_zone_name(zone_name)
         if not target:
@@ -144,7 +206,7 @@ class TencentEdgeOneApi:
         offset = 0
         limit = 100
         for _ in range(20):
-            data = self.list_zones(offset=offset, limit=limit)
+            data = self._cached_zone_page(offset=offset, limit=limit)
             zones = data.get("zones") or []
             for item in zones:
                 if self.normalize_zone_name(item.get("zoneName")) == target:
@@ -163,6 +225,7 @@ class TencentEdgeOneApi:
         if final_plan_id:
             payload["PlanId"] = final_plan_id
         resp = self._tc3_request("CreateZone", payload)
+        self.invalidate_zone_cache()
         data = {
             "siteId": str(resp.get("ZoneId") or ""),
             "zoneId": str(resp.get("ZoneId") or ""),
@@ -173,11 +236,16 @@ class TencentEdgeOneApi:
             "type": payload["Type"],
             "planId": final_plan_id or None,
         }
-        if not data["verification"].get("recordName") and not data["verification"].get("recordValue"):
+        if not data["verification"].get("recordName"):
+            # A verification value without a record NAME cannot be added to DNS
+            # — fetch the full identification info (old condition required BOTH
+            # to be missing, so a value-only response silently skipped this).
             try:
                 verification = self.create_ownership_verification(name, data["siteId"] or None)
                 if isinstance(verification, dict):
-                    data["verification"] = verification.get("verification") or data["verification"]
+                    filled = verification.get("verification") or {}
+                    if filled.get("recordName"):
+                        data["verification"] = filled
             except Exception:
                 pass
         return data
@@ -194,12 +262,9 @@ class TencentEdgeOneApi:
         except TencentEdgeOneApiError:
             pass
 
-        payload: Dict[str, Any] = {"DomainName": name}
-        try:
-            resp = self._tc3_request("CreateOwnershipVerification", payload)
-        except TencentEdgeOneApiError:
-            fallback_payload: Dict[str, Any] = {"ZoneName": name}
-            resp = self._tc3_request("IdentifyZone", fallback_payload)
+        # TEO has no CreateOwnershipVerification action; ownership records are
+        # obtained via IdentifyZone (or read back through DescribeIdentifications).
+        resp = self._tc3_request("IdentifyZone", {"ZoneName": name})
         zone = None
         try:
             zone = self.describe_zone(name, zone_id)
@@ -234,11 +299,9 @@ class TencentEdgeOneApi:
             if item_zone_name == name:
                 matched = item
                 break
-        if matched is None:
-            for item in raw_items:
-                if isinstance(item, dict):
-                    matched = item
-                    break
+        # NOTE: deliberately no "take the first item" fallback — showing another
+        # zone's verification TXT would send users chasing a record that can
+        # never validate. Unmatched simply reports empty verification.
         raw_verification = dict(matched or {})
         raw_verification.setdefault("ZoneName", name)
         zone = None
@@ -261,7 +324,7 @@ class TencentEdgeOneApi:
             offset = 0
             limit = 100
             for _ in range(20):
-                data = self.list_zones(offset=offset, limit=limit)
+                data = self._cached_zone_page(offset=offset, limit=limit)
                 zones = data.get("zones") or []
                 for item in zones:
                     if str(item.get("siteId") or "") == str(zone_id or ""):
@@ -310,16 +373,37 @@ class TencentEdgeOneApi:
         }
 
     def list_acceleration_domains(self, zone_id: str, domain_name: str | None = None) -> Dict[str, Any]:
+        """List ALL acceleration domains under a zone (auto-paginated).
+
+        DescribeAccelerationDomains defaults to Limit=20; without paging the
+        UI silently hid domains past the 20th (and `total` lied too).
+        """
         zid = str(zone_id or "").strip()
         if not zid:
             raise TencentEdgeOneApiError("缺少站点 ID", 400)
-        payload: Dict[str, Any] = {"ZoneId": zid}
+        base_payload: Dict[str, Any] = {"ZoneId": zid}
         if domain_name:
-            payload["Filters"] = [{"Name": "domain-name", "Values": [self.normalize_domain_name(domain_name)]}]
-        resp = self._tc3_request("DescribeAccelerationDomains", payload)
-        raw_items = resp.get("AccelerationDomains") or resp.get("AccelerationDomainInfos") or []
-        items = [self._normalize_acceleration_domain(item) for item in raw_items if isinstance(item, dict)]
-        return {"items": items, "requestId": resp.get("RequestId")}
+            base_payload["Filters"] = [{"Name": "domain-name", "Values": [self.normalize_domain_name(domain_name)]}]
+        items: List[Dict[str, Any]] = []
+        offset = 0
+        limit = 100
+        total = None
+        request_id = None
+        for _ in range(100):  # hard stop; 100 * 100 = 10k domains
+            payload = dict(base_payload, Offset=offset, Limit=limit)
+            resp = self._tc3_request("DescribeAccelerationDomains", payload)
+            request_id = resp.get("RequestId") or request_id
+            raw_items = resp.get("AccelerationDomains") or resp.get("AccelerationDomainInfos") or []
+            batch = [self._normalize_acceleration_domain(item) for item in raw_items if isinstance(item, dict)]
+            items.extend(batch)
+            try:
+                total = int(resp.get("TotalCount") or 0) or total
+            except Exception:
+                pass
+            if len(batch) < limit or (total is not None and len(items) >= total):
+                break
+            offset += limit
+        return {"items": items, "requestId": request_id, "total": total if total is not None else len(items)}
 
     def get_acceleration_domain(self, zone_id: str, domain_name: str) -> Dict[str, Any] | None:
         target = self.normalize_domain_name(domain_name)
@@ -336,10 +420,8 @@ class TencentEdgeOneApi:
         target_domain = self.normalize_domain_name(domain_name)
         if not zid or not target_domain:
             raise TencentEdgeOneApiError("缺少站点 ID 或加速域名", 400)
-        payload = {"ZoneId": zid, "DomainName": target_domain, "OriginInfo": self._build_origin_info(config)}
-        ipv6_status = self._normalize_ipv6_status(config.get("ipv6Status"))
-        if ipv6_status:
-            payload["Ipv6Status"] = ipv6_status
+        payload: Dict[str, Any] = {"ZoneId": zid, "DomainName": target_domain, "OriginInfo": self._build_origin_info(config)}
+        self._apply_origin_transport_params(payload, config)
         resp = self._request_acceleration_domain_with_port_fallback("CreateAccelerationDomain", payload)
         verification = self._normalize_verification(resp)
         current = self.get_acceleration_domain(zid, target_domain) or {"domainName": target_domain, "raw": {}}
@@ -348,6 +430,10 @@ class TencentEdgeOneApi:
         current["verifyRecordValue"] = str(verification.get("recordValue") or current.get("verifyRecordValue") or "")
         if verification.get("verificationCode"):
             current["verificationCode"] = str(verification.get("verificationCode") or "")
+        # Surface params the API rejected and the compatibility retry dropped,
+        # so callers/UI can warn instead of silently losing user config.
+        if isinstance(resp, dict) and resp.get("_strippedParams"):
+            current["strippedParams"] = list(resp["_strippedParams"])
         return current
 
     def modify_acceleration_domain(self, zone_id: str, domain_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -355,12 +441,13 @@ class TencentEdgeOneApi:
         target_domain = self.normalize_domain_name(domain_name)
         if not zid or not target_domain:
             raise TencentEdgeOneApiError("缺少站点 ID 或加速域名", 400)
-        payload = {"ZoneId": zid, "DomainName": target_domain, "OriginInfo": self._build_origin_info(config)}
-        ipv6_status = self._normalize_ipv6_status(config.get("ipv6Status"))
-        if ipv6_status:
-            payload["Ipv6Status"] = ipv6_status
-        self._request_acceleration_domain_with_port_fallback("ModifyAccelerationDomain", payload)
-        return self.get_acceleration_domain(zid, target_domain) or {"domainName": target_domain, "raw": {}}
+        payload: Dict[str, Any] = {"ZoneId": zid, "DomainName": target_domain, "OriginInfo": self._build_origin_info(config)}
+        self._apply_origin_transport_params(payload, config)
+        resp = self._request_acceleration_domain_with_port_fallback("ModifyAccelerationDomain", payload)
+        result = self.get_acceleration_domain(zid, target_domain) or {"domainName": target_domain, "raw": {}}
+        if isinstance(resp, dict) and resp.get("_strippedParams"):
+            result["strippedParams"] = list(resp["_strippedParams"])
+        return result
 
     def upsert_acceleration_domain(self, zone_id: str, domain_name: str, config: Dict[str, Any]) -> Dict[str, Any]:
         existing = self.get_acceleration_domain(zone_id, domain_name)
@@ -399,6 +486,7 @@ class TencentEdgeOneApi:
         if not zid:
             raise TencentEdgeOneApiError("缺少站点 ID", 400)
         resp = self._tc3_request("DeleteZone", {"ZoneId": zid})
+        self.invalidate_zone_cache()
         return {"siteId": zid, "requestId": resp.get("RequestId")}
 
     def check_cname_status(self, zone_id: str, domain_names: List[str]) -> Dict[str, Any]:
@@ -477,23 +565,13 @@ class TencentEdgeOneApi:
         }
 
     def create_certificate(self, zone_id: str, domain_name: str, alternative_names: List[str] | None = None) -> Dict[str, Any]:
-        zid = str(zone_id or "").strip()
-        target_domain = self.normalize_domain_name(domain_name)
-        if not zid or not target_domain:
-            raise TencentEdgeOneApiError("缺少站点 ID 或域名", 400)
-        payload: Dict[str, Any] = {"ZoneId": zid, "DomainName": target_domain}
-        alts = [self.normalize_domain_name(item) for item in (alternative_names or []) if self.normalize_domain_name(item)]
-        if alts:
-            payload["AlternativeNames"] = alts
-        resp = self._tc3_request("CreateCertificate", payload)
-        return {
-            "zoneId": zid,
-            "domainName": target_domain,
-            "certificateId": str(resp.get("CertificateId") or ""),
-            "status": str(resp.get("Status") or ""),
-            "requestId": resp.get("RequestId"),
-            "raw": resp,
-        }
+        """Compatibility shim: apply for EdgeOne free certs via the real API.
+
+        Kept because older callers (QuickAddForm) reference this method name;
+        it now delegates to ApplyFreeCertificate, which actually exists.
+        """
+        names = [domain_name] + [str(x) for x in (alternative_names or [])]
+        return self.apply_free_certificate(zone_id, names)
 
     def modify_hosts_certificate(
         self,
@@ -539,26 +617,96 @@ class TencentEdgeOneApi:
             pass
         return data
 
+    def apply_free_certificate(self, zone_id: str, domain_names: List[str]) -> Dict[str, Any]:
+        """Request EdgeOne-managed FREE certificates for the given domains.
+
+        Uses the real TEO API (ApplyFreeCertificate + CheckFreeCertificateVerification).
+        The old ``CreateCertificate`` action does not exist in the TEO API and
+        always failed with InvalidAction — callers got a confusing hard error.
+        """
+        zid = str(zone_id or "").strip()
+        normalized = [self.normalize_domain_name(item) for item in (domain_names or []) if self.normalize_domain_name(item)]
+        if not zid or not normalized:
+            raise TencentEdgeOneApiError("缺少站点 ID 或域名", 400)
+        resp = self._tc3_request("ApplyFreeCertificate", {"ZoneId": zid, "DomainNames": normalized})
+        # Verification of DNS ownership may be required before issuance; try a
+        # best-effort immediate check so single-shot callers see the state.
+        check: Dict[str, Any] = {}
+        try:
+            check = self.check_free_certificate_verification(zid, normalized)
+        except TencentEdgeOneApiError:
+            check = {}
+        return {
+            "zoneId": zid,
+            "domainNames": normalized,
+            "applied": True,
+            "check": check,
+            "requestId": resp.get("RequestId"),
+            "raw": resp,
+        }
+
+    def check_free_certificate_verification(self, zone_id: str, domain_names: List[str]) -> Dict[str, Any]:
+        zid = str(zone_id or "").strip()
+        normalized = [self.normalize_domain_name(item) for item in (domain_names or []) if self.normalize_domain_name(item)]
+        if not zid or not normalized:
+            raise TencentEdgeOneApiError("缺少站点 ID 或域名", 400)
+        resp = self._tc3_request("CheckFreeCertificateVerification", {"ZoneId": zid, "DomainNames": normalized})
+        raw_items = resp.get("VerificationInfos") if isinstance(resp.get("VerificationInfos"), list) else []
+        items = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            record_name = str(raw.get("RecordName") or "").strip()
+            sub = str(raw.get("Subdomain") or "").strip()
+            if not record_name and sub:
+                record_name = sub
+            items.append({
+                "domainName": self.normalize_domain_name(raw.get("DomainName") or ""),
+                "recordType": str(raw.get("RecordType") or "TXT"),
+                "recordName": record_name,
+                "recordValue": str(raw.get("RecordValue") or "").strip(),
+                "status": str(raw.get("Status") or "").strip(),
+                "raw": raw,
+            })
+        return {"items": items, "requestId": resp.get("RequestId"), "zoneId": zid}
+
     def describe_host_certificates(self, zone_id: str, hosts: List[str] | None = None) -> Dict[str, Any]:
         zid = str(zone_id or "").strip()
         if not zid:
             raise TencentEdgeOneApiError("缺少站点 ID", 400)
-        payload: Dict[str, Any] = {"ZoneId": zid}
         normalized_hosts = [self.normalize_domain_name(item) for item in (hosts or []) if self.normalize_domain_name(item)]
-        resp = self._tc3_request("DescribeHostCertificates", payload)
-        raw_items = resp.get("HostCertificates") if isinstance(resp.get("HostCertificates"), list) else []
-        if not raw_items and isinstance(resp.get("Certificates"), list):
-            raw_items = resp.get("Certificates") or []
-        if not raw_items and isinstance(resp.get("Items"), list):
-            raw_items = resp.get("Items") or []
-        items = [self._normalize_host_certificate(item) for item in raw_items if isinstance(item, dict)]
+        # Auto-paginate: DescribeHostCertificates also defaults to a small page.
+        all_raw: List[Dict[str, Any]] = []
+        request_id = None
+        offset = 0
+        limit = 100
+        total = None
+        for _ in range(100):
+            payload: Dict[str, Any] = {"ZoneId": zid, "Offset": offset, "Limit": limit}
+            resp = self._tc3_request("DescribeHostCertificates", payload)
+            request_id = resp.get("RequestId") or request_id
+            raw_items = resp.get("HostCertificates") if isinstance(resp.get("HostCertificates"), list) else []
+            if not raw_items and isinstance(resp.get("Certificates"), list):
+                raw_items = resp.get("Certificates") or []
+            if not raw_items and isinstance(resp.get("Items"), list):
+                raw_items = resp.get("Items") or []
+            batch = [item for item in raw_items if isinstance(item, dict)]
+            all_raw.extend(batch)
+            try:
+                total = int(resp.get("TotalCount") or 0) or total
+            except Exception:
+                pass
+            if len(batch) < limit or (total is not None and len(all_raw) >= total):
+                break
+            offset += limit
+        items = [self._normalize_host_certificate(item) for item in all_raw]
         if normalized_hosts:
             wanted = set(normalized_hosts)
             items = [
                 item for item in items
                 if any(self.normalize_domain_name(host) in wanted for host in (item.get("hosts") or [item.get("host")]))
             ]
-        return {"items": items, "certificates": items, "requestId": resp.get("RequestId"), "zoneId": zid}
+        return {"items": items, "certificates": items, "requestId": request_id, "zoneId": zid}
 
     @staticmethod
     def _safe_port(value: Any, default: int) -> int:
@@ -575,21 +723,33 @@ class TencentEdgeOneApi:
         cname_status: Any = None,
         paused: Any = False,
     ) -> str:
+        """Map API statuses to the UI state enum.
+
+        Official DomainStatus values: online / process / offline / forbidden /
+        init. `forbidden` (blocked by the platform) used to fall through to
+        "deploying", hiding a state the user must act on.
+        """
         ds = str(domain_status or "").strip().lower()
         idents = str(identification_status or "").strip().lower()
         cns = str(cname_status or "").strip().lower()
-        if paused or ds in {"paused", "disabled", "offline", "suspended"}:
+        if paused or ds in {"disabled", "suspended"}:
             return "paused"
-        if ds in {"pending", "deploying", "processing", "configuring", "init", "initializing", "pendingverify"}:
+        if ds == "forbidden":
+            return "error"
+        if ds in {"error", "failed", "fail"}:
+            return "error"
+        if ds in {"pending", "deploying", "process", "processing", "configuring", "init", "initializing", "pendingverify"}:
             return "deploying"
-        ident_ok = idents in {"verified", "completed", "finished", "success", "active", "online"} or ds in {"active", "online"}
+        ident_ok = idents in {"verified", "completed", "finished", "success", "active", "online"} or ds == "online"
         cname_ok = (not cns) or cns in {"success", "active", "online", "completed", "finished", "ok", "verified", "pass", "passed"}
-        if ds in {"active", "online"} and ident_ok and cname_ok:
+        if ds == "online" and ident_ok and cname_ok:
             return "active"
         if not ident_ok or (cns and not cname_ok):
             return "cname_pending"
-        if ds in {"error", "failed", "fail"}:
-            return "error"
+        if ds == "offline":
+            # Offline without a paused request may mean disabled on the cloud
+            # console — surface as paused rather than pretending it deploys.
+            return "paused"
         return "deploying"
 
     @staticmethod
@@ -623,8 +783,17 @@ class TencentEdgeOneApi:
                 candidates.insert(0, dns_verification)
             elif isinstance(dns_verification, list):
                 candidates = [item for item in dns_verification if isinstance(item, dict)] + candidates
+            zone_name = TencentEdgeOneApi.normalize_zone_name(
+                raw.get("ZoneName") or raw.get("Domain") or raw.get("DomainName") or verification.get("ZoneName") or ""
+            )
             for item in candidates:
+                # The DnsVerification structure uses Subdomain (host part);
+                # without it the record name ended up empty and automatic TXT
+                # creation silently skipped.
+                sub = str(item.get("Subdomain") or item.get("SubDomain") or "").strip()
                 record_name = str(item.get("RecordName") or item.get("Name") or item.get("Host") or "")
+                if not record_name and sub:
+                    record_name = TencentEdgeOneApi._normalize_verification_record_name(zone_name, sub)
                 record_value = str(item.get("RecordValue") or item.get("Value") or item.get("Content") or "")
                 if not record_name and not record_value:
                     continue
@@ -639,21 +808,29 @@ class TencentEdgeOneApi:
 
     @staticmethod
     def _normalize_ipv6_status(value: Any) -> str:
+        """Map UI values to the official IPv6Status enum: follow / on / off."""
         text = str(value or "").strip().lower()
         mapping = {
-            "on": "follow",
-            "enable": "follow",
-            "enabled": "follow",
+            "on": "on",
+            "enable": "on",
+            "enabled": "on",
             "follow": "follow",
-            "off": "close",
-            "disable": "close",
-            "disabled": "close",
-            "close": "close",
+            "off": "off",
+            "disable": "off",
+            "disabled": "off",
+            "close": "off",     # legacy UI value
+            "closed": "off",
         }
         return mapping.get(text, "")
 
     @staticmethod
     def _build_origin_info(config: Dict[str, Any]) -> Dict[str, Any]:
+        """Origin server block only — OriginType/Origin/BackupOrigin/HostHeader.
+
+        Transport settings (protocol/ports) are TOP-LEVEL parameters on
+        CreateAccelerationDomain / ModifyAccelerationDomain and must not be
+        nested inside OriginInfo; see _apply_origin_transport_params.
+        """
         origin_type = str(config.get("originType") or "IP_DOMAIN").strip().upper() or "IP_DOMAIN"
         origin_value = str(config.get("originValue") or "").strip()
         if not origin_value:
@@ -665,48 +842,82 @@ class TencentEdgeOneApi:
         host_header = str(config.get("hostHeader") or "").strip()
         if host_header:
             info["HostHeader"] = host_header
-        try:
-            http_port = int(config.get("httpOriginPort") or config.get("originPort") or 80)
-        except Exception:
-            http_port = 80
-        try:
-            https_port = int(config.get("httpsOriginPort") or config.get("originPort") or 443)
-        except Exception:
-            https_port = 443
-        info["HttpOriginPort"] = http_port
-        info["HttpsOriginPort"] = https_port
-        origin_protocol = str(config.get("originProtocol") or "").strip()
-        if origin_protocol:
-            info["OriginProtocol"] = origin_protocol
         return info
 
+    @classmethod
+    def _apply_origin_transport_params(cls, payload: Dict[str, Any], config: Dict[str, Any]) -> None:
+        """Add protocol / ports / IPv6 as TOP-LEVEL API parameters.
+
+        Per the official schema these live on the request root:
+          IPv6Status (follow|on|off), OriginProtocol (HTTP|HTTPS|FOLLOW),
+          HttpOriginPort, HttpsOriginPort.
+        Previously they were sent inside OriginInfo (rejected) and then
+        silently stripped by the fallback retry, discarding the user's config.
+        """
+        ipv6_status = cls._normalize_ipv6_status(config.get("ipv6Status"))
+        if ipv6_status:
+            payload["IPv6Status"] = ipv6_status
+        origin_protocol = str(config.get("originProtocol") or "").strip()
+        if origin_protocol:
+            payload["OriginProtocol"] = origin_protocol.upper()
+        try:
+            http_port = int(config.get("httpOriginPort") or config.get("originPort") or 0)
+        except Exception:
+            http_port = 0
+        try:
+            https_port = int(config.get("httpsOriginPort") or config.get("originPort") or 0)
+        except Exception:
+            https_port = 0
+        if http_port > 0:
+            payload["HttpOriginPort"] = http_port
+        if https_port > 0:
+            payload["HttpsOriginPort"] = https_port
+
     def _request_acceleration_domain_with_port_fallback(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Retry without transport params ONLY when the API rejects them.
+
+        The old code nested ports/protocol under OriginInfo, which newer API
+        versions rejected — and the fallback then silently dropped the user's
+        settings. Params now go to the correct top level; this stripped retry
+        remains solely as compatibility for older API versions, and the strip
+        is flagged via the returned payload so callers can surface a warning.
+        """
         retry_payload = json.loads(json.dumps(payload, ensure_ascii=False))
-        stripped_ipv6_status = False
-        stripped_origin_ports = False
-        stripped_origin_protocol = False
+        stripped: List[str] = []
         while True:
             try:
-                return self._tc3_request(action, retry_payload)
+                result = self._tc3_request(action, retry_payload)
+                if stripped and isinstance(result, dict):
+                    result["_strippedParams"] = list(stripped)
+                return result
             except TencentEdgeOneApiError as exc:
                 message = str(exc)
-                if (not stripped_ipv6_status) and "Ipv6Status" in message and ("UnknownParameter" in message or "not recognized" in message):
-                    retry_payload.pop("Ipv6Status", None)
-                    stripped_ipv6_status = True
+                unknown = "UnknownParameter" in message or "not recognized" in message
+                if not unknown:
+                    raise
+                if "IPv6Status" in message and "IPv6Status" in retry_payload and "IPv6Status" not in stripped:
+                    retry_payload.pop("IPv6Status", None)
+                    stripped.append("IPv6Status")
                     continue
-                if (not stripped_origin_protocol) and "OriginInfo.OriginProtocol" in message and ("UnknownParameter" in message or "not recognized" in message):
-                    origin_info = retry_payload.get("OriginInfo")
-                    if isinstance(origin_info, dict):
-                        origin_info.pop("OriginProtocol", None)
-                    stripped_origin_protocol = True
+                if "IPv6Status" in message and "IPv6Status" in retry_payload:
+                    retry_payload.pop("IPv6Status", None)
                     continue
-                if (not stripped_origin_ports) and ("OriginInfo.HttpOriginPort" in message or "OriginInfo.HttpsOriginPort" in message):
-                    origin_info = retry_payload.get("OriginInfo")
-                    if isinstance(origin_info, dict):
-                        origin_info.pop("HttpOriginPort", None)
-                        origin_info.pop("HttpsOriginPort", None)
-                    stripped_origin_ports = True
+                if "OriginProtocol" in message and "OriginProtocol" in retry_payload:
+                    retry_payload.pop("OriginProtocol", None)
+                    stripped.append("OriginProtocol")
                     continue
+                if ("HttpOriginPort" in message or "HttpsOriginPort" in message):
+                    popped = False
+                    if "HttpOriginPort" in retry_payload:
+                        retry_payload.pop("HttpOriginPort", None)
+                        stripped.append("HttpOriginPort")
+                        popped = True
+                    if "HttpsOriginPort" in retry_payload:
+                        retry_payload.pop("HttpsOriginPort", None)
+                        stripped.append("HttpsOriginPort")
+                        popped = True
+                    if popped:
+                        continue
                 raise
 
     @staticmethod

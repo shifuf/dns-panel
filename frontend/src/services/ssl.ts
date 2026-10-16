@@ -10,6 +10,7 @@ interface PaginatedResponse<T> {
   errors?: Array<{ credentialId: number; name: string; error: string }>;
   statusSummary?: Record<string, number>;
   sourceSummary?: Record<string, number>;
+  credentialSummary?: Array<{ credentialId: number; credentialName: string; source: string; count: number }>;
 }
 
 export interface SslCredential {
@@ -131,6 +132,8 @@ export interface SslDeploymentEvent {
   fingerprint?: string;
   error?: string;
   createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
   updatedAt: string;
 }
 
@@ -293,6 +296,98 @@ export async function reconcileSslCertificates(
 ): Promise<ApiResponse<{ results: any[]; failed: number }>> {
   const res = await api.post('/ssl/certificates/reconcile', credentialId ? { credentialId } : {});
   return res as unknown as ApiResponse<{ results: any[]; failed: number }>;
+}
+
+export async function batchDeploySslCertificates(
+  certIds: string[],
+): Promise<ApiResponse<{ queued: any[]; skipped: any[]; errors: any[] }>> {
+  const res = await api.post('/ssl/certificates/batch-deploy', { certIds });
+  return res as unknown as ApiResponse<{ queued: any[]; skipped: any[]; errors: any[] }>;
+}
+
+export async function batchSetSslAutoRenew(
+  certIds: string[],
+  enabled: boolean,
+): Promise<ApiResponse<{ updated: any[]; skipped: any[]; errors: any[] }>> {
+  const res = await api.post('/ssl/certificates/batch-auto-renew', { certIds, enabled });
+  return res as unknown as ApiResponse<{ updated: any[]; skipped: any[]; errors: any[] }>;
+}
+
+export async function checkSslExpiry(): Promise<ApiResponse<{ checked: number; notified: number; expired: number }>> {
+  const res = await api.post('/ssl/certificates/check-expiry', {});
+  return res as unknown as ApiResponse<{ checked: number; notified: number; expired: number }>;
+}
+
+export interface SslCaOption {
+  value: string;
+  label: string;
+  requiresEab?: boolean;
+}
+
+export async function getSslAcmeCas(): Promise<ApiResponse<{ cas: SslCaOption[]; default: string }>> {
+  const res = await api.get('/ssl/acme-cas');
+  return res as unknown as ApiResponse<{ cas: SslCaOption[]; default: string }>;
+}
+
+export interface SiteDeploymentOverview {
+  site: string;
+  latestStatus: string;
+  latestSource: string;
+  latestDomain: string;
+  latestError: string;
+  latestFingerprint: string;
+  latestAt: string;
+  history: Array<{
+    eventId: number;
+    status: string;
+    domain: string;
+    source: string;
+    attempts: number;
+    error: string;
+    at: string;
+  }>;
+}
+
+export async function getSslDeploymentsBySite(): Promise<ApiResponse<SiteDeploymentOverview[]>> {
+  const res = await api.get('/ssl/deployments/by-site');
+  return res as unknown as ApiResponse<SiteDeploymentOverview[]>;
+}
+
+export async function getSslPluginVersion(): Promise<ApiResponse<{ expectedVersion: string; minVersion: string; releaseNotes?: string }>> {
+  const res = await api.get('/ssl/plugin-version');
+  return res as unknown as ApiResponse<{ expectedVersion: string; minVersion: string; releaseNotes?: string }>;
+}
+
+export interface SslCertificateView {
+  certId: string;
+  publicKey: string;
+  meta: {
+    notBefore?: string;
+    notAfter?: string;
+    san?: string[];
+    issuer?: string;
+    subjectCN?: string;
+    serialNumber?: string;
+    fingerprintSha256?: string;
+    signatureAlgorithm?: string;
+  };
+}
+
+export async function viewSslCertificate(
+  credentialId: number,
+  certId: string,
+): Promise<ApiResponse<SslCertificateView>> {
+  const res = await api.get(
+    `/ssl/certificates/${encodeURIComponent(certId)}/view?credentialId=${credentialId}`,
+  );
+  return res as unknown as ApiResponse<SslCertificateView>;
+}
+
+export async function deploySslCertificate(
+  certId: string,
+): Promise<ApiResponse<{ id: number; status: string }>> {
+  const res = await api.post('/ssl/certificates/deploy', { certId });
+  return res as unknown as ApiResponse<{ id: number; status: string }>;
 }
 
 export interface CleanExpiredResult {

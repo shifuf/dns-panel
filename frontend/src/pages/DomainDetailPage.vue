@@ -261,12 +261,14 @@ async function loadAccelerationDomainsForZone(): Promise<ResolvedAccelerationDom
   return results.flat();
 }
 
-const { data: accelerationDomainsData } = useQuery({
+const { data: accelerationDomainsData, refetch: refetchAccelerationDomains } = useQuery({
   queryKey: accelerationDomainsQueryKey,
   queryFn: loadAccelerationDomainsForZone,
   enabled: computed(() => !!zoneName.value && accelerationCredentials.value.length > 0 && hasAccelerationCandidates.value),
   retry: false,
-  staleTime: 120_000,
+  // Badges track the cloud state; keep the stale window short and allow a
+  // manual refresh so "已加速" never lingers after a pause/delete.
+  staleTime: 30_000,
 });
 
 const accelerationDomainMap = computed(() => {
@@ -495,6 +497,11 @@ async function handleRefresh() {
   try {
     await refreshDNSRecords(zoneId.value, credentialId.value);
     await refetchRecords();
+    // Also refresh the acceleration badges so paused/deleted cloud domains
+    // don't linger as "已加速" on the DNS records table.
+    if (accelerationCredentials.value.length > 0 && hasAccelerationCandidates.value) {
+      refetchAccelerationDomains().catch(() => undefined);
+    }
     message.success('已刷新');
   } catch (err: any) {
     message.error(String(err));

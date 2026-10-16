@@ -642,13 +642,24 @@ async function loadManagedSslCertificates(preferredHosts: string[] = bindHosts.v
 }
 
 async function refreshAll() {
-  await Promise.all([
-    loadCredentials(false, true),
-    loadDnsCredentials(),
-    loadSslCredentials(),
-  ]);
+  try {
+    await Promise.all([
+      loadCredentials(false, true),
+      loadDnsCredentials(),
+      loadSslCredentials(),
+    ]);
+  } catch (err: any) {
+    // loadCredentials(silent) rethrows so callers can react; without this
+    // catch the initial load produced an unhandled rejection and a blank UI.
+    connectionNotice.value = { type: 'warning', text: `加载 EdgeOne 账户失败：${asErrorText(err)}` };
+    return;
+  }
   if (credentialId.value) {
-    await loadSites(undefined, { silent: false });
+    try {
+      await loadSites(undefined, { silent: false });
+    } catch {
+      // loadSites already surfaced the error via message when not silent
+    }
   }
 }
 
@@ -726,7 +737,7 @@ async function doVerify() {
   if (!credentialId.value || !site.value?.zoneName) return;
   verifying.value = true;
   try {
-    await verifyAccelerationSite({
+    const res = await verifyAccelerationSite({
       credentialId: credentialId.value,
       provider,
       zoneName: site.value.zoneName,
@@ -734,7 +745,15 @@ async function doVerify() {
       verificationCode: verificationCode.value.trim() || verification.value?.verificationCode || verification.value?.recordValue || undefined,
     });
     await loadSites(site.value.siteId, { silent: true });
-    message.success('验证请求已提交');
+    // Honor the actual verification outcome — the API may return fail with
+    // HTTP 200, in which case claiming success misleads the user.
+    const data: any = res?.data || {};
+    const passed = data.passed === true || ['success', 'verified', 'active', 'online', 'finished', 'completed'].includes(String(data.status || '').toLowerCase());
+    if (data.passed === false || (data.status && !passed)) {
+      message.warning(`验证未通过（${data.status || 'fail'}），请确认 DNS 记录已生效后重试`);
+    } else {
+      message.success('验证请求已提交，请稍候刷新查看状态');
+    }
   } catch (err: any) {
     message.error(asErrorText(err));
   } finally {
@@ -1090,11 +1109,13 @@ async function bindCertificate() {
       loadCertificates({ silent: true, skipLoadingFlag: true }),
     ]);
     const boundItems = res.data?.certificates || res.data?.items || [];
+    // Only report the certificate we actually matched — falling back to the
+    // first list item could describe some other (or an older) certificate.
     const boundCert = boundItems.find((item) =>
       normalizeCertificateId(String(item.certId || item.certificateId || '')) === normalizeCertificateId(certBindForm.value.certId),
-    ) || boundItems[0];
-    const summary = describeCertificate(boundCert);
-    message.success(summary ? `证书已绑定：${summary}` : '证书已绑定');
+    );
+    const summary = boundCert ? describeCertificate(boundCert) : '';
+    message.success(summary ? `证书已绑定：${summary}` : '证书绑定成功');
   } catch (err: any) {
     message.error(asErrorText(err));
   } finally {
@@ -1149,11 +1170,16 @@ watch(siteId, async (value, prev) => {
 });
 
 onMounted(async () => {
-  await Promise.all([
-    loadCredentials(true, true),
-    loadDnsCredentials(),
-    loadSslCredentials(),
-  ]);
+  try {
+    await Promise.all([
+      loadCredentials(true, true),
+      loadDnsCredentials(),
+      loadSslCredentials(),
+    ]);
+  } catch (err: any) {
+    connectionNotice.value = { type: 'warning', text: `加载 EdgeOne 账户失败：${asErrorText(err)}` };
+    return;
+  }
   if (credentialId.value) {
     try {
       await loadSites(undefined, { silent: true });
@@ -1327,7 +1353,7 @@ onMounted(async () => {
         <div><label class="mb-1 block text-sm text-slate-500">站点域名</label><NInput v-model:value="siteForm.zoneName" placeholder="example.com" /></div>
         <div class="grid gap-4 md:grid-cols-2">
           <div><label class="mb-1 block text-sm text-slate-500">接入方式</label><NSelect v-model:value="siteForm.type" :options="[{ label: 'partial', value: 'partial' }, { label: 'full', value: 'full' }]" /></div>
-          <div><label class="mb-1 block text-sm text-slate-500">区域</label><NSelect v-model:value="siteForm.area" :options="[{ label: 'global', value: 'global' }, { label: 'china', value: 'china' }]" /></div>
+          <div><label class="mb-1 block text-sm text-slate-500">区域</label><NSelect v-model:value="siteForm.area" :options="[{ label: '全球可用区（global）', value: 'global' }, { label: '中国大陆（mainland）', value: 'mainland' }, { label: '海外（overseas）', value: 'overseas' }]" /></div>
         </div>
         <div><label class="mb-1 block text-sm text-slate-500">套餐 ID（可选）</label><NInput v-model:value="siteForm.planId" placeholder="plan-xxxxxx" /></div>
         <div class="flex justify-end gap-3"><NButton @click="showSiteModal = false">取消</NButton><NButton type="primary" :loading="savingSite" @click="saveSite">创建</NButton></div>
@@ -1353,7 +1379,7 @@ onMounted(async () => {
         </div>
         <div class="grid gap-4 md:grid-cols-2">
           <div><label class="mb-1 block text-sm text-slate-500">备用源站</label><NInput v-model:value="domainForm.backupOriginValue" placeholder="可选，备用 IP 或域名" /></div>
-          <div><label class="mb-1 block text-sm text-slate-500">IPv6 访问</label><NSelect v-model:value="domainForm.ipv6Status" :options="[{ label: '遵循站点配置', value: 'follow' }, { label: '关闭', value: 'close' }]" /></div>
+          <div><label class="mb-1 block text-sm text-slate-500">IPv6 访问</label><NSelect v-model:value="domainForm.ipv6Status" :options="[{ label: '遵循站点配置（follow）', value: 'follow' }, { label: '开启（on）', value: 'on' }, { label: '关闭（off）', value: 'off' }]" /></div>
         </div>
         <div class="grid gap-4 md:grid-cols-3">
           <div><label class="mb-1 block text-sm text-slate-500">回源协议</label><NSelect v-model:value="domainForm.originProtocol" :options="[{ label: '协议跟随', value: 'FOLLOW' }, { label: 'HTTP', value: 'HTTP' }, { label: 'HTTPS', value: 'HTTPS' }]" /></div>

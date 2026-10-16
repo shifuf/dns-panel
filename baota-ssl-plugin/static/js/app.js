@@ -69,6 +69,18 @@ var dnspanel_ssl = {
         var badge = d.connectionOk
             ? '<span class="dps-badge ok">已连接</span>'
             : (d.configured ? '<span class="dps-badge err">连接失败</span>' : '<span class="dps-badge warn">未配置</span>');
+        // Plugin version: warn when the panel expects a newer release so
+        // stale installs (missing new features/fixes) are visible at a glance.
+        var versionHtml = '';
+        if (d.pluginUpdate && d.pluginUpdate.expectedVersion) {
+            versionHtml = '<div class="dps-alert warn" style="margin-bottom:14px;">'
+                + '插件有新版本：当前 v' + this.esc(d.pluginVersion || d.pluginUpdate.currentVersion || '?')
+                + ' → 面板要求 v' + this.esc(d.pluginUpdate.expectedVersion) + '。'
+                + (d.pluginUpdate.releaseNotes ? '更新内容：' + this.esc(d.pluginUpdate.releaseNotes) + '。' : '')
+                + '请到宝塔「软件商店 → 第三方插件」重新上传安装包更新。</div>';
+        } else if (d.pluginVersion) {
+            versionHtml = '<div class="dps-alert info" style="margin-bottom:14px;">插件版本 v' + this.esc(d.pluginVersion) + '（已是最新）</div>';
+        }
         // Auto-renew status is read LIVE from the panel (panelRenew) — the panel
         // scheduler is the source of truth. When the panel is unreachable we fall
         // back to the local BaoTa cron flag (autoSync).
@@ -78,6 +90,7 @@ var dnspanel_ssl = {
             ? '<span class="dps-badge ok">已开启</span>'
             : '<span class="dps-badge warn">未开启</span>';
         var html = ''
+            + versionHtml
             + '<div class="dps-card">'
             + '  <h3>运行状态</h3>'
             + '  <div class="dps-grid">'
@@ -242,19 +255,44 @@ var dnspanel_ssl = {
         for (var i = 0; i < certs.length; i++) {
             var c = certs[i];
             var site = c.matchedSite || '';
+            var deployedSites = c.deployedSites || (c.deployed && site ? [site] : []);
+            var pendingSites = c.pendingSites || (site && !c.deployed ? [site] : []);
             if (site) matchedCount++;
-            if (c.deployed) deployedCount++;
-            var siteCell = site
-                ? '<span class="font-mono">' + this.esc(site) + '</span>'
-                : '<span class="dps-badge warn">未匹配站点</span>';
-            var statusCell = c.deployed
+            if (deployedSites.length) deployedCount++;
+            // 站点列：泛域名可能匹配/部署到多个站点，全部列出
+            var siteCell;
+            if (!site) {
+                siteCell = '<span class="dps-badge warn">未匹配站点</span>';
+            } else {
+                siteCell = '';
+                for (var d = 0; d < deployedSites.length; d++) {
+                    siteCell += '<div><span class="dps-badge ok" style="margin-right:4px;">已部署</span><span class="font-mono">' + this.esc(deployedSites[d]) + '</span></div>';
+                }
+                for (var p = 0; p < pendingSites.length; p++) {
+                    siteCell += '<div><span class="dps-badge warn" style="margin-right:4px;">未部署</span><span class="font-mono">' + this.esc(pendingSites[p]) + '</span></div>';
+                }
+                if (!deployedSites.length && !pendingSites.length) {
+                    siteCell = '<span class="font-mono">' + this.esc(site) + '</span>';
+                }
+            }
+            var deployed = deployedSites.length > 0 && pendingSites.length === 0;
+            var statusCell = deployed
                 ? '<span class="dps-badge ok">已部署</span>'
-                : (site ? '<span class="dps-badge warn">未部署</span>' : '<span style="color:#94a3b8">—</span>');
-            var actionCell = site
-                ? '<button class="dps-btn dps-btn-ghost dps-btn-sm" onclick="dnspanel_ssl.deploy_to(\''
-                    + this.esc(c.remoteCertId) + '\',' + (c.credentialId || 0) + ',\'' + this.esc(site) + '\')">'
-                    + (c.deployed ? '重新部署' : '部署') + '</button>'
-                : '<span style="color:#94a3b8;font-size:12px">无可部署站点</span>';
+                : (deployedSites.length ? '<span class="dps-badge info">部分部署</span>'
+                    : (site ? '<span class="dps-badge warn">未部署</span>' : '<span style="color:#94a3b8">—</span>'));
+            // 操作列：对每个匹配站点提供部署按钮
+            var actionCell = '';
+            var targets = deployedSites.concat(pendingSites);
+            if (!targets.length && site) targets = [site];
+            if (targets.length) {
+                for (var t = 0; t < targets.length; t++) {
+                    actionCell += '<button class="dps-btn dps-btn-ghost dps-btn-sm" style="margin:2px 4px 2px 0;" onclick="dnspanel_ssl.deploy_to(\''
+                        + this.esc(c.remoteCertId) + '\',' + (c.credentialId || 0) + ',\'' + this.esc(targets[t]) + '\')">'
+                        + (deployedSites.indexOf(targets[t]) >= 0 ? '重新部署到 ' : '部署到 ') + this.esc(targets[t]) + '</button>';
+                }
+            } else {
+                actionCell = '<span style="color:#94a3b8;font-size:12px">无可部署站点</span>';
+            }
             // Source badge: Let's Encrypt certs (acme.sh) vs Tencent/uploaded.
             var srcLabel = c.sourceLabel || (c.provider === 'acme' ? "Let's Encrypt" : '腾讯云');
             var isLE = c.provider === 'acme' || c.source === 'letsencrypt';
@@ -276,7 +314,7 @@ var dnspanel_ssl = {
             + ' 张证书 · 匹配到站点 <b>' + matchedCount + '</b> · 已部署 <b>' + deployedCount + '</b></div>';
         $('#cert_list_body').html(
             summary
-            + '<table class="dps-table"><thead><tr><th>域名</th><th>来源</th><th>过期时间</th><th>自动续期</th><th>匹配站点</th><th>部署状态</th><th>操作</th></tr></thead>'
+            + '<table class="dps-table"><thead><tr><th>域名</th><th>来源</th><th>过期时间</th><th>自动续期</th><th>匹配/部署站点</th><th>部署状态</th><th>操作</th></tr></thead>'
             + '<tbody>' + rows + '</tbody></table>');
     },
 
