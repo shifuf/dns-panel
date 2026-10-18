@@ -670,6 +670,160 @@ class TencentEdgeOneApi:
             })
         return {"items": items, "requestId": resp.get("RequestId"), "zoneId": zid}
 
+    @staticmethod
+    def _as_response_list(resp: Dict[str, Any], keys: List[str]) -> List[Dict[str, Any]]:
+        """First list value found under any of `keys` (TEO field names vary)."""
+        for key in keys:
+            value = resp.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return []
+
+    @staticmethod
+    def _normalize_certificate_id(certificate: Dict[str, Any], host: str = "") -> str:
+        """Certificate ID out of a CertificateInfo block.
+
+        The TEO field naming is not stable across versions (CertId / CertificateId
+        / Id), so every spelling is read here. The ApplyFreeCertificate response
+        names the certificate ID `From`, hence that key too.
+        """
+        block = certificate if isinstance(certificate, dict) else {}
+        if host:
+            for alias in (host, host.lstrip("*.")):
+                entries = block.get(alias)
+                if isinstance(entries, list):
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        found = TencentEdgeOneApi._normalize_certificate_id(entry)
+                        if found:
+                            return found
+        for key in (
+            "CertId", "CertificateId", "Id", "CertificateID",
+            "From", "FromId", "CertID", "ServerCertId",
+        ):
+            value = str(block.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def apply_free_certificate(self, zone_id: str, domain_names: List[str]) -> Dict[str, Any]:
+        """Request EdgeOne-managed FREE certificates for the given domains.
+
+        Uses the real TEO API (ApplyFreeCertificate + CheckFreeCertificateVerification).
+        The old ``CreateCertificate`` action does not exist in the TEO API and
+        always failed with InvalidAction — callers got a confusing hard error.
+
+        The response's `Certificates` list is parsed through to per-domain
+        certificate IDs: without the ID the freshly applied certificate cannot be
+        bound to an acceleration domain, and the accelerated host kept serving
+        EdgeOne's default (or a stale) certificate.
+        """
+        zid = str(zone_id or "").strip()
+        normalized = [self.normalize_domain_name(item) for item in (domain_names or []) if self.normalize_domain_name(item)]
+        if not zid or not normalized:
+            raise TencentEdgeOneApiError("缺少站点 ID 或域名", 400)
+        resp = self._tc3_request("ApplyFreeCertificate", {"ZoneId": zid, "DomainNames": normalized})
+        check: Dict[str, Any] = {}
+        try:
+            check = self.check_free_certificate_verification(zid, normalized)
+        except TencentEdgeOneApiError:
+            check = {}
+        certificates: List[Dict[str, Any]] = []
+        for entry in self._as_response_list(resp, ["Certificates", "CertificateInfos", "CertificateData"]):
+            names = entry.get("DomainNames") or entry.get("Domains") or entry.get("Domain")
+            if isinstance(names, str):
+                names = [names]
+            if not isinstance(names, list):
+                names = []
+            names = [self.normalize_domain_name(item) for item in names if self.normalize_domain_name(item)]
+            cert_id = self._normalize_certificate_id(entry, names[0] if names else "")
+            if not cert_id and not names:
+                continue
+            certificates.append({"certId": cert_id, "domainNames": names, "raw": entry})
+        for name in normalized:
+            if any(name in item["domainNames"] for item in certificates):
+                continue
+            cert_id = self._normalize_certificate_id(resp, name)
+            if cert_id:
+                certificates.append({"certId": cert_id, "domainNames": [name], "raw": {}})
+        return {
+            "zoneId": zid,
+            "domainNames": normalized,
+            "applied": True,
+            "check": check,
+            "certificates": certificates,
+            "requestId": resp.get("RequestId"),
+            "raw": resp,
+        }
+
+    def lookup_host_certificate_ids(self, zone_id: str, hosts: List[str]) -> Dict[str, str]:
+        """Certificate IDs EdgeOne reports for `hosts` right now.
+
+        Fallback for certificates whose ID was never captured from the apply
+        response: DescribeHostCertificates lists the certificate actually
+        attached to each accelerated host, and that ID can be reused for a later
+        re-bind.
+        """
+        zid = str(zone_id or "").strip()
+        normalized = [self.normalize_domain_name(item) for item in (hosts or []) if self.normalize_domain_name(item)]
+        if not zid or not normalized:
+            return {}
+        found: Dict[str, str] = {}
+        try:
+            data = self.describe_host_certificates(zid)
+        except TencentEdgeOneApiError:
+            return found
+        wanted = set(normalized)
+        for item in data.get("items") or []:
+            cert_id = str(item.get("certificateId") or "").strip()
+            if not cert_id:
+                continue
+            for host in (item.get("hosts") or [item.get("host")]):
+                host_name = self.normalize_domain_name(host)
+                if host_name in wanted and host_name not in found:
+                    found[host_name] = cert_id
+        return found
+
+    def describe_certificates(self, zone_id: str = "", certificate_ids: List[str] | None = None) -> Dict[str, Any]:
+        """Certificate details (status / validity / covering hosts).
+
+        Answers "is the certificate EdgeOne serves still current?": the
+        accelerated copy expires on its own schedule and must be re-pointed when
+        the panel renews the certificate.
+        """
+        zids = [str(item).strip() for item in ([zone_id] if isinstance(zone_id, str) else list(zone_id or [])) if str(item or "").strip()]
+        cert_ids = [str(item).strip() for item in (certificate_ids or []) if str(item or "").strip()]
+        if not zids and not cert_ids:
+            raise TencentEdgeOneApiError("缺少站点 ID 或证书 ID", 400)
+        payload: Dict[str, Any] = {}
+        if zids:
+            payload["ZoneIds"] = zids
+        if cert_ids:
+            payload["Filters"] = [{"Name": "cert-id", "Values": cert_ids}]
+        resp = self._tc3_request("DescribeCertificates", payload)
+        items: List[Dict[str, Any]] = []
+        for entry in self._as_response_list(resp, ["Certificates", "CertificateInfos", "Items"]):
+            names = entry.get("DomainNames") or entry.get("Domains") or entry.get("Domain")
+            if isinstance(names, str):
+                names = [names]
+            if not isinstance(names, list):
+                names = []
+            cert_id = self._normalize_certificate_id(entry)
+            items.append({
+                "certificateId": cert_id,
+                "certId": cert_id,
+                "domainNames": [self.normalize_domain_name(item) for item in names if self.normalize_domain_name(item)],
+                "status": str(entry.get("Status") or entry.get("CertStatus") or "").strip(),
+                "type": str(entry.get("Type") or entry.get("CertificateType") or "").strip(),
+                "effectiveTime": entry.get("EffectiveTime") or entry.get("NotBefore") or entry.get("DeployTime"),
+                "expireTime": entry.get("ExpireTime") or entry.get("NotAfter") or entry.get("ExpiredTime"),
+                "signAlgo": str(entry.get("SignAlgo") or "").strip(),
+                "requestId": resp.get("RequestId"),
+                "raw": entry,
+            })
+        return {"items": items, "certificates": items, "requestId": resp.get("RequestId"), "zoneIds": zids}
+
     def describe_host_certificates(self, zone_id: str, hosts: List[str] | None = None) -> Dict[str, Any]:
         zid = str(zone_id or "").strip()
         if not zid:

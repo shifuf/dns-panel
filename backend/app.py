@@ -830,6 +830,29 @@ def init_db() -> None:
         c.execute("CREATE INDEX IF NOT EXISTS idx_accel_cert_requests_pending ON acceleration_cert_requests(userId, status, updatedAt)")
         c.execute(
             """
+            CREATE TABLE IF NOT EXISTS acceleration_cert_bindings (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              userId INTEGER NOT NULL,
+              provider TEXT NOT NULL DEFAULT 'edgeone',
+              accelerationCredentialId INTEGER NOT NULL,
+              siteId TEXT NOT NULL,
+              domainName TEXT NOT NULL,
+              source TEXT NOT NULL DEFAULT 'tencent',
+              certRemoteId TEXT NOT NULL,
+              edgeCertId TEXT,
+              fingerprint TEXT,
+              notAfter TEXT,
+              status TEXT NOT NULL DEFAULT 'pending',
+              lastError TEXT,
+              syncedAt DATETIME,
+              createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accel_cert_binding_domain ON acceleration_cert_bindings(userId, accelerationCredentialId, siteId, domainName)")
+        c.execute(
+            """
             CREATE TABLE IF NOT EXISTS dns_record_history (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               userId INTEGER NOT NULL,
@@ -2818,6 +2841,18 @@ def _ssl_autorenew_worker() -> None:
                             outcome = _check_ssl_expiry_notifications(int(u["id"]))
                             if outcome.get("notified"):
                                 done.append(f"{u['username']}(到期提醒{outcome['notified']})")
+                        except Exception:
+                            pass
+                        # Safety net: re-bind the latest certificate to every
+                        # EdgeOne acceleration domain. Catches drift where the
+                        # edge is still serving an older cert (renewal happened
+                        # but the site plugin hasn't redeployed, or the cloud
+                        # cert was rotated out of band).
+                        try:
+                            sync = _post("/api/ssl/certificates/sync-edgeone", {})
+                            n = int((sync.get("data") or {}).get("totalSynced") or 0)
+                            if n:
+                                done.append(f"{u['username']}(加速同步{n})")
                         except Exception:
                             pass
                     except Exception:

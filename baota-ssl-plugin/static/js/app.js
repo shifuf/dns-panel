@@ -257,6 +257,7 @@ var dnspanel_ssl = {
             var site = c.matchedSite || '';
             var deployedSites = c.deployedSites || (c.deployed && site ? [site] : []);
             var pendingSites = c.pendingSites || (site && !c.deployed ? [site] : []);
+            var staleSites = c.staleSites || [];
             if (site) matchedCount++;
             if (deployedSites.length) deployedCount++;
             // 站点列：泛域名可能匹配/部署到多个站点，全部列出
@@ -265,11 +266,26 @@ var dnspanel_ssl = {
                 siteCell = '<span class="dps-badge warn">未匹配站点</span>';
             } else {
                 siteCell = '';
+                var viaTags = c.deployedVia || {};
                 for (var d = 0; d < deployedSites.length; d++) {
-                    siteCell += '<div><span class="dps-badge ok" style="margin-right:4px;">已部署</span><span class="font-mono">' + this.esc(deployedSites[d]) + '</span></div>';
+                    var viaLabel = viaTags[deployedSites[d]] || '手工部署';
+                    siteCell += '<div class="dps-site-row">'
+                        + '<span class="dps-badge ok">已部署</span>'
+                        + '<span class="font-mono">' + this.esc(deployedSites[d]) + '</span>'
+                        + '<span class="dps-badge src">' + this.esc(viaLabel) + '</span>'
+                        + '</div>';
+                }
+                for (var s = 0; s < staleSites.length; s++) {
+                    siteCell += '<div class="dps-site-row">'
+                        + '<span class="dps-badge info">已部署(有新版)</span>'
+                        + '<span class="font-mono">' + this.esc(staleSites[s]) + '</span>'
+                        + '</div>';
                 }
                 for (var p = 0; p < pendingSites.length; p++) {
-                    siteCell += '<div><span class="dps-badge warn" style="margin-right:4px;">未部署</span><span class="font-mono">' + this.esc(pendingSites[p]) + '</span></div>';
+                    siteCell += '<div class="dps-site-row">'
+                        + '<span class="dps-badge warn">未部署</span>'
+                        + '<span class="font-mono">' + this.esc(pendingSites[p]) + '</span>'
+                        + '</div>';
                 }
                 if (!deployedSites.length && !pendingSites.length) {
                     siteCell = '<span class="font-mono">' + this.esc(site) + '</span>';
@@ -280,16 +296,31 @@ var dnspanel_ssl = {
                 ? '<span class="dps-badge ok">已部署</span>'
                 : (deployedSites.length ? '<span class="dps-badge info">部分部署</span>'
                     : (site ? '<span class="dps-badge warn">未部署</span>' : '<span style="color:#94a3b8">—</span>'));
-            // 操作列：对每个匹配站点提供部署按钮
+            // 到期时间：可读日期 + 剩余天数，避免 ISO 串难读。
+            var expiryCell;
+            if (c.notAfter) {
+                var expiryDate = String(c.notAfter).slice(0, 10);
+                var expiryDays = (typeof c.daysRemaining === 'number') ? c.daysRemaining : null;
+                var expiryCls = (expiryDays !== null && expiryDays < 0) ? 'err' : ((expiryDays !== null && expiryDays <= 30) ? 'warn' : 'ok');
+                expiryCell = '<div class="dps-cell-main">' + this.esc(expiryDate) + '</div>'
+                    + (expiryDays === null ? '' : '<span class="dps-badge ' + expiryCls + '">剩余 ' + expiryDays + ' 天</span>');
+            } else {
+                expiryCell = '<span style="color:#94a3b8">-</span>';
+            }
+            // 操作：按站点排列成整齐的按钮列。
             var actionCell = '';
             var targets = deployedSites.concat(pendingSites);
             if (!targets.length && site) targets = [site];
             if (targets.length) {
+                actionCell = '<div class="dps-btn-stack">';
                 for (var t = 0; t < targets.length; t++) {
-                    actionCell += '<button class="dps-btn dps-btn-ghost dps-btn-sm" style="margin:2px 4px 2px 0;" onclick="dnspanel_ssl.deploy_to(\''
+                    var isDeployed = deployedSites.indexOf(targets[t]) >= 0;
+                    actionCell += '<button class="dps-btn dps-btn-sm ' + (isDeployed ? 'dps-btn-ghost' : 'dps-btn-primary') + '"'
+                        + ' onclick="dnspanel_ssl.deploy_to(\''
                         + this.esc(c.remoteCertId) + '\',' + (c.credentialId || 0) + ',\'' + this.esc(targets[t]) + '\')">'
-                        + (deployedSites.indexOf(targets[t]) >= 0 ? '重新部署到 ' : '部署到 ') + this.esc(targets[t]) + '</button>';
+                        + (isDeployed ? '重新部署 ' : '部署到 ') + this.esc(targets[t]) + '</button>';
                 }
+                actionCell += '</div>';
             } else {
                 actionCell = '<span style="color:#94a3b8;font-size:12px">无可部署站点</span>';
             }
@@ -300,13 +331,24 @@ var dnspanel_ssl = {
             // Auto-renew: acme certs carry a status; others renew via panel scheduler.
             var renewLabel = c.autoRenewLabel || (c.provider === 'acme' ? '自动续期' : '面板托管');
             var renewCell = '<span style="font-size:12px;color:#64748b">' + this.esc(renewLabel) + '</span>';
+            // EdgeOne acceleration cert status for this certificate's domain.
+            var eo = c.edgeOne || { state: 'none' };
+            var edgeCell = '<span style="color:#94a3b8;font-size:12px">未加速</span>';
+            if (eo.state === 'synced') {
+                edgeCell = '<span class="dps-badge ok">已同步</span>';
+            } else if (eo.state === 'stale') {
+                edgeCell = '<span class="dps-badge warn" title="加速边缘绑定的是旧证书，请在面板「任务 → 加速绑定」重新同步">加速需同步</span>';
+            } else if (eo.state === 'failed') {
+                edgeCell = '<span class="dps-badge err" title="上次同步到加速域名失败">加速同步失败</span>';
+            }
             rows += '<tr>'
                 + '<td><strong>' + this.esc(c.domain || '-') + '</strong></td>'
                 + '<td>' + sourceCell + '</td>'
-                + '<td>' + this.esc(c.notAfter || '-') + '</td>'
+                + '<td>' + expiryCell + '</td>'
                 + '<td>' + renewCell + '</td>'
                 + '<td>' + siteCell + '</td>'
                 + '<td>' + statusCell + '</td>'
+                + '<td>' + edgeCell + '</td>'
                 + '<td>' + actionCell + '</td>'
                 + '</tr>';
         }
@@ -314,8 +356,8 @@ var dnspanel_ssl = {
             + ' 张证书 · 匹配到站点 <b>' + matchedCount + '</b> · 已部署 <b>' + deployedCount + '</b></div>';
         $('#cert_list_body').html(
             summary
-            + '<table class="dps-table"><thead><tr><th>域名</th><th>来源</th><th>过期时间</th><th>自动续期</th><th>匹配/部署站点</th><th>部署状态</th><th>操作</th></tr></thead>'
-            + '<tbody>' + rows + '</tbody></table>');
+            + '<div class="dps-table-wrap"><table class="dps-table"><thead><tr><th>域名</th><th>来源</th><th>过期时间</th><th>自动续期</th><th>匹配/部署站点</th><th>部署状态</th><th>加速</th><th>操作</th></tr></thead>'
+            + '<tbody>' + rows + '</tbody></table></div>');
     },
 
     // ── Apply for a new certificate ──────────────────────────────
@@ -500,7 +542,9 @@ var dnspanel_ssl = {
     },
 
     // Deploy directly to a known site (matched server-side), then refresh list.
-    deploy_to: function (certId, credentialId, siteName) {
+    // after: optional callback invoked after a successful deploy (used by the
+    // site-check view to re-run the detection instead of jumping to the list).
+    deploy_to: function (certId, credentialId, siteName, after) {
         var that = this;
         layer.confirm('将证书部署到站点「' + siteName + '」并重载 Web 服务？', { btn: ['确定', '取消'] }, function (index) {
             layer.close(index);
@@ -509,7 +553,10 @@ var dnspanel_ssl = {
             that.request('deploy', { certId: certId, credentialId: credentialId, siteName: siteName, force: true }, function (rdata) {
                 layer.close(loadIdx);
                 that.handle(rdata,
-                    function () { that.showMsg('已部署到 ' + siteName, 1); that.show_certs(); },
+                    function () {
+                        that.showMsg('已部署到 ' + siteName, 1);
+                        if (typeof after === 'function') { after(); } else { that.show_certs(); }
+                    },
                     function (err) { that.showMsg(err, 2); });
             });
         });
@@ -585,31 +632,82 @@ var dnspanel_ssl = {
             var it = items[i];
             var st = stateMap[it.state] || ['info', it.state];
             var badge = '<span class="dps-badge ' + st[0] + '">' + st[1] + '</span>';
-            var inst = it.deployed
-                ? (it.installedDaysRemaining == null ? '（无法解析）' : ('剩余 ' + it.installedDaysRemaining + ' 天'))
-                : '未部署证书';
-            var best = it.bestCertDomain
-                ? (this.esc(it.bestCertDomain) + (it.bestCertDaysRemaining == null ? '' : ('（剩余 ' + it.bestCertDaysRemaining + ' 天）')))
-                : '面板暂无';
-            var actionCell = '';
-            if ((it.state === 'update' || it.state === 'missing' || it.state === 'error') && it.bestCertId) {
-                actionCell = '<button class="dps-btn dps-btn-primary dps-btn-sm" onclick="dnspanel_ssl.deploy_to(\''
-                    + this.esc(it.bestCertId) + '\',' + (it.bestCertCredentialId || 0) + ',\'' + this.esc(it.site) + '\')">立即部署</button>';
-            } else if (it.state === 'expired') {
-                actionCell = '<button class="dps-btn dps-btn-ghost dps-btn-sm" onclick="dnspanel_ssl.show_issue()">去申请证书</button>';
-            } else if (it.state === 'expiring') {
-                actionCell = '<button class="dps-btn dps-btn-ghost dps-btn-sm" onclick="dnspanel_ssl.sync_now()">触发续期同步</button>';
-            } else {
-                actionCell = '<span style="color:#94a3b8;font-size:12px">—</span>';
+
+            // 已部署证书：站点的 nginx/apache 配置实际引用的证书（可能多张）。
+            var installed = it.installedCerts || [];
+            if (!installed.length && it.deployed) {
+                // 兼容旧版后端字段
+                installed = [{ names: it.installedNames || [], daysRemaining: it.installedDaysRemaining }];
             }
+            var instHtml;
+            if (!installed.length) {
+                instHtml = '<span style="color:#94a3b8;font-size:12px">未部署证书</span>';
+            } else {
+                instHtml = '';
+                for (var k = 0; k < installed.length; k++) {
+                    var ic = installed[k];
+                    var icUnknown = (ic.daysRemaining === null || ic.daysRemaining === undefined);
+                    var icDays = icUnknown ? '有效期未知' : ('剩余 ' + ic.daysRemaining + ' 天');
+                    var icCls = (!icUnknown && ic.daysRemaining < 0) ? 'err' : 'ok';
+                    var icNames = (ic.names && ic.names.length) ? ic.names.join(', ') : '（无法解析域名）';
+                    instHtml += '<div style="margin-bottom:3px;">'
+                        + '<span class="dps-badge ' + icCls + '">' + this.esc(icDays) + '</span>'
+                        + '<div style="font-size:11px;color:#64748b;word-break:break-all;">' + this.esc(icNames) + '</div>'
+                        + (ic.sources && ic.sources.length ? '<div style="margin-top:3px"><span class="dps-badge src">' + this.esc(ic.sources.join(' / ')) + '</span></div>' : '')
+                        + (ic.chainComplete === false ? '<div style="margin-top:3px"><span class="dps-badge err">证书链不完整（缺中间证书）</span></div>' : '')
+                        + '</div>';
+                }
+            }
+
+            // 面板候选证书：全部未过期且匹配站点，用户可自行选择要部署哪一张。
+            var cands = it.panelCerts || [];
+            if (!cands.length && it.bestCertId) {
+                // 兼容旧版后端字段
+                cands = [{
+                    id: it.bestCertId,
+                    credentialId: it.bestCertCredentialId,
+                    domain: it.bestCertDomain,
+                    daysRemaining: it.bestCertDaysRemaining
+                }];
+            }
+            var candHtml, actionCell;
+            if (cands.length) {
+                var opts = '';
+                for (var c = 0; c < cands.length; c++) {
+                    var cc = cands[c];
+                    var tail = (cc.daysRemaining === null || cc.daysRemaining === undefined)
+                        ? '' : ('（剩余 ' + cc.daysRemaining + ' 天）');
+                    var label = (cc.domain || '（未知域名）') + tail;
+                    if (cc.sourceLabel) label += ' · ' + cc.sourceLabel;
+                    opts += '<option value="' + this.esc(cc.id) + '|' + (cc.credentialId || 0) + '">'
+                        + this.esc(label) + '</option>';
+                }
+                candHtml = '<select id="site_cand_' + i + '" class="dps-input" style="min-width:210px;padding:4px 6px;font-size:12px;">'
+                    + opts + '</select>'
+                    + (cands.length > 1
+                        ? '<div style="font-size:11px;color:#64748b;margin-top:2px;">共 ' + cands.length + ' 张可用证书，切换后点「部署所选」</div>'
+                        : '');
+                actionCell = '<button class="dps-btn dps-btn-primary dps-btn-sm" onclick="dnspanel_ssl.deploy_selected('
+                    + i + ',\'' + this.esc(it.site) + '\')">部署所选</button>';
+            } else {
+                candHtml = '<span style="color:#94a3b8;font-size:12px">面板暂无</span>';
+                if (it.state === 'expired') {
+                    actionCell = '<button class="dps-btn dps-btn-ghost dps-btn-sm" onclick="dnspanel_ssl.show_issue()">去申请证书</button>';
+                } else if (it.state === 'expiring') {
+                    actionCell = '<button class="dps-btn dps-btn-ghost dps-btn-sm" onclick="dnspanel_ssl.sync_now()">触发续期同步</button>';
+                } else {
+                    actionCell = '<span style="color:#94a3b8;font-size:12px">—</span>';
+                }
+            }
+
             var hostsText = (it.hosts || []).slice(0, 3).join(', ');
             rows += '<tr>'
                 + '<td><strong>' + this.esc(it.site) + '</strong>'
                 + (it.hosts && it.hosts.length > 1 ? '<div style="font-size:11px;color:#94a3b8">' + this.esc(hostsText) + '</div>' : '')
                 + '</td>'
                 + '<td>' + badge + '<div style="font-size:11px;color:#64748b;margin-top:2px">' + this.esc(it.action || '') + '</div></td>'
-                + '<td>' + this.esc(inst) + '</td>'
-                + '<td>' + best + '</td>'
+                + '<td>' + instHtml + '</td>'
+                + '<td>' + candHtml + '</td>'
                 + '<td>' + actionCell + '</td>'
                 + '</tr>';
         }
@@ -617,8 +715,17 @@ var dnspanel_ssl = {
             + '共检测 <b>' + (summary.sites || 0) + '</b> 个站点 · 待更新 <b>' + (summary.needUpdate || 0) + '</b> 个 · 已过期 <b>' + (summary.expired || 0) + '</b> 个 · 已是最新 <b>' + (summary.ok || 0) + '</b> 个</div>';
         $('#site_check_body').html(
             summaryHtml
-            + '<table class="dps-table"><thead><tr><th>站点</th><th>状态</th><th>已部署证书</th><th>面板最佳证书</th><th>操作</th></tr></thead>'
-            + '<tbody>' + rows + '</tbody></table>');
+            + '<div class="dps-table-wrap"><table class="dps-table"><thead><tr><th>站点</th><th>状态</th><th>已部署证书</th><th>面板候选证书</th><th>操作</th></tr></thead>'
+            + '<tbody>' + rows + '</tbody></table></div>');
+    },
+
+    // 部署站点检测页里选中的候选证书，完成后刷新检测结果。
+    deploy_selected: function (index, siteName) {
+        var sel = document.getElementById('site_cand_' + index);
+        if (!sel || !sel.value) { this.showMsg('请选择要部署的证书', 2); return; }
+        var parts = String(sel.value).split('|');
+        var that = this;
+        this.deploy_to(parts[0], parts[1], siteName, function () { that.show_site_check(); });
     },
 
     sync_now: function () {

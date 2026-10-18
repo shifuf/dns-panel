@@ -227,6 +227,23 @@ class CloudflareApi:
         res = self._request("GET", f"/zones/{urllib.parse.quote(str(zone_id or '').strip())}/custom_hostnames")
         return res if isinstance(res, list) else []
 
+    def list_all_custom_hostnames(self, zone_id: str, max_pages: int = 10) -> List[Dict[str, Any]]:
+        """Paged listing (the bare list endpoint returns only the first page)."""
+        out: List[Dict[str, Any]] = []
+        page = 1
+        while page <= max_pages:
+            res = self._request(
+                "GET",
+                f"/zones/{urllib.parse.quote(str(zone_id or '').strip())}/custom_hostnames",
+                {"page": page, "per_page": 50},
+            )
+            batch = res if isinstance(res, list) else []
+            out.extend(x for x in batch if isinstance(x, dict))
+            if len(batch) < 50:
+                break
+            page += 1
+        return out
+
     def create_custom_hostname(self, zone_id: str, hostname: str, custom_origin_server: str | None = None) -> Dict[str, Any]:
         body: Dict[str, Any] = {"hostname": str(hostname or "").strip(), "ssl": {"method": "http", "type": "dv"}}
         if custom_origin_server:
@@ -242,6 +259,28 @@ class CloudflareApi:
             f"/zones/{urllib.parse.quote(str(zone_id or '').strip())}/custom_hostnames/{urllib.parse.quote(str(hostname_id or '').strip())}",
         )
         return True
+
+    def update_custom_hostname_custom_certificate(
+        self, zone_id: str, hostname_id: str, certificate_pem: str, private_key_pem: str,
+    ) -> Dict[str, Any]:
+        """Upload a panel-managed certificate onto a custom hostname
+        (ssl type=custom), replacing the previous edge certificate."""
+        body: Dict[str, Any] = {
+            "ssl": {
+                "method": "http",
+                "type": "custom",
+                "custom_certificate": str(certificate_pem or ""),
+                "custom_key": str(private_key_pem or ""),
+            }
+        }
+        res = self._request(
+            "PATCH",
+            f"/zones/{urllib.parse.quote(str(zone_id or '').strip())}/custom_hostnames/{urllib.parse.quote(str(hostname_id or '').strip())}",
+            body=body,
+        )
+        if not isinstance(res, dict):
+            raise CloudflareApiError("上传自定义主机名证书失败", 502)
+        return res
 
     def get_fallback_origin(self, zone_id: str) -> str:
         try:

@@ -252,6 +252,30 @@ MIGRATIONS: list[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_ssl_task_logs_user_time ON ssl_task_logs(userId, createdAt)",
     "CREATE INDEX IF NOT EXISTS idx_ssl_task_logs_filters ON ssl_task_logs(userId, taskType, status, source)",
+    # Tracks which SSL certificate is bound to each EdgeOne acceleration domain,
+    # so the panel can re-sync after renewal and detect/correct drift where the
+    # site serves a newer cert than the CDN node (the "cert looks expired" bug).
+    """
+    CREATE TABLE IF NOT EXISTS acceleration_cert_bindings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'edgeone',
+      accelerationCredentialId INTEGER NOT NULL,
+      siteId TEXT NOT NULL,
+      domainName TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'tencent',
+      certRemoteId TEXT NOT NULL,
+      edgeCertId TEXT,
+      fingerprint TEXT,
+      notAfter TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      lastError TEXT,
+      syncedAt DATETIME,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_accel_cert_binding_domain ON acceleration_cert_bindings(userId, accelerationCredentialId, siteId, domainName)",
 
     # ── system_settings table (global config, not per-user) ──
     """

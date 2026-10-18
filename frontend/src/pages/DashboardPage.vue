@@ -32,6 +32,7 @@ import {
   type DomainTagEntry,
 } from '@/services/dashboard';
 import { getStoredUser } from '@/services/auth';
+import { getSslEdgeOneBindings, type EdgeOneCertBinding } from '@/services/ssl';
 import { formatRelativeTime } from '@/utils/formatters';
 import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import type { Domain, Log } from '@/types';
@@ -417,6 +418,29 @@ const { data: auditLogsData } = useQuery({
   },
 });
 
+// ── CDN acceleration certificate drift (EdgeOne bindings health) ──
+// Polled on the overview so a stale/failed edge binding surfaces as a red
+// count before users notice a stale certificate in the browser.
+const { data: accelBindingsData } = useQuery({
+  queryKey: ['dashboard-accel-bindings'],
+  queryFn: async () => {
+    try {
+      const res = await getSslEdgeOneBindings();
+      return res.data || [] as EdgeOneCertBinding[];
+    } catch {
+      return [] as EdgeOneCertBinding[];
+    }
+  },
+  refetchInterval: 120_000,
+});
+const accelDriftBindings = computed(() =>
+  (accelBindingsData.value || []).filter(b => b.status === 'failed' || b.upToDate === false),
+);
+const accelDriftCount = computed(() => accelDriftBindings.value.length);
+function openAccelDrift() {
+  router.push({ path: '/ssl', query: { tasks: 'edgeone' } });
+}
+
 const logs24h = computed<Log[]>(() => logs24hData.value || []);
 const auditLogs = computed<Log[]>(() => auditLogsData.value || []);
 const remoteSyncJobs = computed<SyncJob[]>(() => remoteSyncJobsData.value || []);
@@ -763,6 +787,19 @@ const generatedAlertEvents = computed<AlertEvent[]>(() => {
       status: 'open',
       title: '同步任务失败',
       message: `24 小时内同步失败 ${failedSync} 次`,
+      createdAt: new Date().toISOString(),
+    });
+  }
+  // CDN 加速证书漂移：边缘仍在用旧证书/绑定失败。这是浏览器会看到"证书
+  // 过期"的直接原因，必须在概览页优先暴露。
+  if (accelDriftCount.value > 0) {
+    const names = accelDriftBindings.value.slice(0, 3).map(b => b.domainName).join('、');
+    list.push({
+      id: `gen-accel-drift-${accelDriftCount.value}`,
+      level: 'high',
+      status: 'open',
+      title: '加速绑定证书漂移',
+      message: `${accelDriftCount.value} 个加速域名的边缘证书需要重新同步（${names}${accelDriftCount.value > 3 ? ' 等' : ''}）`,
       createdAt: new Date().toISOString(),
     });
   }
@@ -1593,7 +1630,17 @@ watch(domains, (list) => {
           批量删除
         </NButton>
         <NButton size="small" secondary @click="showSyncCenter = true">同步任务</NButton>
-        <NButton size="small" secondary @click="showAlertCenter = true">告警中心</NButton>
+        <NButton size="small" secondary @click="showAlertCenter = true">
+          告警中心
+          <span
+            v-if="accelDriftCount > 0"
+            class="ml-1 inline-block h-2 w-2 rounded-full bg-red-500 animate-pulse"
+            title="存在加速绑定证书漂移，点击查看或前往 SSL 页重新同步"
+          />
+        </NButton>
+        <NButton v-if="accelDriftCount > 0" size="small" type="error" secondary @click="openAccelDrift">
+          加速证书漂移 {{ accelDriftCount }}
+        </NButton>
         <NButton size="small" secondary @click="showAuditCenter = true">变更审计</NButton>
         <NButton size="small" secondary @click="openSaveCurrentViewModal">保存视图</NButton>
         <NButton size="small" secondary @click="openTagCenter()">标签中心</NButton>

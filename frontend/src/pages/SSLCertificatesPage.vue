@@ -7,7 +7,8 @@ import {
   NButton, NTag, NDataTable, NModal, NFormItem, NInput, NSelect, NAlert,
   NEmpty, NSpin, NPagination, NDrawer, NDrawerContent, NDescriptions,
   NDescriptionsItem, NSwitch, NTooltip, NTabs, NTabPane, NInputNumber, NDropdown, useMessage, useDialog,
-} from 'naive-ui';import { RefreshCw, Search, Plus, Upload, Download, Trash2, Eye, CheckCircle, KeyRound, Pencil, AlertTriangle, RotateCw, ArrowUpDown, FileDown, ListChecks, FileText, Rocket, Copy } from 'lucide-vue-next';
+} from 'naive-ui';
+import { RefreshCw, Search, Plus, Upload, Download, Trash2, Eye, CheckCircle, KeyRound, Pencil, AlertTriangle, RotateCw, ArrowUpDown, FileDown, ListChecks, FileText, Rocket, Copy, Zap } from 'lucide-vue-next';
 import {
   getSslCredentials, createSslCredential, updateSslCredential, deleteSslCredential as deleteSslCred,
   getSslCertificates, getSslCertificateDetail, applySslCertificate,
@@ -21,8 +22,9 @@ import {
   viewSslCertificate, deploySslCertificate,
   batchDeploySslCertificates, batchSetSslAutoRenew, checkSslExpiry,
   getSslAcmeCas, getSslDeploymentsBySite,
+  getSslEdgeOneBindings, syncSslCertToEdgeOne,
 } from '@/services/ssl';
-import type { SslCaOption, SiteDeploymentOverview } from '@/services/ssl';
+import type { SslCaOption, SiteDeploymentOverview, EdgeOneCertBinding } from '@/services/ssl';
 import { getDnsCredentials } from '@/services/dnsCredentials';
 import { getDomains } from '@/services/domains';
 import AddZoneDialog from '@/components/Dashboard/AddZoneDialog.vue';
@@ -303,6 +305,23 @@ watch(certificates, (list) => {
 }, { immediate: true });
 // ── Persistent ACME jobs and incremental deployment events ─────
 const showTaskDrawer = ref(false);
+const taskDrawerTab = ref('acme');
+// Deep link from the overview: /ssl?tasks=edgeone opens the task drawer on the
+// 加速绑定 tab so a drift red-dot click lands exactly where the fix lives.
+{
+  const q = String(route.query.tasks || '').toLowerCase();
+  if (q === 'edgeone' || q === 'bindings') {
+    taskDrawerTab.value = 'edgeone';
+    showTaskDrawer.value = true;
+  }
+}
+watch(() => route.query.tasks, (val) => {
+  const q = String(val || '').toLowerCase();
+  if (q === 'edgeone' || q === 'bindings') {
+    taskDrawerTab.value = 'edgeone';
+    showTaskDrawer.value = true;
+  }
+});
 const deploymentStatusFilter = ref<string | null>(null);
 const deploymentSourceFilter = ref<string | null>(null);
 const deploymentDomainFilter = ref('');
@@ -345,11 +364,67 @@ const { data: siteDeployments, isFetching: siteDeploymentsFetching } = useQuery(
   refetchInterval: computed(() => showTaskDrawer.value ? 15000 : false),
 });
 
+// ── EdgeOne acceleration certificate bindings (task drawer "加速绑定" tab) ──
+// Runs always (not just when the drawer opens) so the toolbar can surface a
+// drift red-dot when the CDN edge is serving a stale cert.
+const { data: edgeOneBindings, isFetching: edgeOneBindingsFetching } = useQuery({
+  queryKey: ['ssl-edgeone-bindings'],
+  queryFn: async () => (await getSslEdgeOneBindings()).data || [] as EdgeOneCertBinding[],
+  enabled: computed(() => !!selectedCredentialId.value),
+  staleTime: 30_000,
+  refetchInterval: computed(() => showTaskDrawer.value ? 20000 : 60000),
+});
+
+// Bindings whose edge cert is stale or whose last sync failed.
+const edgeOneDriftCount = computed(() =>
+  (edgeOneBindings.value || []).filter(b =>
+    b.status === 'failed' || b.upToDate === false,
+  ).length,
+);
+
+function openTaskDrawer() {
+  // With drift present, land on the 加速绑定 tab where "重新同步" lives.
+  taskDrawerTab.value = edgeOneDriftCount.value > 0 ? 'edgeone' : 'acme';
+  showTaskDrawer.value = true;
+}
+
+// Manual full sync: reconcile every issued cert against its acceleration domains.
+const syncEdgeOneMutation = useMutation({
+  mutationFn: (payload: { certId?: string; dryRun?: boolean }) => syncSslCertToEdgeOne(payload),
+  onSuccess: (res, vars) => {
+    const n = res.data?.totalSynced || 0;
+    if (vars.dryRun) {
+      message.info(`预览：${n} 个加速域名将被绑定`);
+    } else {
+      message.success(res.message || `已同步 ${n} 个加速域名`);
+    }
+    queryClient.invalidateQueries({ queryKey: ['ssl-edgeone-bindings'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+// Per-row sync from the certificate list.
+async function syncCertRowToEdgeOne(row: SslCertificate) {
+  try {
+    const res = await syncSslCertToEdgeOne({ certId: row.remoteCertId });
+    const n = res.data?.totalSynced || 0;
+    if (n) {
+      message.success(`已将「${row.domain}」同步到 ${n} 个加速域名`);
+      queryClient.invalidateQueries({ queryKey: ['ssl-edgeone-bindings'] });
+    } else {
+      const r = res.data?.results?.[0];
+      message.info(r?.skipped || '该域名没有已启用的加速');
+    }
+  } catch (err: any) {
+    message.error(String(err));
+  }
+}
+
 const showNotificationSettings = ref(false);
 const notificationLoading = ref(false);
 const notificationForm = ref<SslNotificationSettings>({
   enabled: false, emailEnabled: false, emailTo: '', webhookEnabled: false,
-  webhookUrl: '', wecomEnabled: false, wecomWebhookUrl: '', retentionDays: 30,
+  webhookUrl: '', wecomEnabled: false, wecomWebhookUrl: '', notifySuccessWebhook: false, retentionDays: 30,
 });
 async function openNotificationSettings() {
   showNotificationSettings.value = true;
@@ -1754,6 +1829,10 @@ const columns = computed(() => {
             ? h(NButton, { size: 'tiny', secondary: true, type: 'info', onClick: () => handleDeploy(row) },
                 { icon: () => h(Rocket, { size: 13 }), default: () => '部署' })
             : null,
+          row.status === 'issued'
+            ? h(NButton, { size: 'tiny', secondary: true, type: 'warning', onClick: () => syncCertRowToEdgeOne(row) },
+                { icon: () => h(Zap, { size: 13 }), default: () => '同步加速' })
+            : null,
           !isManagedDomain(row.domain || '') && (row.domain || '').trim()
             ? h(NButton, { size: 'tiny', secondary: true, onClick: () => openAddZoneForDomain(row.domain) },
                 { icon: () => h(Plus, { size: 13 }), default: () => '添加域名' })
@@ -1877,9 +1956,14 @@ const columns = computed(() => {
             清理失效
           </NButton>
         </NDropdown>
-        <NButton size="small" secondary @click="showTaskDrawer = true" title="查看持久化签发任务与自动部署事件">
+        <NButton size="small" secondary @click="openTaskDrawer" title="查看持久化签发任务与自动部署事件">
           <template #icon><ListChecks :size="14" /></template>
           任务
+          <span
+            v-if="edgeOneDriftCount > 0"
+            class="ml-1 inline-flex items-center justify-center rounded-full bg-red-500 px-1.5 text-[10px] font-semibold text-white"
+            title="有加速域名绑定的证书已过期/漂移，点击查看「加速绑定」"
+          >{{ edgeOneDriftCount }}</span>
         </NButton>
         <NButton
           size="small"
@@ -2539,7 +2623,7 @@ const columns = computed(() => {
             </div>
           </div>
         </template>
-        <NTabs type="line" animated>
+        <NTabs v-model:value="taskDrawerTab" type="line" animated>
           <NTabPane name="acme" tab="签发任务">
             <div v-if="acmeJobsFetching && !(acmeJobs || []).length" class="flex justify-center py-12"><NSpin /></div>
             <NEmpty v-else-if="!(acmeJobs || []).length" description="暂无 ACME 签发任务" class="py-12" />
@@ -2669,6 +2753,46 @@ const columns = computed(() => {
               </div>
             </div>
           </NTabPane>
+          <NTabPane name="edgeone" tab="加速绑定">
+            <div class="mb-3 flex items-center gap-2">
+              <NButton size="small" type="warning" secondary :loading="syncEdgeOneMutation.isPending.value" @click="syncEdgeOneMutation.mutate({})">
+                全部同步到 CDN
+              </NButton>
+              <NButton size="small" quaternary :loading="syncEdgeOneMutation.isPending.value" @click="syncEdgeOneMutation.mutate({ dryRun: true })">
+                预览
+              </NButton>
+              <span class="text-xs text-slate-400">将面板证书绑定到匹配的加速域名（EdgeOne / Cloudflare / ESA），消除 CDN 侧证书过期</span>
+            </div>
+            <div v-if="edgeOneBindingsFetching && !(edgeOneBindings || []).length" class="flex justify-center py-12"><NSpin /></div>
+            <NEmpty v-else-if="!(edgeOneBindings || []).length" description="暂无加速证书绑定记录（启用域名加速或部署证书后自动生成）" class="py-12" />
+            <div v-else class="space-y-3">
+              <div v-for="b in edgeOneBindings" :key="b.id" class="rounded-xl border border-panel-border p-3">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="font-medium text-slate-700">{{ b.domainName }}</span>
+                  <NTag size="tiny" :bordered="false" type="info">
+                    {{ b.provider === 'cloudflare' ? 'Cloudflare' : b.provider === 'aliyun_esa' ? '阿里云 ESA' : 'EdgeOne' }}
+                  </NTag>
+                  <NTag size="tiny" :bordered="false" :type="b.status === 'synced' ? 'success' : b.status === 'failed' ? 'error' : 'warning'">
+                    {{ b.status === 'synced' ? '已绑定' : b.status === 'failed' ? '失败' : b.status }}
+                  </NTag>
+                  <NTag v-if="b.upToDate === false" size="tiny" :bordered="false" type="warning">有更新证书</NTag>
+                  <NTag v-if="b.upToDate === true" size="tiny" :bordered="false" type="success">已是最新</NTag>
+                  <span class="ml-auto text-xs text-slate-400">{{ formatDateTime(b.syncedAt || b.updatedAt) }}</span>
+                </div>
+                <p class="mt-1 text-xs text-slate-500">
+                  来源：{{ b.source === 'acme' ? "Let's Encrypt" : '腾讯云' }} · 证书 ID：{{ b.certRemoteId }}
+                  <span v-if="b.edgeCertId"> · 边缘证书：{{ b.edgeCertId }}</span>
+                </p>
+                <p v-if="b.notAfter" class="text-xs text-slate-400">到期：{{ formatDateTime(b.notAfter) }}</p>
+                <p v-if="b.lastError" class="mt-1 break-all text-xs text-red-500">{{ b.lastError }}</p>
+                <div class="mt-2 flex gap-2">
+                  <NButton size="tiny" secondary :loading="syncEdgeOneMutation.isPending.value" @click="syncEdgeOneMutation.mutate({ certId: b.certRemoteId })">
+                    重新同步
+                  </NButton>
+                </div>
+              </div>
+            </div>
+          </NTabPane>
         </NTabs>
       </NDrawerContent>
     </NDrawer>
@@ -2686,6 +2810,13 @@ const columns = computed(() => {
           <div class="mb-3 flex items-center justify-between"><span class="text-sm font-medium text-slate-700">Webhook</span><NSwitch v-model:value="notificationForm.webhookEnabled" /></div>
           <NInput v-model:value="notificationForm.webhookUrl" type="password" show-password-on="click" placeholder="https://example.com/hooks/ssl" />
           <p class="mt-2 text-xs text-slate-500">出于 SSRF 防护，仅允许解析到公网地址的 HTTPS URL。</p>
+          <div class="mt-3 flex items-center justify-between border-t border-panel-border pt-3">
+            <div>
+              <span class="text-sm font-medium text-slate-700">推送成功事件</span>
+              <p class="text-xs text-slate-500">签发/续期/部署成功时也向此 Webhook 发送事件（默认只推失败）</p>
+            </div>
+            <NSwitch v-model:value="notificationForm.notifySuccessWebhook" :disabled="!notificationForm.webhookEnabled" />
+          </div>
         </div>
         <div class="rounded-xl border border-panel-border p-3">
           <div class="mb-3 flex items-center justify-between"><span class="text-sm font-medium text-slate-700">企业微信机器人</span><NSwitch v-model:value="notificationForm.wecomEnabled" /></div>

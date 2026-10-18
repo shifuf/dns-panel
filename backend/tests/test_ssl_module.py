@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import sqlite3
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,8 +19,30 @@ from modules.tencent_ssl_api import (  # noqa: E402
     parse_certificate_datetime, certificate_days_remaining, certificate_is_expired,
     _normalize_status,
 )
-from modules.route_handlers import _ssl_filter_and_summarize, _validate_ssl_notification_url  # noqa: E402
+from modules.route_handlers import (  # noqa: E402
+    _ssl_filter_and_summarize, _validate_ssl_notification_url,
+    _wildcard_covers, _norm_host,
+)
 import migrate as db_migrate  # noqa: E402
+
+
+class WildcardCoverTests(unittest.TestCase):
+    """TLS semantics for the acceleration-cert domain matching."""
+
+    def test_exact_and_wildcard(self) -> None:
+        self.assertTrue(_wildcard_covers("api.example.com", "api.example.com"))
+        self.assertTrue(_wildcard_covers("*.example.com", "account.example.com"))
+        self.assertFalse(_wildcard_covers("*.example.com", "example.com"))
+        self.assertFalse(_wildcard_covers("*.example.com", "a.b.example.com"))
+
+    def test_literal_wildcard_host_only_matches_itself(self) -> None:
+        self.assertTrue(_wildcard_covers("*.example.com", "*.example.com"))
+        self.assertFalse(_wildcard_covers("api.example.com", "*.example.com"))
+
+    def test_norm_host_strips_dots_and_lowercases(self) -> None:
+        self.assertEqual(_norm_host("Example.COM."), "example.com")
+        self.assertEqual(_norm_host(None), "")
+        self.assertEqual(_norm_host("  *.Foo.com "), "*.foo.com")
 
 
 class SslListTests(unittest.TestCase):
@@ -256,6 +279,67 @@ class SslRouteContractTests(unittest.TestCase):
         self.assertIn("def _read_private_key", acme_source)
         self.assertIn("_write_private_key(privkey, raw_key)", acme_source)
 
+    def test_edgeone_cert_sync_routes_and_helpers_exist(self) -> None:
+        for probe in (
+            'sub == "/certificates/sync-edgeone"',
+            'sub == "/edgeone-bindings"',
+            "acceleration_cert_bindings",
+            "def _sync_cert_to_edgeone",
+            "def _accel_targets_for_domain",
+            "def _edge_cert_id_for_ssl_cert",
+            "def _best_cert_for_domain",
+            "def _download_tencent_cert_pem",
+        ):
+            self.assertIn(probe, self.source)
+        # deploy result + acme job success + accel enable all trigger the sync
+        self.assertIn("_sync_cert_to_edgeone(self, uid, cert_row)", self.source)
+        self.assertIn("_sync_cert_to_edgeone(self, uid, fresh)", self.source)
+        self.assertIn("edgeoneCertSync", self.source)
+        # cross-account certs must be re-uploaded, not reused by id
+        self.assertIn("same_account", self.source)
+        # "all" sync must only bind the freshest cert per domain
+        self.assertIn("seen_domains.add(domain_key)", self.source)
+
+    def test_multi_cdn_binders_are_registered(self) -> None:
+        # All three CDN providers have a real cert binder — none fall back to
+        # the unsupported-reason stub.
+        self.assertIn("def _bind_cert_to_cloudflare_provider", self.source)
+        self.assertIn("def _bind_cert_to_esa_provider", self.source)
+        self.assertIn('"cloudflare": _bind_cert_to_cloudflare_provider', self.source)
+        self.assertIn('"aliyun_esa": _bind_cert_to_esa_provider', self.source)
+        self.assertNotIn('_ACCEL_CERT_UNSUPPORTED_REASON: Dict[str, str] = {\n    "aliyun_esa":', self.source)
+        # CF pushes the panel PEM onto the custom hostname (type=custom)
+        cf_source = (BACKEND_DIR / "modules" / "cloudflare_api.py").read_text(encoding="utf-8")
+        self.assertIn("def update_custom_hostname_custom_certificate", cf_source)
+        self.assertIn('"custom_certificate"', cf_source)
+        # Native target discovery for panel-external CF/ESA resources
+        self.assertIn("def _native_cdn_targets", self.source)
+        self.assertIn("def _discover_cf_hostname_targets", self.source)
+        self.assertIn("def _discover_esa_record_targets", self.source)
+        self.assertIn("ssl:cdn-targets:user:", self.source)
+
+    def test_cert_delete_paths_clean_up_uploaded_accel_temp_certs(self) -> None:
+        # Panel-uploaded temp certs in acceleration accounts must be removed
+        # wherever a cert dies: single delete (acme + tencent), sync prune,
+        # clean-expired, prune-superseded and credential deletion.
+        self.assertIn("def _cleanup_edgeone_cert_for_cert", self.source)
+        self.assertGreaterEqual(self.source.count("_cleanup_edgeone_cert_for_cert("), 6)
+
+    def test_accel_binding_drift_view_is_wildcard_aware(self) -> None:
+        self.assertIn("def _accel_binding_drift_view", self.source)
+        self.assertIn("_wildcard_covers(n, domain)", self.source)
+        # the endpoint must use the shared drift view helper (with the
+        # preloaded issued-cert rows to avoid a query per binding)
+        self.assertIn("_accel_binding_drift_view(uid, dict(row), issued_rows)", self.source)
+
+    def test_success_event_webhook_opt_in_is_persisted_and_sent(self) -> None:
+        self.assertIn("def _push_ssl_success_event", self.source)
+        # the settings save endpoint must round-trip the opt-in flag
+        self.assertIn('"notifySuccessWebhook": bool(body.get("notifySuccessWebhook"', self.source)
+        # renew (tencent inline), issue (acme job) and deploy success all push
+        for event in ('"ssl_renewal_succeeded"', '"ssl_issue_succeeded"', '"ssl_deployment_succeeded"'):
+            self.assertIn(event, self.source)
+
     def test_persisted_jobs_requeue_stale_running_work(self) -> None:
         self.assertIn("CREATE TABLE IF NOT EXISTS ssl_acme_jobs", (BACKEND_DIR / "app.py").read_text(encoding="utf-8"))
         self.assertIn("任务中断，已自动重新排队", self.source)
@@ -352,6 +436,417 @@ class SslMigrationTests(unittest.TestCase):
             self.assertIn("idx_ssl_deploy_events_queue", indexes)
             self.assertIn("ssl_task_logs", tables)
             self.assertIn("idx_ssl_task_logs_user_time", indexes)
+
+    def test_acceleration_cert_tables_and_columns_are_created(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "ssl-test.db"
+            db_migrate.migrate(db_path)
+            connection = sqlite3.connect(str(db_path))
+            try:
+                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                cert_cols = {row[1] for row in connection.execute("PRAGMA table_info(ssl_certificates)")}
+                job_cols = {row[1] for row in connection.execute("PRAGMA table_info(ssl_acme_jobs)")}
+            finally:
+                connection.close()
+            self.assertIn("acceleration_cert_requests", tables)
+            self.assertIn("acceleration_cert_bindings", tables)
+            self.assertIn("acmeCa", cert_cols)
+            for col in ("ca", "eabKid", "eabHmac"):
+                self.assertIn(col, job_cols)
+
+
+class EdgeOneSyncFlowTests(unittest.TestCase):
+    """End-to-end (mocked) test of the cert→EdgeOne binding flow."""
+
+    def _build(self):
+        d = tempfile.mkdtemp()
+        db = Path(d) / "t.db"
+        db_migrate.migrate(db)
+        raw = sqlite3.connect(str(db))
+        raw.row_factory = sqlite3.Row
+        raw.execute(
+            """INSERT INTO dns_record_acceleration_states
+               (userId, dnsCredentialId, zoneId, zoneName, recordId, recordName,
+                accelerationProvider, accelerationCredentialId, accelerationSiteId,
+                accelerationDomain, accelerationTarget, originalRecord, enabled)
+               VALUES (1,1,'z','example.com','r1','cdn','edgeone',5,'site1',
+                       'cdn.example.com','tgt.dnse.com','{}',1)"""
+        )
+        raw.execute(
+            """INSERT INTO ssl_certificates
+               (userId, credentialId, provider, remoteCertId, domain, status, notAfter, autoRenew)
+               VALUES (1, 9, 'tencent_ssl', 'SSLCERT-1', 'cdn.example.com', 'issued', '2027-01-01T00:00:00Z', 0)"""
+        )
+        raw.commit()
+        self.addCleanup(lambda: (raw.close(), shutil.rmtree(d, ignore_errors=True)))
+        return rh if False else None, raw, db
+
+    def test_same_account_tencent_cert_reuses_cert_id(self) -> None:
+        import modules.route_handlers as rh
+        _, raw, db = self._build()
+        orig = (rh.conn, rh.now_iso, rh.cache_delete_pattern)
+        rh.conn = lambda: raw
+        rh.now_iso = lambda: "2026-10-17T00:00:00Z"
+        rh.cache_delete_pattern = lambda *a, **k: None
+
+        calls = []
+
+        class FakeAccelApi:
+            def modify_hosts_certificate(self, site, hosts, mode, cert_id):
+                calls.append((site, hosts, mode, cert_id))
+                return {}
+
+        class FakeHandler:
+            def _acceleration_auth(self, uid, cid):
+                return {"api": FakeAccelApi(), "credential": {"secrets": "x"}, "provider": "edgeone"}
+
+            def _credential_secrets(self, row):
+                return {"secretId": "AKID-SAME", "secretKey": "SK"}
+
+            def _get_credential_row(self, uid, cid):
+                return {"secrets": "x"}
+
+        try:
+            cert = raw.execute("SELECT * FROM ssl_certificates WHERE remoteCertId='SSLCERT-1'").fetchone()
+            out = rh._sync_cert_to_edgeone(FakeHandler(), 1, cert)
+        finally:
+            rh.conn, rh.now_iso, rh.cache_delete_pattern = orig
+        self.assertEqual(out["synced"], 1)
+        self.assertEqual(calls, [("site1", ["cdn.example.com"], "sslcert", "SSLCERT-1")])
+
+    def test_dry_run_does_not_upload_or_bind(self) -> None:
+        import modules.route_handlers as rh
+        _, raw, db = self._build()
+        orig = (rh.conn, rh.now_iso, rh.cache_delete_pattern)
+        rh.conn = lambda: raw
+        rh.now_iso = lambda: "2026-10-17T00:00:00Z"
+        rh.cache_delete_pattern = lambda *a, **k: None
+
+        calls = []
+
+        class FakeAccelApi:
+            def modify_hosts_certificate(self, *a):
+                calls.append(a)
+                return {}
+
+        class FakeHandler:
+            def _acceleration_auth(self, uid, cid):
+                return {"api": FakeAccelApi(), "credential": {"secrets": "x"}, "provider": "edgeone"}
+
+            def _credential_secrets(self, row):
+                return {"secretId": "AKID", "secretKey": "SK"}
+
+            def _get_credential_row(self, uid, cid):
+                return {"secrets": "x"}
+
+        try:
+            cert = raw.execute("SELECT * FROM ssl_certificates WHERE remoteCertId='SSLCERT-1'").fetchone()
+            out = rh._sync_cert_to_edgeone(FakeHandler(), 1, cert, dry_run=True)
+        finally:
+            rh.conn, rh.now_iso, rh.cache_delete_pattern = orig
+        # preview reports the target but performs NO cloud bind
+        self.assertEqual(calls, [])
+        self.assertTrue(all(r.get("dryRun") for r in out["results"]))
+
+    def test_no_acceleration_returns_skipped(self) -> None:
+        import modules.route_handlers as rh
+        d = tempfile.mkdtemp()
+        db = Path(d) / "t.db"
+        db_migrate.migrate(db)
+        raw = sqlite3.connect(str(db))
+        raw.row_factory = sqlite3.Row
+        raw.execute(
+            """INSERT INTO ssl_certificates
+               (userId, credentialId, provider, remoteCertId, domain, status, notAfter, autoRenew)
+               VALUES (1, 9, 'tencent_ssl', 'SSLCERT-2', 'plain.example.com', 'issued', '2027-01-01T00:00:00Z', 0)"""
+        )
+        raw.commit()
+        self.addCleanup(lambda: (raw.close(), shutil.rmtree(d, ignore_errors=True)))
+        orig = (rh.conn, rh.now_iso, rh.cache_delete_pattern)
+        rh.conn = lambda: raw
+        rh.now_iso = lambda: "2026-10-17T00:00:00Z"
+        rh.cache_delete_pattern = lambda *a, **k: None
+        try:
+            cert = raw.execute("SELECT * FROM ssl_certificates WHERE remoteCertId='SSLCERT-2'").fetchone()
+            out = rh._sync_cert_to_edgeone(object(), 1, cert)
+        finally:
+            rh.conn, rh.now_iso, rh.cache_delete_pattern = orig
+        self.assertEqual(out["synced"], 0)
+        self.assertIn("没有已启用", out.get("skipped", ""))
+
+
+class AccelTempCertCleanupTests(unittest.TestCase):
+    """Deleting a panel cert must remove the temp certs the panel uploaded into
+    acceleration accounts for it (and its binding rows)."""
+
+    def _build(self):
+        d = tempfile.mkdtemp()
+        db = Path(d) / "t.db"
+        db_migrate.migrate(db)
+        raw = sqlite3.connect(str(db))
+        raw.row_factory = sqlite3.Row
+        raw.execute(
+            """INSERT INTO acceleration_cert_bindings
+               (userId, provider, accelerationCredentialId, siteId, domainName,
+                source, certRemoteId, edgeCertId, fingerprint, notAfter,
+                status, syncedAt, createdAt, updatedAt)
+               VALUES (1, 'edgeone', 5, 'site1', 'cdn.example.com',
+                       'acme', 'example.com', 'UPLOADED-1', 'FP1', '2027-01-01T00:00:00Z',
+                       'synced', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')"""
+        )
+        raw.commit()
+        self.addCleanup(lambda: (raw.close(), shutil.rmtree(d, ignore_errors=True)))
+        return raw, db
+
+    def test_uploaded_temp_cert_is_deleted_and_bindings_dropped(self) -> None:
+        import modules.route_handlers as rh
+        raw, _ = self._build()
+        orig = (rh.conn, rh.now_iso, rh.TencentSslApi)
+        deleted = []
+
+        class FakeSslApi:
+            def __init__(self, sid, skey):
+                self.sid = sid
+
+            def delete_certificate(self, cert_id):
+                deleted.append(cert_id)
+                return {}
+
+        class FakeHandler:
+            def _acceleration_auth(self, uid, cid):
+                return {"credential": {"secrets": "x"}, "provider": "edgeone"}
+
+            def _credential_secrets(self, row):
+                return {"secretId": "AKID", "secretKey": "SK"}
+
+        rh.conn = lambda: raw
+        rh.now_iso = lambda: "2026-10-18T00:00:00Z"
+        rh.TencentSslApi = FakeSslApi
+        try:
+            out = rh._cleanup_edgeone_cert_for_cert(FakeHandler(), 1, {"remoteCertId": "example.com", "provider": "acme"})
+        finally:
+            rh.conn, rh.now_iso, rh.TencentSslApi = orig
+        self.assertEqual(deleted, ["UPLOADED-1"])
+        self.assertEqual(out["removedEdgeCerts"], ["UPLOADED-1"])
+        left = raw.execute("SELECT COUNT(*) c FROM acceleration_cert_bindings").fetchone()["c"]
+        self.assertEqual(left, 0)
+
+    def test_same_account_cert_id_is_never_deleted(self) -> None:
+        # A same-account Tencent cert reuses the cert's own cloud id — that is
+        # the user's real certificate, not a temp upload, and must survive.
+        import modules.route_handlers as rh
+        raw, _ = self._build()
+        raw.execute(
+            """UPDATE acceleration_cert_bindings SET source='tencent_ssl', certRemoteId='SSLCERT-9',
+               edgeCertId='SSLCERT-9'"""
+        )
+        raw.commit()
+        orig = (rh.conn, rh.now_iso, rh.TencentSslApi)
+        deleted = []
+
+        class FakeSslApi:
+            def __init__(self, sid, skey):
+                pass
+
+            def delete_certificate(self, cert_id):
+                deleted.append(cert_id)
+                return {}
+
+        class FakeHandler:
+            def _acceleration_auth(self, uid, cid):
+                return {"credential": {"secrets": "x"}, "provider": "edgeone"}
+
+            def _credential_secrets(self, row):
+                return {"secretId": "AKID", "secretKey": "SK"}
+
+        rh.conn = lambda: raw
+        rh.now_iso = lambda: "2026-10-18T00:00:00Z"
+        rh.TencentSslApi = FakeSslApi
+        try:
+            rh._cleanup_edgeone_cert_for_cert(FakeHandler(), 1, {"remoteCertId": "SSLCERT-9", "provider": "tencent_ssl"})
+        finally:
+            rh.conn, rh.now_iso, rh.TencentSslApi = orig
+        self.assertEqual(deleted, [])
+        left = raw.execute("SELECT COUNT(*) c FROM acceleration_cert_bindings").fetchone()["c"]
+        self.assertEqual(left, 0)
+
+
+class AccelBindingDriftViewTests(unittest.TestCase):
+    def _build(self):
+        d = tempfile.mkdtemp()
+        db = Path(d) / "t.db"
+        db_migrate.migrate(db)
+        raw = sqlite3.connect(str(db))
+        raw.row_factory = sqlite3.Row
+        raw.execute(
+            """INSERT INTO ssl_certificates
+               (userId, credentialId, provider, remoteCertId, domain, san, status, notAfter, autoRenew)
+               VALUES (1, 9, 'acme', 'example.com', '*.example.com', '["*.example.com"]',
+                       'issued', '2027-01-01T00:00:00Z', 1)"""
+        )
+        raw.commit()
+        self.addCleanup(lambda: (raw.close(), shutil.rmtree(d, ignore_errors=True)))
+        return raw
+
+    def test_wildcard_cert_covers_edge_host(self) -> None:
+        import modules.route_handlers as rh
+        raw = self._build()
+        orig = rh.conn
+        rh.conn = lambda: raw
+        try:
+            # binding carries the wildcard cert's own remoteCertId → up to date
+            item = rh._accel_binding_drift_view(1, {"domainName": "cdn.example.com", "source": "acme", "certRemoteId": "example.com"})
+            self.assertTrue(item["upToDate"])
+            self.assertEqual(item["currentCertRemoteId"], "example.com")
+            # an older binding id → drift
+            item2 = rh._accel_binding_drift_view(1, {"domainName": "cdn.example.com", "source": "acme", "certRemoteId": "old.example.com"})
+            self.assertFalse(item2["upToDate"])
+        finally:
+            rh.conn = orig
+
+    def test_no_matching_cert_reports_unknown(self) -> None:
+        import modules.route_handlers as rh
+        raw = self._build()
+        orig = rh.conn
+        rh.conn = lambda: raw
+        try:
+            item = rh._accel_binding_drift_view(1, {"domainName": "other.example.net", "source": "acme", "certRemoteId": "x"})
+            self.assertIsNone(item["upToDate"])
+        finally:
+            rh.conn = orig
+
+
+class MultiCdnBinderTests(unittest.TestCase):
+    """Cloudflare / ESA binders: real cert linkage, provider-appropriate."""
+
+    CERT_PEM = (
+        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+    )
+    KEY_PEM = "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n"
+
+    class FakeHandler:
+        def __init__(self, secrets):
+            self._secrets = secrets
+
+        def _get_credential_row(self, uid, cid):
+            if cid == 999:
+                return None
+            return {"id": cid, "provider": self._secrets.get("_provider", "cloudflare"), "secrets": "x"}
+
+        def _credential_secrets(self, row):
+            return {k: v for k, v in self._secrets.items() if not k.startswith("_")}
+
+    def test_cloudflare_binder_pushes_pem_to_matching_hostname(self) -> None:
+        import modules.route_handlers as rh
+        pushed = []
+
+        class FakeCf:
+            def __init__(self, token):
+                if token != "tok":
+                    raise AssertionError("bad token")
+
+            def list_zones(self, page, size):
+                return {"zones": [{"id": "zone1", "name": "example.com"}], "total": 1}
+
+            def list_all_custom_hostnames(self, zone_id, max_pages=10):
+                return [{"id": "ch1", "hostname": "cdn.example.com"}]
+
+            def update_custom_hostname_custom_certificate(self, zone_id, hostname_id, cert, key):
+                pushed.append((zone_id, hostname_id, cert, key))
+                return {}
+
+        orig_cf, orig_pem = rh.CloudflareApi, rh._panel_cert_pem
+        rh.CloudflareApi = FakeCf
+        rh._panel_cert_pem = lambda handler, uid, cert_row: {"publicKey": self.CERT_PEM, "privateKey": self.KEY_PEM}
+        try:
+            handler = self.FakeHandler({"apiToken": "tok", "_provider": "cloudflare"})
+            edge_id = rh._bind_cert_to_cloudflare_provider(
+                handler, 1, 7, "zone1", {"provider": "acme", "remoteCertId": "example.com"}, "cdn.example.com", False,
+            )
+        finally:
+            rh.CloudflareApi, rh._panel_cert_pem = orig_cf, orig_pem
+        # zone_id is used as-is when provided; the PEM pair is pushed
+        self.assertEqual(pushed, [("zone1", "ch1", self.CERT_PEM, self.KEY_PEM)])
+        self.assertTrue(edge_id.startswith("cf-custom:"))
+
+    def test_cloudflare_binder_requires_custom_hostname(self) -> None:
+        import modules.route_handlers as rh
+
+        class FakeCf:
+            def __init__(self, token):
+                pass
+
+            def list_zones(self, page, size):
+                return {"zones": [{"id": "zone1", "name": "example.com"}], "total": 1}
+
+            def list_all_custom_hostnames(self, zone_id, max_pages=10):
+                return []
+
+            def update_custom_hostname_custom_certificate(self, *a):
+                raise AssertionError("must not push without a custom hostname")
+
+        orig_cf = rh.CloudflareApi
+        rh.CloudflareApi = FakeCf
+        try:
+            handler = self.FakeHandler({"apiToken": "tok"})
+            with self.assertRaises(ValueError) as cm:
+                rh._bind_cert_to_cloudflare_provider(
+                    handler, 1, 7, "zone1", {"provider": "acme", "remoteCertId": "x"}, "cdn.example.com", False,
+                )
+            self.assertIn("自定义主机名", str(cm.exception))
+        finally:
+            rh.CloudflareApi = orig_cf
+
+    def test_esa_binder_reuses_valid_cert_without_applying(self) -> None:
+        import modules.route_handlers as rh
+        applied = []
+
+        def fake_list_certs(ak, sk, region, site, names, valid_only, detail):
+            return {"records": [{"recordName": "cdn.example.com", "certificates": [{"id": "ESA-CERT-1"}]}]}
+
+        def fake_apply(*a, **k):
+            applied.append(a)
+            return {"results": []}
+
+        orig_list, orig_apply = rh.esa_list_certificates_by_record, rh.esa_apply_certificate
+        rh.esa_list_certificates_by_record = fake_list_certs
+        rh.esa_apply_certificate = fake_apply
+        try:
+            handler = self.FakeHandler({"accessKeyId": "ak", "accessKeySecret": "sk", "_provider": "aliyun"})
+            edge_id = rh._bind_cert_to_esa_provider(
+                handler, 1, 7, "site1", {"provider": "acme", "remoteCertId": "x"}, "cdn.example.com", False,
+            )
+        finally:
+            rh.esa_list_certificates_by_record, rh.esa_apply_certificate = orig_list, orig_apply
+        self.assertEqual(edge_id, "esa-managed:ESA-CERT-1")
+        self.assertEqual(applied, [])
+
+    def test_esa_binder_applies_free_cert_when_missing(self) -> None:
+        import modules.route_handlers as rh
+
+        def fake_list_certs(*a, **k):
+            return {"records": [{"recordName": "cdn.example.com", "certificates": None}]}
+
+        def fake_apply(ak, sk, region, site, domains, cert_type):
+            return {"results": [{"domain": "cdn.example.com", "certificateId": "NEW-1", "status": "applying"}]}
+
+        orig_list, orig_apply = rh.esa_list_certificates_by_record, rh.esa_apply_certificate
+        rh.esa_list_certificates_by_record = fake_list_certs
+        rh.esa_apply_certificate = fake_apply
+        try:
+            handler = self.FakeHandler({"accessKeyId": "ak", "accessKeySecret": "sk", "_provider": "aliyun"})
+            edge_id = rh._bind_cert_to_esa_provider(
+                handler, 1, 7, "site1", {"provider": "acme", "remoteCertId": "x"}, "cdn.example.com", False,
+            )
+        finally:
+            rh.esa_list_certificates_by_record, rh.esa_apply_certificate = orig_list, orig_apply
+        self.assertEqual(edge_id, "esa-applied:NEW-1")
+
+    def test_binder_credential_provider_mismatch_is_rejected(self) -> None:
+        import modules.route_handlers as rh
+        handler = self.FakeHandler({"apiToken": "tok", "_provider": "cloudflare"})
+        with self.assertRaises(ValueError):
+            rh._cdn_binding_credential(handler, 1, 7, "aliyun")
 
 
 if __name__ == "__main__":

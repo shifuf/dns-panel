@@ -145,6 +145,8 @@ export interface SslNotificationSettings {
   webhookUrl: string;
   wecomEnabled: boolean;
   wecomWebhookUrl: string;
+  /** Opt-in: also push success events (renew/issue/deploy ok) to the webhook. */
+  notifySuccessWebhook?: boolean;
   retentionDays: number;
 }
 
@@ -356,6 +358,40 @@ export async function getSslDeploymentsBySite(): Promise<ApiResponse<SiteDeploym
 export async function getSslPluginVersion(): Promise<ApiResponse<{ expectedVersion: string; minVersion: string; releaseNotes?: string }>> {
   const res = await api.get('/ssl/plugin-version');
   return res as unknown as ApiResponse<{ expectedVersion: string; minVersion: string; releaseNotes?: string }>;
+}
+
+export interface EdgeOneCertBinding {
+  id: number;
+  provider: string;
+  accelerationCredentialId: number;
+  siteId: string;
+  domainName: string;
+  source: string;
+  certRemoteId: string;
+  edgeCertId?: string | null;
+  fingerprint?: string | null;
+  notAfter?: string | null;
+  status: string;
+  lastError?: string | null;
+  syncedAt?: string | null;
+  updatedAt?: string;
+  currentCertRemoteId?: string;
+  currentNotAfter?: string;
+  upToDate?: boolean | null;
+}
+
+export async function getSslEdgeOneBindings(): Promise<ApiResponse<EdgeOneCertBinding[]>> {
+  const res = await api.get('/ssl/edgeone-bindings');
+  return res as unknown as ApiResponse<EdgeOneCertBinding[]>;
+}
+
+export async function syncSslCertToEdgeOne(params?: {
+  certId?: string;
+  certIds?: string[];
+  dryRun?: boolean;
+}): Promise<ApiResponse<{ results: any[]; totalSynced: number; dryRun: boolean }>> {
+  const res = await api.post('/ssl/certificates/sync-edgeone', params || {});
+  return res as unknown as ApiResponse<{ results: any[]; totalSynced: number; dryRun: boolean }>;
 }
 
 export interface SslCertificateView {

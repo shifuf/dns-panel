@@ -342,6 +342,7 @@ class TencentSslApi:
         return {
             "remoteCertId": c.get("CertificateId", ""),
             "domain": c.get("Domain", ""),
+            "alias": c.get("Alias", ""),
             "san": c.get("CertificateExtra", {}).get("DomainNumber") if isinstance(c.get("CertificateExtra"), dict) else None,
             "certType": c.get("CertificateType", ""),
             "productName": c.get("ProductZhName", ""),
