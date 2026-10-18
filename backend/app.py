@@ -2843,6 +2843,20 @@ def _ssl_autorenew_worker() -> None:
                                 done.append(f"{u['username']}(到期提醒{outcome['notified']})")
                         except Exception:
                             pass
+                        # Pre-expiry deploy guarantee: any issued cert still
+                        # within 7 days of expiry (i.e. renewal did NOT push its
+                        # notAfter out) is force-queued for the BaoTa plugin, so
+                        # sites never keep serving a cert that's about to lapse.
+                        # Runs after renewal so a freshly renewed cert (new
+                        # notAfter beyond the window) is a no-op here. The edge
+                        # copy is handled by the sync-edgeone pass just below.
+                        try:
+                            from modules.route_handlers import _ensure_pre_expiry_deployments
+                            pre = _ensure_pre_expiry_deployments(int(u["id"]))
+                            if pre.get("queued"):
+                                done.append(f"{u['username']}(到期前部署{pre.get('queued')})")
+                        except Exception:
+                            pass
                         # Safety net: re-bind the latest certificate to every
                         # EdgeOne acceleration domain. Catches drift where the
                         # edge is still serving an older cert (renewal happened

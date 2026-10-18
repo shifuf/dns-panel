@@ -341,5 +341,62 @@ class SiteCertificateCheckTests(unittest.TestCase):
 
 
 
+class AccelCheckTests(unittest.TestCase):
+    """The 加速证书 tab — previously a dead tab (index.html called a
+    non-existent show_accel_check). Its backend action classifies each
+    acceleration certificate binding by drift / expiry / failure."""
+
+    def setUp(self) -> None:
+        self.mod = PluginLoadedOnce.get()
+
+    def _run(self, bindings):
+        mod = self.mod
+        cfg = {"serverUrl": "https://panel.example.com", "apiToken": "token"}
+        with patch.object(mod, "_get_config", lambda *a, **k: cfg), \
+             patch.object(mod, "_set_config", lambda *a, **k: True), \
+             patch.object(mod, "_panel_get", lambda path, timeout=60: {"success": True, "data": list(bindings)}):
+            return mod.dnspanel_ssl_main().accel_check(None)
+
+    def test_classifies_state_by_drift_and_expiry(self) -> None:
+        import datetime as _dt
+        future = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=200)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        soon = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        past = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        result = self._run([
+            {"domainName": "ok.example.com", "source": "acme", "certRemoteId": "c1",
+             "upToDate": True, "status": "synced", "notAfter": future},
+            {"domainName": "drift.example.com", "source": "tencent", "certRemoteId": "old",
+             "upToDate": False, "status": "synced", "notAfter": future},
+            {"domainName": "failed.example.com", "source": "tencent", "certRemoteId": "x",
+             "upToDate": False, "status": "failed", "lastError": "boom", "notAfter": future},
+            {"domainName": "expired.example.com", "source": "tencent", "certRemoteId": "y",
+             "upToDate": True, "status": "synced", "notAfter": past},
+            {"domainName": "expiring.example.com", "source": "acme", "certRemoteId": "z",
+             "upToDate": True, "status": "synced", "notAfter": soon},
+        ])
+        self.assertTrue(result.get("success"), result)
+        states = {it["domainName"]: it["state"] for it in result["data"]["items"]}
+        self.assertEqual(states["ok.example.com"], "synced")
+        self.assertEqual(states["drift.example.com"], "stale")
+        self.assertEqual(states["failed.example.com"], "failed")
+        self.assertEqual(states["expired.example.com"], "expired")
+        self.assertEqual(states["expiring.example.com"], "expiring")
+        summary = result["data"]["summary"]
+        self.assertEqual(summary["total"], 5)
+        self.assertEqual(summary["synced"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_worst_state_sorted_first(self) -> None:
+        import datetime as _dt
+        future = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=200)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        result = self._run([
+            {"domainName": "good.example.com", "source": "acme", "certRemoteId": "c1",
+             "upToDate": True, "status": "synced", "notAfter": future},
+            {"domainName": "bad.example.com", "source": "tencent", "certRemoteId": "x",
+             "upToDate": False, "status": "failed", "notAfter": future},
+        ])
+        self.assertEqual(result["data"]["items"][0]["domainName"], "bad.example.com")
+
+
 if __name__ == "__main__":
     unittest.main()

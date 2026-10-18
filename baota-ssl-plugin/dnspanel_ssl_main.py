@@ -43,7 +43,7 @@ import public
 
 __plugin_path = "/www/server/panel/plugin/dnspanel_ssl/"
 __config = None
-PLUGIN_VERSION = "1.8.0"
+PLUGIN_VERSION = "1.9.0"
 PLUGIN_LOG_TAG = "DNS panel SSL sync"
 
 # ---------------------------------------------------------------------
@@ -2793,6 +2793,77 @@ class dnspanel_ssl_main:
         _set_config("lastSiteCheckResult", json.dumps(summary, ensure_ascii=False))
         _write_log("站点证书检测：共 " + str(len(items)) + " 个站点，待更新 " + str(updates))
         return {"success": True, "message": "站点证书检测完成", "data": {"summary": summary, "items": items}}
+
+    # ── Acceleration (EdgeOne / CDN) certificate status ──────────
+    def accel_check(self, args):
+        """Report the CDN acceleration certificate status for every domain that
+        is accelerated, using the panel's authoritative /ssl/edgeone-bindings
+        data.
+
+        The panel drives the actual binding (upload/reuse a CertId, handle
+        multi-CDN, drift detection); the plugin's job here is to surface, per
+        accelerated domain, whether the edge copy matches the panel's current
+        certificate and how much validity is left — so a "site OK but edge
+        stale/expired" mismatch is visible without opening the panel.
+        """
+        cfg = _get_config() or {}
+        if not cfg.get("serverUrl") or not cfg.get("apiToken"):
+            return public.ReturnMsg(False, "请先配置连接信息")
+        result = _panel_get("/ssl/edgeone-bindings", timeout=60)
+        if not isinstance(result, dict) or not result.get("success"):
+            return public.ReturnMsg(False, _as_text((result or {}).get("message")) or "获取加速证书绑定失败")
+
+        bindings = [b for b in (result.get("data") or []) if isinstance(b, dict)]
+        items = []
+        for b in bindings:
+            not_after = _as_text(b.get("notAfter") or b.get("currentNotAfter")).strip()
+            days = _days_until(_parse_expiry(not_after))
+            status = _as_text(b.get("status")).strip().lower()
+            up_to_date = b.get("upToDate")
+            edge_cert_id = _as_text(b.get("edgeCertId")).strip()
+            # Classify: a failed sync wins; otherwise drift (edge ≠ current
+            # panel cert) is a warning; an expired edge cert is an error.
+            if status == "failed":
+                state, action = "failed", "加速同步失败：" + (_as_text(b.get("lastError")).strip()[:120] or "请在面板重新同步")
+            elif up_to_date is False:
+                state, action = "stale", "加速边缘为旧证书，请在面板「SSL → 同步加速」重新同步"
+            elif isinstance(days, int) and days < 0:
+                state, action = "expired", "加速证书已过期，请续期并重新同步"
+            elif isinstance(days, int) and days <= ACCEL_EXPIRING_DAYS:
+                state, action = "expiring", "加速证书将于 " + str(days) + " 天后到期"
+            elif up_to_date is True:
+                state, action = "synced", "加速证书已与面板一致"
+            else:
+                state, action = "unknown", "无法确定加速证书状态"
+            items.append({
+                "domainName": _as_text(b.get("domainName")).strip(),
+                "provider": _as_text(b.get("provider")).strip() or "edgeone",
+                "source": _as_text(b.get("source")).strip(),
+                "sourceLabel": "Let's Encrypt" if _as_text(b.get("source")).strip().lower() in ("acme", "letsencrypt") else "腾讯云",
+                "certRemoteId": _as_text(b.get("certRemoteId")).strip(),
+                "edgeCertId": edge_cert_id,
+                "currentCertRemoteId": _as_text(b.get("currentCertRemoteId")).strip(),
+                "notAfter": not_after,
+                "daysRemaining": days,
+                "state": state,
+                "action": action,
+                "syncedAt": _as_text(b.get("syncedAt")).strip(),
+                "updatedAt": _as_text(b.get("updatedAt")).strip(),
+            })
+        # Sort worst-first so problems surface at the top of the table.
+        order = {"failed": 0, "expired": 1, "stale": 2, "expiring": 3, "unknown": 4, "synced": 5}
+        items.sort(key=lambda x: (order.get(x.get("state"), 9), _as_text(x.get("domainName"))))
+        summary = {
+            "total": len(items),
+            "synced": sum(1 for x in items if x.get("state") == "synced"),
+            "stale": sum(1 for x in items if x.get("state") == "stale"),
+            "expiring": sum(1 for x in items if x.get("state") == "expiring"),
+            "expired": sum(1 for x in items if x.get("state") == "expired"),
+            "failed": sum(1 for x in items if x.get("state") == "failed"),
+        }
+        _set_config("lastAccelCheckAt", time.strftime("%Y-%m-%d %H:%M:%S"))
+        _set_config("lastAccelCheckResult", json.dumps(summary, ensure_ascii=False))
+        return {"success": True, "message": "加速证书检测完成", "data": {"summary": summary, "items": items}}
 
     def _site_certificate_report(self, site, deployable, allowed_sources, renew_days):
         """Per-site report row; a single bad site never breaks the whole check."""

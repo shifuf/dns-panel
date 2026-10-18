@@ -3297,7 +3297,41 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
             site_id = str(body.get("siteId") or "").strip()
             hosts = body.get("hosts") if isinstance(body.get("hosts"), list) else []
             cert_type = str(body.get("certType") or "managed").strip() or "managed"
-            data = api.modify_hosts_certificate(site_id, hosts, cert_type, body.get("certId"), body.get("certInfo") if isinstance(body.get("certInfo"), dict) else None)
+            cert_id = str(body.get("certId") or "").strip()
+            cert_info = body.get("certInfo") if isinstance(body.get("certInfo"), dict) else None
+
+            # A panel-issued CertId is NOT always usable at EdgeOne: for Let's
+            # Encrypt certs remoteCertId is the domain name, and a Tencent cert
+            # from a different account is account-scoped. Passing either straight
+            # to ModifyHostsCertificate fails with "FailedOperation". Resolve a
+            # real EdgeOne-usable CertId by uploading/reusing the PEM when the
+            # id matches one of this user's panel certificates.
+            if cert_id:
+                panel_cert = None
+                try:
+                    with conn() as c:
+                        panel_cert = c.execute(
+                            """SELECT * FROM ssl_certificates
+                               WHERE userId = ? AND remoteCertId = ? LIMIT 1""",
+                            (uid, cert_id),
+                        ).fetchone()
+                except Exception:
+                    panel_cert = None
+                if panel_cert is not None:
+                    accel_cred_id = int(auth["credential"]["id"] or 0)
+                    accel_secrets = self._credential_secrets(auth["credential"])
+                    try:
+                        resolved = _edge_cert_id_for_ssl_cert(self, uid, panel_cert, accel_secrets, accel_cred_id)
+                        if resolved:
+                            cert_id = resolved
+                    except TencentSslApiError as exc:
+                        self._err(f"证书无法绑定到 EdgeOne：{exc}", int(getattr(exc, "status", 400) or 400))
+                        return
+                    except Exception as exc:
+                        self._err(f"证书无法绑定到 EdgeOne：{exc}", 400)
+                        return
+
+            data = api.modify_hosts_certificate(site_id, hosts, cert_type, cert_id or None, cert_info)
             self._ok(data, "绑定加速证书成功")
             return
 
@@ -7136,6 +7170,92 @@ def _check_ssl_expiry_notifications(uid: int) -> Dict[str, Any]:
     return {"checked": checked, "notified": notified, "expired": expired_pushed}
 
 
+# Certificates this close to expiry are force-deployed to every site and
+# acceleration domain, so the plugin's cron + the panel's daily pass always
+# push a fresh copy BEFORE the edge/origin starts serving an expired cert.
+PRE_EXPIRY_DEPLOY_DAYS = 7
+
+
+def _ensure_pre_expiry_deployments(uid: int, days: int = PRE_EXPIRY_DEPLOY_DAYS) -> Dict[str, Any]:
+    """Guarantee every certificate expiring within `days` is queued for deploy.
+
+    Runs from the daily auto-renew worker AFTER renewal, so a cert that just
+    got renewed (and therefore has a NEW notAfter well beyond the window) is
+    skipped. For any still-expiring-within-the-window issued cert this re-arms
+    its deployment event (queued/running are left alone; success/failed/skipped
+    are reset to queued) so the BaoTa plugin's next claim deploys the fresh copy
+    to every matching site even if a previous attempt already succeeded with an
+    older fingerprint.
+
+    The CDN/EdgeOne edge copy is handled by the worker's own
+    /certificates/sync-edgeone pass that runs right after this one — no handler
+    is available here to reach the acceleration API, and duplicating it would
+    double the cloud calls.
+
+    Idempotent and best-effort: it never raises, and re-queuing an event the
+    plugin already deployed is harmless (the plugin's own downgrade guard keeps
+    it from shrinking host coverage).
+    """
+    summary: Dict[str, Any] = {"scanned": 0, "queued": 0, "domains": []}
+    try:
+        with conn() as c:
+            rows = c.execute(
+                """SELECT provider, remoteCertId, credentialId, domain, notAfter, status
+                   FROM ssl_certificates
+                   WHERE userId = ? AND status = 'issued' AND TRIM(domain) != ''
+                     AND notAfter IS NOT NULL AND TRIM(notAfter) != ''""",
+                (uid,),
+            ).fetchall()
+    except Exception:
+        return summary
+    ts = now_iso()
+    for row in rows:
+        remaining = certificate_days_remaining(row["notAfter"] or "")
+        if remaining is None:
+            continue
+        # Only the pre-expiry window (still valid, but soon to lapse).
+        if remaining < 0 or remaining > max(1, int(days)):
+            continue
+        summary["scanned"] += 1
+        try:
+            with conn() as c:
+                existing = c.execute(
+                    """SELECT id, status FROM ssl_deployment_events
+                       WHERE userId = ? AND provider = ? AND remoteCertId = ? LIMIT 1""",
+                    (uid, row["provider"], row["remoteCertId"]),
+                ).fetchone()
+                if existing is None:
+                    c.execute(
+                        """INSERT INTO ssl_deployment_events
+                           (userId, provider, remoteCertId, credentialId, domain, source, status, createdAt, updatedAt)
+                           VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                        (
+                            uid, row["provider"], row["remoteCertId"], row["credentialId"],
+                            row["domain"], "letsencrypt" if str(row["provider"]) == "acme" else "tencent",
+                            ts, ts,
+                        ),
+                    )
+                elif str(existing["status"] or "") in ("queued", "running"):
+                    # Already awaiting/being handled — leave it alone.
+                    continue
+                else:
+                    # success / failed / skipped → re-arm so the fresh copy is
+                    # pushed again for the pre-expiry guarantee.
+                    c.execute(
+                        """UPDATE ssl_deployment_events SET status = 'queued', attempts = 0,
+                             nextAttemptAt = NULL, targetName = NULL, fingerprint = NULL,
+                             error = NULL, startedAt = NULL, completedAt = NULL, updatedAt = ?
+                           WHERE id = ?""",
+                        (ts, existing["id"]),
+                    )
+                c.commit()
+            summary["queued"] += 1
+            summary["domains"].append(str(row["domain"] or row["remoteCertId"]))
+        except Exception:
+            pass
+    return summary
+
+
 def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     u = self._auth()
     if not u:
@@ -7147,7 +7267,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
 
     # Expected BaoTa plugin version. Bump together with baota-ssl-plugin's
     # info.json so deployed plugins can detect that an update is available.
-    PLUGIN_EXPECTED_VERSION = "1.8.0"
+    PLUGIN_EXPECTED_VERSION = "1.9.0"
 
     def _require_api_scope(required: str) -> bool:
         if not u.get("_api_token"):
@@ -7603,7 +7723,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 {
                     "expectedVersion": PLUGIN_EXPECTED_VERSION,
                     "minVersion": PLUGIN_EXPECTED_VERSION,
-                    "releaseNotes": "部署证书时同步到 EdgeOne/CDN 加速域名、加速证书状态检测与自动续期同步、证书检测页、降级覆盖保护、部署目标可见、证书内容在线查看",
+                    "releaseNotes": "新增加速证书检测页（EdgeOne/CDN 边缘证书状态与漂移一目了然）；修复加速证书标签点击无响应；修复腾讯云/Let's Encrypt 证书互串账号列；证书表格支持横向滚动；证书检测与加速同步更稳定",
                 },
                 "获取插件版本要求成功",
             )

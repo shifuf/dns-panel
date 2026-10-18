@@ -109,6 +109,7 @@ var dnspanel_ssl = {
                 + '    <button class="dps-btn dps-btn-ghost" onclick="dnspanel_ssl.show_issue()">申请证书</button>'
                 + '    <button class="dps-btn dps-btn-ghost" onclick="dnspanel_ssl.show_certs()">查看证书</button>'
                 + '    <button class="dps-btn dps-btn-ghost" onclick="dnspanel_ssl.show_site_check()">检测证书更新</button>'
+                + '    <button class="dps-btn dps-btn-ghost" onclick="dnspanel_ssl.show_accel_check()">加速证书</button>'
                 : '    <button class="dps-btn dps-btn-primary" onclick="dnspanel_ssl.show_config()">前往连接配置</button>')
             + '  </div>'
             + '</div>'
@@ -726,6 +727,77 @@ var dnspanel_ssl = {
         var parts = String(sel.value).split('|');
         var that = this;
         this.deploy_to(parts[0], parts[1], siteName, function () { that.show_site_check(); });
+    },
+
+    // ── Acceleration (EdgeOne / CDN) certificate status ──────────
+    // The 加速证书 tab. Previously index.html called dnspanel_ssl.show_accel_check
+    // which did not exist, so clicking the tab threw a ReferenceError and the
+    // tab looked dead. It now renders the panel's authoritative acceleration
+    // certificate bindings (drift / expiry / failures) in one table.
+    show_accel_check: function () {
+        this.setActiveTab(6);
+        this.setContent('<div class="dps-card"><h3>加速证书检测</h3><div id="accel_check_body">'
+            + this.loadingHtml('正在读取加速证书绑定…') + '</div></div>');
+        var that = this;
+        this.request('accel_check', {}, function (rdata) {
+            that.handle(rdata,
+                function (d) { that.render_accel_check(d.data || {}); },
+                function (err) { $('#accel_check_body').html('<div class="dps-alert error">' + that.esc(err) + '。请先到「连接配置」完成设置。</div>'); });
+        });
+    },
+
+    render_accel_check: function (data) {
+        var items = data.items || [];
+        var summary = data.summary || {};
+        if (!items.length) {
+            $('#accel_check_body').html('<div class="dps-empty">当前没有被加速的域名（或尚未绑定加速证书）。</div>');
+            return;
+        }
+        var stateMap = {
+            synced:   ['ok',   '已同步'],
+            stale:    ['warn', '加速需同步'],
+            expiring: ['warn', '临近到期'],
+            expired:  ['err',  '已过期'],
+            failed:   ['err',  '同步失败'],
+            unknown:  ['info', '状态未知']
+        };
+        var rows = '';
+        for (var i = 0; i < items.length; i++) {
+            var it = items[i];
+            var st = stateMap[it.state] || ['info', it.state];
+            var badge = '<span class="dps-badge ' + st[0] + '">' + st[1] + '</span>';
+            var expiryCell;
+            if (it.notAfter) {
+                var days = (typeof it.daysRemaining === 'number') ? it.daysRemaining : null;
+                var cls = (days !== null && days < 0) ? 'err' : ((days !== null && days <= 30) ? 'warn' : 'ok');
+                expiryCell = '<div class="dps-cell-main">' + this.esc(String(it.notAfter).slice(0, 10)) + '</div>'
+                    + (days === null ? '' : '<span class="dps-badge ' + cls + '">剩余 ' + days + ' 天</span>');
+            } else {
+                expiryCell = '<span style="color:#94a3b8">-</span>';
+            }
+            var certCell = '<div class="dps-cell-sub">面板：' + this.esc(it.certRemoteId || '-') + '</div>'
+                + (it.edgeCertId ? '<div class="dps-cell-sub">边缘：' + this.esc(it.edgeCertId) + '</div>' : '');
+            var syncedAt = it.syncedAt || it.updatedAt || '';
+            rows += '<tr>'
+                + '<td><strong>' + this.esc(it.domainName || '-') + '</strong></td>'
+                + '<td><span class="dps-badge ' + (it.sourceLabel === "Let's Encrypt" ? 'ok' : 'info') + '">' + this.esc(it.sourceLabel || '-') + '</span></td>'
+                + '<td>' + badge + '<div style="font-size:11px;color:#64748b;margin-top:2px">' + this.esc(it.action || '') + '</div></td>'
+                + '<td>' + expiryCell + '</td>'
+                + '<td>' + certCell + '</td>'
+                + '<td><span style="font-size:12px;color:#64748b">' + (syncedAt ? this.esc(syncedAt) : '—') + '</span></td>'
+                + '</tr>';
+        }
+        var summaryHtml = '<div class="dps-alert ' + ((summary.stale || summary.expired || summary.failed) ? 'warn' : 'info') + '" style="margin-bottom:12px;">'
+            + '共 <b>' + (summary.total || 0) + '</b> 个加速域名 · 已同步 <b>' + (summary.synced || 0) + '</b> 个'
+            + ' · 需同步 <b>' + (summary.stale || 0) + '</b> 个'
+            + ' · 临近到期 <b>' + (summary.expiring || 0) + '</b> 个'
+            + ' · 已过期 <b>' + (summary.expired || 0) + '</b> 个'
+            + ' · 同步失败 <b>' + (summary.failed || 0) + '</b> 个</div>'
+            + '<div class="dps-alert info" style="margin-bottom:12px;">加速证书由 DNS 面板自动绑定与续期同步（每日任务 + 过期前 7 天强制部署）。此处仅作只读检查；如需立即重试，请到面板「SSL 证书管理 → 任务 → 加速绑定」点「同步加速」。</div>';
+        $('#accel_check_body').html(
+            summaryHtml
+            + '<div class="dps-table-wrap"><table class="dps-table"><thead><tr><th>加速域名</th><th>来源</th><th>状态</th><th>到期时间</th><th>证书</th><th>最近同步</th></tr></thead>'
+            + '<tbody>' + rows + '</tbody></table></div>');
     },
 
     sync_now: function () {

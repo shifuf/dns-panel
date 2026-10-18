@@ -12,7 +12,7 @@ import {
   updateAccelerationDomainStatus, updateAccelerationSiteStatus, verifyAccelerationSite,
   type AccelerationCertificate, type AccelerationDnsCheck, type AccelerationDomain, type AccelerationDnsRecord, type AccelerationDnsConflict, type AccelerationVerificationInfo, type AccelerationSite,
 } from '@/services/accelerations';
-import { applySslCertificate, getSslCertificates, getSslCredentials, type SslCredential } from '@/services/ssl';
+import { applySslCertificate, getSslCertificates, getSslCredentials, issueAcmeCertificate, type SslCredential } from '@/services/ssl';
 import type { DnsCredential } from '@/types/dns';
 import type { SslCertificate } from '@/types/ssl';
 import { formatDateSafe } from '@/utils/formatters';
@@ -61,6 +61,11 @@ const applyingSslCertificate = ref(false);
 const bindingCert = ref(false);
 const bindHostLocked = ref(false);
 const bindSslCredentialId = ref<number | null>(null);
+// Issuance channel for the in-modal "申请并自动解析" action. 'tencent' uses a
+// Tencent SSL credential (TrustAsia 免费 DV); 'acme' issues a Let's Encrypt
+// cert through a DNS credential (Cloudflare / DNSPod / 阿里云).
+const bindIssueChannel = ref<'tencent' | 'acme'>('tencent');
+const bindAcmeDnsCredId = ref<number | null>(null);
 const editingDomain = ref<string | null>(null);
 const connectionNotice = ref<{ type: 'success' | 'warning' | 'info'; text: string } | null>(null);
 const siteForm = ref({ zoneName: '', area: 'global', type: 'partial', planId: '' });
@@ -367,7 +372,7 @@ const managedSslCertificateChoices = computed(() =>
     }),
 );
 const managedSslCertificateOptions = computed(() =>
-  managedSslCertificateChoices.value.map(({ cert, matched }) => ({
+  validManagedSslCertificateOptions.value.map(({ cert, matched }) => ({
     label: `${cert.domain} · ${cert.remoteCertId}${matched ? ' · 匹配当前域名' : ''}${cert.issuer ? ` · ${cert.issuer}` : ''}${cert.notAfter ? ` · 到期 ${formatDateSafe(cert.notAfter)}` : ''}${cert.credentialName ? ` · ${cert.credentialName}` : ''}`,
     value: cert.remoteCertId,
   })),
@@ -375,11 +380,50 @@ const managedSslCertificateOptions = computed(() =>
 const matchedManagedSslCertificateCount = computed(() =>
   managedSslCertificateChoices.value.filter((item) => item.matched).length,
 );
+// DNS credentials acme.sh can drive for a Let's Encrypt (DNS-01) issuance.
+const acmeDnsCredentialOptions = computed(() =>
+  dnsCredentials.value
+    .filter((item) => ['cloudflare', 'dnspod', 'dnspod_token', 'aliyun'].includes(String(item.provider || '').toLowerCase()))
+    .map((item) => ({ label: `${item.name} · ${item.providerName || item.provider}`, value: item.id })),
+);
+const bindIssueChannels = computed(() => {
+  const opts: Array<{ label: string; value: 'tencent' | 'acme' }> = [];
+  if (sslCredentials.value.length) opts.push({ label: '腾讯云 DV（TrustAsia 免费证书）', value: 'tencent' });
+  if (acmeDnsCredentialOptions.value.length) opts.push({ label: "Let's Encrypt（acme.sh）", value: 'acme' });
+  return opts;
+});
+// Expiry helpers. A certificate past notAfter must never be bound to an
+// acceleration domain (EdgeOne rejects it and the edge would serve a dead
+// cert). daysUntil mirrors the backend's certificate_days_remaining.
+function daysUntil(notAfter?: string | null): number | null {
+  const raw = String(notAfter || '').trim();
+  if (!raw) return null;
+  const ts = Date.parse(raw.includes('T') ? raw : raw.replace(' ', 'T') + (raw.endsWith('Z') ? '' : 'Z'));
+  if (Number.isNaN(ts)) return null;
+  return Math.floor((ts - Date.now()) / 86400000);
+}
+function isCertExpired(notAfter?: string | null): boolean {
+  const days = daysUntil(notAfter);
+  return days !== null && days < 0;
+}
 const selectedManagedSslCertificate = computed(() => findManagedSslCertificateById(certBindForm.value.certId));
 const selectedManagedSslPending = computed(() => {
   const status = String(selectedManagedSslCertificate.value?.status || '').toLowerCase();
   return !!selectedManagedSslCertificate.value && !['issued', 'upload'].includes(status);
 });
+const selectedManagedSslExpired = computed(() => {
+  const cert = selectedManagedSslCertificate.value;
+  return !!cert && isCertExpired(cert.notAfter);
+});
+// Valid (issued/upload, not expired) panel certs covering the bind hosts, best
+// first (most matching, latest expiry). Used to auto-pick a certificate and to
+// surface an expired-selection warning.
+const validManagedSslCertificateOptions = computed(() =>
+  managedSslCertificateChoices.value.filter(({ cert }) => !isCertExpired(cert.notAfter)),
+);
+const hasExpiredManagedSslCertificates = computed(() =>
+  managedSslCertificateChoices.value.some(({ cert }) => isCertExpired(cert.notAfter)),
+);
 const bindTargetHost = computed(() => bindHosts.value.length === 1 ? bindHosts.value[0] : '');
 const sslCredentialOptions = computed(() =>
   sslCredentials.value.map((item) => ({
@@ -408,14 +452,19 @@ const isCurrentBindingAlreadyApplied = computed(() => {
     return normalizeCertificateId(String(cert?.certId || cert?.certificateId || '')) === selectedCertId;
   });
 });
-const canApplySslForBind = computed(() => !!bindTargetHost.value && !!bindSslCredentialId.value);
+const canApplySslForBind = computed(() =>
+  !!bindTargetHost.value
+  && (bindIssueChannel.value === 'acme' ? !!bindAcmeDnsCredId.value : !!bindSslCredentialId.value),
+);
 const bindSubmitLabel = computed(() => {
   if (isCurrentBindingAlreadyApplied.value) return '已绑定';
+  if (selectedManagedSslExpired.value) return '证书已过期';
   if (selectedManagedSslPending.value) return '等待签发';
   return '提交绑定';
 });
 const canSubmitBind = computed(() => {
   if (isCurrentBindingAlreadyApplied.value) return false;
+  if (selectedManagedSslExpired.value) return false;
   if (!bindHosts.value.length || !certBindForm.value.certId.trim()) return false;
   if (selectedManagedSslPending.value) return false;
   return true;
@@ -619,15 +668,27 @@ async function loadManagedSslCertificates(preferredHosts: string[] = bindHosts.v
       }
     }
     sslManagedCertificates.value = Array.from(merged.values());
-    if (showCertBindModal.value && !certBindForm.value.certId.trim()) {
-      const preferred = sslManagedCertificates.value.find((item) =>
-        ['issued', 'upload'].includes(String(item.status || '').toLowerCase())
-        && (!preferredHosts.length || preferredHosts.some((host) => certificateMatchesHost(item, host))),
-      );
-      if (preferred?.remoteCertId) {
-        certBindForm.value.certId = preferred.remoteCertId;
-        if (!bindSslCredentialId.value && typeof preferred.credentialId === 'number') {
-          bindSslCredentialId.value = preferred.credentialId;
+    if (showCertBindModal.value) {
+      // Auto-pick a certificate only when the field is empty OR currently holds
+      // an expired one — an expired selection would fail the EdgeOne bind, so
+      // silently upgrade it to the best valid, host-matching cert available.
+      const selected = findManagedSslCertificateById(certBindForm.value.certId);
+      const needsPick = !certBindForm.value.certId.trim() || (selected ? isCertExpired(selected.notAfter) : false);
+      if (needsPick) {
+        const preferred = sslManagedCertificates.value.find((item) =>
+          ['issued', 'upload'].includes(String(item.status || '').toLowerCase())
+          && !isCertExpired(item.notAfter)
+          && (!preferredHosts.length || preferredHosts.some((host) => certificateMatchesHost(item, host))),
+        );
+        if (preferred?.remoteCertId) {
+          certBindForm.value.certId = preferred.remoteCertId;
+          if (!bindSslCredentialId.value && typeof preferred.credentialId === 'number') {
+            bindSslCredentialId.value = preferred.credentialId;
+          }
+        } else if (selected && isCertExpired(selected.notAfter)) {
+          // No valid replacement — clear the expired pick so the user must
+          // choose or issue one rather than binding a dead certificate.
+          certBindForm.value.certId = '';
         }
       }
     }
@@ -1040,6 +1101,10 @@ function openBindCertificate(item?: AccelerationCertificate | AccelerationDomain
       || ('certificateId' in (item || {}) ? ((item as AccelerationCertificate).certificateId || (item as AccelerationCertificate).certId || '') : ''),
   };
   bindHostLocked.value = isDomainTarget && !!host;
+  certBindForm.value.certId = isCertExpired(boundCertificate?.expireTime) ? '' : certBindForm.value.certId;
+  // Default the issue channel to whichever the account can actually use.
+  bindIssueChannel.value = sslCredentials.value.length ? 'tencent' : 'acme';
+  bindAcmeDnsCredId.value = acmeDnsCredentialOptions.value[0]?.value ?? null;
   sslManagedCertificates.value = [];
   showCertBindModal.value = true;
   void Promise.all([
@@ -1051,15 +1116,32 @@ function openBindCertificate(item?: AccelerationCertificate | AccelerationDomain
 async function applySslForBind() {
   const host = bindTargetHost.value;
   if (!host) { message.error('请从单个加速域名进入后再申请证书'); return; }
-  if (!bindSslCredentialId.value) { message.error('请选择 SSL 账户'); return; }
+  if (bindIssueChannel.value === 'acme' && !bindAcmeDnsCredId.value) {
+    message.error("请选择用于 Let's Encrypt DNS 验证的 DNS 凭证"); return;
+  }
+  if (bindIssueChannel.value === 'tencent' && !bindSslCredentialId.value) {
+    message.error('请选择腾讯云 SSL 账户'); return;
+  }
   applyingSslCertificate.value = true;
   try {
     const currentBound = getBoundCertificateByHost(host);
     const currentSslCertId = currentBound?.source === 'ssl'
       ? String(currentBound.certId || currentBound.certificateId || '').trim()
       : '';
+    if (bindIssueChannel.value === 'acme') {
+      // Let's Encrypt via acme.sh (DNS-01); the cert row appears as 'applying'
+      // and finishes in the panel worker — the user binds it after issuance.
+      const res = await issueAcmeCertificate({
+        dnsCredentialId: bindAcmeDnsCredId.value!,
+        domain: host,
+        keyLength: '2048',
+      });
+      await loadManagedSslCertificates([host]);
+      message.success(res.message || "已开始通过 Let's Encrypt 签发；签发完成后请回到此处刷新并提交绑定。");
+      return;
+    }
     const res = await applySslCertificate({
-      credentialId: bindSslCredentialId.value,
+      credentialId: bindSslCredentialId.value!,
       domain: host,
       dvAuthMethod: 'DNS',
       dnsCredentialId: dnsCredentialId.value || undefined,
@@ -1091,6 +1173,7 @@ async function bindCertificate() {
   const hosts = parseList(certBindForm.value.hosts);
   if (!hosts.length) { message.error('请至少填写一个域名'); return; }
   if (!certBindForm.value.certId.trim()) { message.error('请选择或填写托管证书 ID'); return; }
+  if (selectedManagedSslExpired.value) { message.error('所选证书已过期，无法绑定；请选择有效期内的证书或先申请新证书'); return; }
   if (isCurrentBindingAlreadyApplied.value) { message.info('当前域名已绑定该证书'); return; }
   if (selectedManagedSslPending.value) { message.warning('当前 SSL 证书还未签发完成，请稍后刷新后再绑定'); return; }
   bindingCert.value = true;
@@ -1140,6 +1223,16 @@ watch(credentialId, async (value, prev) => {
 
 watch(selectedManagedSslCertificate, (value) => {
   if (!value?.credentialId) return;
+  const isAcme = value.provider === 'acme' || value.source === 'letsencrypt';
+  if (isAcme) {
+    // A Let's Encrypt cert's credentialId is a DNS credential, not a Tencent
+    // SSL account — never write it into the Tencent account field. If the user
+    // is picking an LE cert to re-issue from, reflect that channel instead.
+    if (bindIssueChannel.value === 'acme' && acmeDnsCredentialOptions.value.some((o) => o.value === value.credentialId)) {
+      bindAcmeDnsCredId.value = value.credentialId;
+    }
+    return;
+  }
   if (!bindSslCredentialId.value || !sslCredentials.value.some((item) => item.id === bindSslCredentialId.value)) {
     bindSslCredentialId.value = value.credentialId;
   }
@@ -1432,17 +1525,30 @@ onMounted(async () => {
           <div class="space-y-3 rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
             <div class="flex items-start justify-between gap-3">
               <div>
-                <label class="block text-sm text-slate-500">SSL 账户</label>
-                <p class="mt-1 text-xs text-slate-500">申请动作直接调用 SSL 证书页的真实接口，不再走 EdgeOne 自己的申请逻辑。</p>
+                <label class="block text-sm text-slate-500">SSL 账户 / 签发渠道</label>
+                <p class="mt-1 text-xs text-slate-500">申请动作直接调用 SSL 证书页的真实接口，支持腾讯云 DV 与 Let's Encrypt（acme.sh）。</p>
               </div>
               <NButton size="small" secondary :loading="loadingSslCredentials" @click="loadSslCredentials">刷新账户</NButton>
             </div>
             <NSelect
+              v-model:value="bindIssueChannel"
+              :options="bindIssueChannels"
+              :loading="loadingSslCredentials"
+              placeholder="选择签发渠道"
+            />
+            <NSelect
+              v-if="bindIssueChannel === 'tencent'"
               v-model:value="bindSslCredentialId"
               :options="sslCredentialOptions"
               :loading="loadingSslCredentials"
               clearable
-              placeholder="选择用于申请证书的 SSL 账户"
+              placeholder="选择用于申请证书的腾讯云 SSL 账户"
+            />
+            <NSelect
+              v-else
+              v-model:value="bindAcmeDnsCredId"
+              :options="acmeDnsCredentialOptions"
+              placeholder="选择用于 DNS-01 验证的 DNS 凭证"
             />
             <div class="flex justify-end">
               <NButton size="small" type="primary" secondary :loading="applyingSslCertificate" :disabled="!canApplySslForBind" @click="applySslForBind">申请并自动解析</NButton>
@@ -1468,8 +1574,14 @@ onMounted(async () => {
           </div>
         </div>
         <NAlert v-if="!bindTargetHost" type="info" :bordered="false">申请 SSL 证书仅支持单个加速域名，请从具体域名的“绑证书”进入。</NAlert>
-        <NAlert v-else-if="!sslCredentialOptions.length" type="warning" :bordered="false">当前没有可用的 SSL 账户，无法在这里发起真实证书申请；你仍可手动填写已有 CertId 进行绑定。</NAlert>
-        <NAlert v-if="selectedManagedSslCertificate" :type="selectedManagedSslPending ? 'warning' : 'success'" :bordered="false">
+        <NAlert v-else-if="!bindIssueChannels.length" type="warning" :bordered="false">当前没有可用的 SSL 账户或 DNS 凭证，无法在这里发起真实证书申请；你仍可手动填写已有 CertId 进行绑定。</NAlert>
+        <NAlert v-if="selectedManagedSslExpired" type="error" :bordered="false">
+          所选证书已于 {{ formatDateSafe(selectedManagedSslCertificate?.notAfter) }} 过期，无法绑定到 EdgeOne。请在上方选择有效期内的证书，或先申请一张新证书。
+        </NAlert>
+        <NAlert v-else-if="hasExpiredManagedSslCertificates" type="warning" :bordered="false">
+          证书库中存在已过期的证书，已从可选列表中隐藏；如当前域名只有过期证书，请先申请或续期。
+        </NAlert>
+        <NAlert v-if="selectedManagedSslCertificate && !selectedManagedSslExpired" :type="selectedManagedSslPending ? 'warning' : 'success'" :bordered="false">
           当前证书：{{ selectedManagedSslCertificate.domain }} · {{ selectedManagedSslCertificate.remoteCertId }} · {{ selectedManagedSslCertificate.issuer || '-' }} · 状态 {{ selectedManagedSslCertificate.status }} · 到期 {{ formatDateSafe(selectedManagedSslCertificate.notAfter) }}
         </NAlert>
         <NAlert v-else-if="certBindForm.certId.trim() && !loadingSslManagedCertificates" type="warning" :bordered="false">当前 CertId 未在 SSL 证书库中找到。若加速域名显示已绑证书但这里找不到，说明它来自 EdgeOne 当前绑定信息，不是本系统 SSL 证书页里的真实证书记录。</NAlert>

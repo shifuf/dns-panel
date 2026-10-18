@@ -1640,7 +1640,10 @@ const credentialSummary = computed(() =>
 const filterOptions = computed(() => {
   const list = credentialSummary.value.map(item => ({
     id: item.credentialId,
-    name: `${item.credentialName || `#${item.credentialId}`} · ${item.source === 'letsencrypt' ? "Let's Encrypt" : '腾讯云'}`,
+    // Lead with the channel so a Tencent SSL credential and a DNS credential
+    // that happen to share a name (e.g. both "腾讯云Shifuf") are never read as
+    // one merged account.
+    name: `${item.source === 'letsencrypt' ? "Let's Encrypt" : '腾讯云'} · ${item.credentialName || `#${item.credentialId}`}`,
     count: item.count,
   }));
   return [
@@ -1661,7 +1664,8 @@ const columns = computed(() => {
     {
       title: '域名',
       key: 'domain',
-      minWidth: 180,
+      width: 220,
+      fixed: 'left' as const,
       render: (row: SslCertificate) => {
         const sanCount = typeof row.san === 'number' ? row.san : (Array.isArray(row.san) ? row.san.length : 0);
         return h('div', { class: 'space-y-1' }, [
@@ -1690,9 +1694,15 @@ const columns = computed(() => {
         const shownName = isAcme
           ? (acmeCred?.name || row.credentialName || credNameById(row.credentialId) || `#${row.credentialId}`)
           : (row.credentialName || credNameById(row.credentialId) || (row.credentialId ? `#${row.credentialId}` : '-'));
+        // Lead with the CHANNEL (腾讯云 / Let's Encrypt) and show the account
+        // name after it. A Tencent SSL credential and a DNS credential can
+        // share a display name (both "腾讯云Shifuf"), so suffixing the channel
+        // made the two rows read as one merged account — the channel is the
+        // real discriminator, so it goes first.
         return h('div', { class: 'flex items-center gap-1' }, [
-          h(NTag, { size: 'tiny', bordered: false, type: isAcme ? 'success' : 'info' }, () => shownName),
-          h('span', { class: 'text-xs text-slate-400' }, isAcme ? 'Let\'s Encrypt' : '腾讯云'),
+          h(NTag, { size: 'tiny', bordered: false, type: isAcme ? 'success' : 'info' },
+            () => isAcme ? "Let's Encrypt" : '腾讯云'),
+          h('span', { class: 'text-xs text-slate-500 truncate' }, shownName),
         ]);
       },
     });
@@ -1875,6 +1885,18 @@ const columns = computed(() => {
 
   return cols;
 });
+
+// Horizontal scroll width = sum of every column's declared width. naived-ui
+// treats scroll-x as the table's minimum width: when it was a hard-coded
+// 900/1000 but the columns actually summed to ~1400, the table compressed and
+// clipped the trailing 操作 column instead of scrolling. Deriving it from the
+// real widths guarantees the columns keep their size and a scrollbar appears.
+const tableScrollX = computed(() =>
+  columns.value.reduce((sum: number, col: any) => {
+    const w = Number(col.width) || Number(col.minWidth) || 0;
+    return sum + (w || 48); // selection / width-less columns ≈ 48px
+  }, 0),
+);
 </script>
 
 <template>
@@ -2178,8 +2200,8 @@ const columns = computed(() => {
             <span>{{ cert.productName || cert.certType || '-' }}</span>
             <NTag v-if="isAllMode" size="tiny" :bordered="false" :type="(cert.provider === 'acme' || cert.source === 'letsencrypt') ? 'success' : 'info'">
               {{ (cert.provider === 'acme' || cert.source === 'letsencrypt')
-                ? `${(dnsCredentials || []).find(c => c.id === cert.credentialId)?.name || cert.credentialName || ''} · Let's Encrypt`
-                : `${cert.credentialName || credNameById(cert.credentialId)} · 腾讯云` }}
+                ? `Let's Encrypt · ${(dnsCredentials || []).find(c => c.id === cert.credentialId)?.name || cert.credentialName || ''}`
+                : `腾讯云 · ${cert.credentialName || credNameById(cert.credentialId)}` }}
             </NTag>
           </div>
           <div class="flex items-center justify-between text-xs text-slate-500">
@@ -2226,7 +2248,7 @@ const columns = computed(() => {
           :bordered="false"
           size="small"
           class="table-scrollable"
-          :scroll-x="isAllMode ? 1000 : 900"
+          :scroll-x="tableScrollX"
           :max-height="560"
         />
       </template>

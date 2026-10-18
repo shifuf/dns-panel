@@ -849,5 +849,106 @@ class MultiCdnBinderTests(unittest.TestCase):
             rh._cdn_binding_credential(handler, 1, 7, "aliyun")
 
 
+class PreExpiryDeployTests(unittest.TestCase):
+    """The daily pre-expiry (≤7d) deploy guarantee."""
+
+    def _build(self, not_after: str):
+        d = tempfile.mkdtemp()
+        db = Path(d) / "t.db"
+        db_migrate.migrate(db)
+        raw = sqlite3.connect(str(db))
+        raw.row_factory = sqlite3.Row
+        raw.execute(
+            """INSERT INTO ssl_certificates
+               (userId, credentialId, provider, remoteCertId, domain, status, notAfter, autoRenew)
+               VALUES (1, 9, 'tencent_ssl', 'SSLCERT-1', 'cdn.example.com', 'issued', ?, 0)""",
+            (not_after,),
+        )
+        raw.commit()
+        self.addCleanup(lambda: (raw.close(), shutil.rmtree(d, ignore_errors=True)))
+        return raw
+
+    def test_soon_expiring_cert_is_queued(self) -> None:
+        import modules.route_handlers as rh
+        # ~3 days out → inside the 7-day pre-expiry window.
+        from datetime import datetime, timedelta, timezone
+        soon = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        raw = self._build(soon)
+        orig = (rh.conn, rh.now_iso)
+        rh.conn = lambda: raw
+        rh.now_iso = lambda: "2026-10-18T00:00:00Z"
+        try:
+            out = rh._ensure_pre_expiry_deployments(1)
+        finally:
+            rh.conn, rh.now_iso = orig
+        self.assertEqual(out["queued"], 1)
+        self.assertIn("cdn.example.com", out["domains"])
+        row = raw.execute("SELECT status FROM ssl_deployment_events WHERE userId=1").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "queued")
+
+    def test_far_expiring_cert_is_skipped(self) -> None:
+        import modules.route_handlers as rh
+        from datetime import datetime, timedelta, timezone
+        far = (datetime.now(timezone.utc) + timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        raw = self._build(far)
+        orig = (rh.conn, rh.now_iso)
+        rh.conn = lambda: raw
+        rh.now_iso = lambda: "2026-10-18T00:00:00Z"
+        try:
+            out = rh._ensure_pre_expiry_deployments(1)
+        finally:
+            rh.conn, rh.now_iso = orig
+        self.assertEqual(out["queued"], 0)
+        self.assertEqual(raw.execute("SELECT COUNT(*) c FROM ssl_deployment_events").fetchone()["c"], 0)
+
+    def test_requeues_a_success_event_for_pre_expiry(self) -> None:
+        import modules.route_handlers as rh
+        from datetime import datetime, timedelta, timezone
+        soon = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        raw = self._build(soon)
+        raw.execute(
+            """INSERT INTO ssl_deployment_events
+               (userId, provider, remoteCertId, credentialId, domain, source, status, attempts, createdAt, updatedAt)
+               VALUES (1,'tencent_ssl','SSLCERT-1',9,'cdn.example.com','tencent','success',1,'x','x')"""
+        )
+        raw.commit()
+        orig = (rh.conn, rh.now_iso)
+        rh.conn = lambda: raw
+        rh.now_iso = lambda: "2026-10-18T00:00:00Z"
+        try:
+            out = rh._ensure_pre_expiry_deployments(1)
+        finally:
+            rh.conn, rh.now_iso = orig
+        self.assertEqual(out["queued"], 1)
+        row = raw.execute("SELECT status, attempts FROM ssl_deployment_events WHERE userId=1").fetchone()
+        self.assertEqual(row["status"], "queued")
+        self.assertEqual(row["attempts"], 0)
+
+    def test_queued_event_is_left_untouched(self) -> None:
+        import modules.route_handlers as rh
+        from datetime import datetime, timedelta, timezone
+        soon = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        raw = self._build(soon)
+        raw.execute(
+            """INSERT INTO ssl_deployment_events
+               (userId, provider, remoteCertId, credentialId, domain, source, status, attempts, createdAt, updatedAt)
+               VALUES (1,'tencent_ssl','SSLCERT-1',9,'cdn.example.com','tencent','queued',2,'x','x')"""
+        )
+        raw.commit()
+        orig = (rh.conn, rh.now_iso)
+        rh.conn = lambda: raw
+        rh.now_iso = lambda: "2026-10-18T00:00:00Z"
+        try:
+            out = rh._ensure_pre_expiry_deployments(1)
+        finally:
+            rh.conn, rh.now_iso = orig
+        # Already queued → not counted as re-armed, attempts preserved.
+        self.assertEqual(out["queued"], 0)
+        row = raw.execute("SELECT status, attempts FROM ssl_deployment_events WHERE userId=1").fetchone()
+        self.assertEqual(row["status"], "queued")
+        self.assertEqual(row["attempts"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
