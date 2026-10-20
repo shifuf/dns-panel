@@ -41,7 +41,7 @@ from modules.dns_provider_api import DnsProviderApiError, build_dns_provider_api
 # ── Application version ─────────────────────────────────────────
 # Fallback version for local/offline environments. GitHub Releases are the
 # primary public version source and are created automatically by Actions.
-APP_VERSION = os.getenv("APP_VERSION", "0.24").strip() or "0.24"
+APP_VERSION = os.getenv("APP_VERSION", "0.29").strip() or "0.29"
 UPSTREAM_GITHUB_REPO = os.getenv("UPSTREAM_GITHUB_REPO", "shifuf/dns-panel").strip() or "shifuf/dns-panel"
 UPSTREAM_GITHUB_REPO_URL = f"https://github.com/{UPSTREAM_GITHUB_REPO}"
 VERSION_CACHE_TTL_SECONDS = 1800
@@ -149,7 +149,13 @@ PROVIDER_NAMES = {
     "dnsla": "DNSLA",
     "tencent_ssl": "腾讯云 SSL",
     "edgeone": "腾讯云 EdgeOne",
+    "qiniu": "七牛云",
+    "upyun": "又拍云",
 }
+# SSL renewal window: a certificate is re-issued once it is inside this many
+# days of expiry (Let's Encrypt / Tencent); a manual replacement upload is only
+# accepted inside the shorter 7-day pre-expiry window.
+DEFAULT_SSL_RENEWAL_DAYS = 30
 DEFAULT_LOG_RETENTION_DAYS = 90
 DEFAULT_RETRY_MAX_ATTEMPTS = 3
 DEFAULT_RETRY_INTERVAL_SECONDS = 2
@@ -164,11 +170,18 @@ SUPPORTED_DNS_PROVIDER_TYPES = tuple(get_supported_provider_types_by_category("d
 SUPPORTED_DNS_RECORD_PROVIDER_TYPES = tuple(get_record_management_provider_types())
 SUPPORTED_SSL_PROVIDER_TYPES = tuple(get_supported_provider_types_by_category("ssl"))
 SUPPORTED_ACCELERATION_PROVIDER_TYPES = tuple(get_supported_provider_types_by_category("acceleration"))
+SUPPORTED_CERT_UPLOAD_PROVIDER_TYPES = tuple(get_supported_provider_types_by_category("cert_upload"))
 SUPPORTED_NON_SSL_PROVIDER_TYPES = tuple(SUPPORTED_DNS_PROVIDER_TYPES)
 SUPPORTED_DNS_PROVIDER_SET = frozenset(SUPPORTED_DNS_PROVIDER_TYPES)
 SUPPORTED_DNS_RECORD_PROVIDER_SET = frozenset(SUPPORTED_DNS_RECORD_PROVIDER_TYPES)
 SUPPORTED_SSL_PROVIDER_SET = frozenset(SUPPORTED_SSL_PROVIDER_TYPES)
+# A DNSPod credential routinely doubles as the Tencent SSL account (it carries
+# SecretId/SecretKey), so SSL backup/restore must accept it alongside
+# 'tencent_ssl' — otherwise those certificates and their credential are lost.
+SSL_CAPABLE_PROVIDER_SET = frozenset(SUPPORTED_SSL_PROVIDER_TYPES) | frozenset({"dnspod"})
 SUPPORTED_ACCELERATION_PROVIDER_SET = frozenset(SUPPORTED_ACCELERATION_PROVIDER_TYPES)
+SUPPORTED_CERT_UPLOAD_PROVIDER_SET = frozenset(SUPPORTED_CERT_UPLOAD_PROVIDER_TYPES)
+SUPPORTED_CERT_UPLOAD_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_CERT_UPLOAD_PROVIDER_TYPES)
 SUPPORTED_NON_SSL_PROVIDER_SET = frozenset(SUPPORTED_NON_SSL_PROVIDER_TYPES)
 SUPPORTED_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_PROVIDER_TYPES)
 SUPPORTED_DNS_PROVIDER_SQL = ", ".join("?" for _ in SUPPORTED_DNS_PROVIDER_TYPES)
@@ -407,6 +420,73 @@ def setup_status_dict() -> Dict[str, Any]:
     }
 
 
+def _backup_acmefile_content(path: Path, *, private: bool = False) -> Dict[str, Any]:
+    """Read one ACME state file into a portable backup form."""
+    if not path.is_file():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    entry: Dict[str, Any] = {"file": path.name}
+    if private:
+        try:
+            from modules.acme_api import _decrypt_pem_text
+            plain = _decrypt_pem_text(raw)
+        except Exception:
+            plain = raw
+        entry["content"] = encrypt_text(plain) if plain else ""
+        entry["private"] = True
+    else:
+        entry["content"] = raw
+        entry["private"] = False
+    return entry
+
+
+def _export_acme_runtime_files(cert_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Snapshot acme.sh state needed to serve existing certificates.
+
+    The full account directory can be large and contains host identity key
+    material, so the portable backup intentionally stores certificate/conf/CSR
+    files plus only the deployed private key (encrypted with the panel key).
+    """
+    try:
+        from modules import acme_api
+        acme_home = Path(acme_api.ACME_HOME)
+    except Exception:
+        return []
+    entries: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(rel: Path, *, private: bool = False) -> None:
+        key = str(rel)
+        if key in seen:
+            return
+        body = _backup_acmefile_content(acme_home / rel, private=private)
+        if body:
+            body["relativePath"] = key
+            entries.append(body)
+            seen.add(key)
+
+    for row in cert_rows or []:
+        primary = str(row.get("domain") or "").strip()
+        if not primary:
+            continue
+        safe = primary.replace("*", "_wildcard_")
+        for directory in (safe, safe + "_ecc"):
+            for name in ("fullchain.cer", "fullchain.pem", "cert.cer", "cert.pem", "csr.conf", f"{safe}.conf", f"{safe}.csr"):
+                add(Path(directory) / name)
+        for name in ("fullchain.pem", "privkey.pem"):
+            add(Path("deployed") / safe / name, private=(name == "privkey.pem"))
+    return entries
+
+
+def backup_contains_acme_runtime(items: Any) -> bool:
+    return isinstance(items, list) and any(isinstance(item, dict) and item.get("relativePath") for item in items)
+
+
 def export_backup_payload(user_id: int, scopes: List[str]) -> Dict[str, Any]:
     selected = [scope for scope in scopes if scope in VALID_BACKUP_SCOPES]
     if not selected:
@@ -446,14 +526,19 @@ def export_backup_payload(user_id: int, scopes: List[str]) -> Dict[str, Any]:
             }
 
         if "ssl" in selected:
+            # Any credential that holds Tencent SecretId/SecretKey owns SSL
+            # certificates — a DNSPod/DNS credential is routinely also the SSL
+            # account, so backing up only provider='tencent_ssl' lost them.
+            cert_upload_sql = ", ".join("?" for _ in SUPPORTED_CERT_UPLOAD_PROVIDER_TYPES) or "''"
             cred_rows = c.execute(
-                """
+                f"""
                 SELECT id, name, provider, secrets, accountId, isDefault, createdAt, updatedAt
                 FROM dns_credentials
-                WHERE userId = ? AND provider = 'tencent_ssl'
+                WHERE userId = ? AND (provider = 'tencent_ssl' OR provider = 'dnspod'
+                      OR provider IN ({cert_upload_sql}))
                 ORDER BY createdAt ASC, id ASC
                 """,
-                (user_id,),
+                (user_id, *SUPPORTED_CERT_UPLOAD_PROVIDER_TYPES),
             ).fetchall()
             cert_rows = c.execute(
                 """
@@ -466,6 +551,77 @@ def export_backup_payload(user_id: int, scopes: List[str]) -> Dict[str, Any]:
                 """,
                 (user_id,),
             ).fetchall() if table_exists("ssl_certificates") else []
+            # Let's Encrypt (acme.sh) certificates live only in the panel DB, and
+            # acceleration (EdgeOne/CDN) bindings live in their own tables — none
+            # of them were part of the backup, so a restore lost the whole ACME
+            # channel and every edge certificate binding.
+            acme_cert_rows = c.execute(
+                """
+                SELECT id, credentialId, provider, remoteCertId, domain, san, certType, productName,
+                       status, statusMsg, issuer, notBefore, notAfter, dvAuthMethod, isUploaded,
+                       remoteCreatedAt, syncedAt, createdAt, updatedAt, autoRenew, autoRenewDays,
+                       lastRenewedAt, acmeCa
+                FROM ssl_certificates
+                WHERE userId = ? AND provider = 'acme'
+                ORDER BY createdAt ASC, id ASC
+                """,
+                (user_id,),
+            ).fetchall() if table_exists('ssl_certificates') else []
+            acme_job_rows = c.execute(
+                """
+                SELECT id, certificateId, credentialId, domain, ca, eabKid, eabHmac, status,
+                       attempts, lastError, createdAt, updatedAt, completedAt
+                FROM ssl_acme_jobs
+                WHERE userId = ?
+                ORDER BY createdAt ASC, id ASC
+                """,
+                (user_id,),
+            ).fetchall() if table_exists('ssl_acme_jobs') else []
+            accel_state_rows = c.execute(
+                """
+                SELECT id, dnsCredentialId, zoneId, zoneName, recordId, recordName,
+                       accelerationProvider, accelerationCredentialId, accelerationSiteId,
+                       accelerationDomain, accelerationTarget, originalRecord, acceleratedRecord,
+                       enabled, createdAt, updatedAt
+                FROM dns_record_acceleration_states
+                WHERE userId = ?
+                ORDER BY createdAt ASC, id ASC
+                """,
+                (user_id,),
+            ).fetchall() if table_exists('dns_record_acceleration_states') else []
+            accel_binding_rows = c.execute(
+                """
+                SELECT id, provider, accelerationCredentialId, siteId, domainName, source,
+                       certRemoteId, edgeCertId, fingerprint, notAfter, status, lastError,
+                       syncedAt, createdAt, updatedAt
+                FROM acceleration_cert_bindings
+                WHERE userId = ?
+                ORDER BY createdAt ASC, id ASC
+                """,
+                (user_id,),
+            ).fetchall() if table_exists('acceleration_cert_bindings') else []
+            accel_request_rows = c.execute(
+                """
+                SELECT id, provider, credentialId, siteId, domainNames, status, attempts,
+                       lastError, verification, createdAt, updatedAt, completedAt
+                FROM acceleration_cert_requests
+                WHERE userId = ?
+                ORDER BY createdAt ASC, id ASC
+                """,
+                (user_id,),
+            ).fetchall() if table_exists('acceleration_cert_requests') else []
+
+            platform_deploy_rows = c.execute(
+                """
+                SELECT id, provider, credentialId, certRowId, certRemoteId, fingerprint, domain,
+                       platformCertId, platformCertName, notBefore, notAfter, status, lastError,
+                       uploadedAt, syncedAt, createdAt, updatedAt
+                FROM ssl_platform_deployments
+                WHERE userId = ?
+                ORDER BY createdAt ASC, id ASC
+                """,
+                (user_id,),
+            ).fetchall() if table_exists('ssl_platform_deployments') else []
             payload["data"]["ssl"] = {
                 "credentials": [
                     {
@@ -504,9 +660,66 @@ def export_backup_payload(user_id: int, scopes: List[str]) -> Dict[str, Any]:
                     }
                     for row in cert_rows
                 ],
+                # 第三方平台（七牛云/又拍云）证书部署记录。
+                "platformDeployments": [dict(row) for row in platform_deploy_rows],
+                # Let's Encrypt (acme.sh) channel: certificates + issuance jobs.
+                "acmeCertificates": [dict(row) for row in acme_cert_rows],
+                "acmeJobs": [dict(row) for row in acme_job_rows],
+                # EdgeOne / CDN acceleration: DNS records that are accelerated,
+                # the certificate bindings pushed to the edge, and any pending
+                # acceleration certificate requests.
+                "accelerationStates": [dict(row) for row in accel_state_rows],
+                "accelerationBindings": [dict(row) for row in accel_binding_rows],
+                "accelerationRequests": [dict(row) for row in accel_request_rows],
+                # acme.sh's live account/config state under ACME_HOME. Private
+                # keys are exported as ciphertext with the backup key so a
+                # restore can actually serve the certificate again; the account
+                # key remains on the host because it is a machine identity, not
+                # panel data.
+                "acmeRuntime": _export_acme_runtime_files([dict(row) for row in acme_cert_rows]),
             }
 
     return payload
+
+
+def _restore_acme_runtime_files(items: Any) -> Dict[str, int]:
+    """Restore ACME runtime files into ACME_HOME with path safety checks."""
+    if not isinstance(items, list):
+        return {"certificates": 0, "files": 0}
+    try:
+        from modules import acme_api
+        base = Path(acme_api.ACME_HOME).resolve()
+    except Exception:
+        return {"certificates": 0, "files": 0}
+    base.mkdir(parents=True, exist_ok=True)
+    restored: Dict[str, int] = {"certificates": 0, "files": 0}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rel_raw = str(item.get("relativePath") or "").strip().replace(chr(92), "/")
+        content = str(item.get("content") or "")
+        if not rel_raw or not content:
+            continue
+        rel = Path(rel_raw)
+        if rel.is_absolute() or ".." in rel.parts:
+            continue
+        target = (base / rel).resolve()
+        if base not in target.parents:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if item.get("private"):
+            plain = decrypt_text(content) if ":" in content else content
+            try:
+                from modules.acme_api import _write_private_key
+                _write_private_key(target, plain)
+            except Exception:
+                target.write_text(plain, encoding="utf-8")
+        else:
+            target.write_text(content, encoding="utf-8")
+        restored["files"] += 1
+        if rel.name in ("fullchain.cer", "fullchain.pem"):
+            restored["certificates"] += 1
+    return restored
 
 
 def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[str], overwrite: bool) -> Dict[str, int]:
@@ -524,6 +737,13 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
         "dnsCredentials": 0,
         "sslCredentials": 0,
         "sslCertificates": 0,
+        "acmeCertificates": 0,
+        "acmeJobs": 0,
+        "accelerationStates": 0,
+        "accelerationBindings": 0,
+        "accelerationRequests": 0,
+        "acmeRuntimeCertificates": 0,
+        "acmeRuntimeFiles": 0,
     }
 
     with conn() as c:
@@ -572,13 +792,34 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
         if "ssl" in selected:
             ssl_block = data.get("ssl")
             credential_id_map: Dict[int, int] = {}
+            certificate_id_map: Dict[int, int] = {}
             if isinstance(ssl_block, dict):
                 cred_items = ssl_block.get("credentials")
                 cert_items = ssl_block.get("certificates")
+                acme_cert_items = ssl_block.get("acmeCertificates")
+                acme_job_items = ssl_block.get("acmeJobs")
+                accel_state_items = ssl_block.get("accelerationStates")
+                accel_binding_items = ssl_block.get("accelerationBindings")
+                accel_request_items = ssl_block.get("accelerationRequests")
+                runtime_items = ssl_block.get("acmeRuntime")
 
                 if overwrite:
                     c.execute("DELETE FROM ssl_certificates WHERE userId = ?", (user_id,))
-                    c.execute("DELETE FROM dns_credentials WHERE userId = ? AND provider = 'tencent_ssl'", (user_id,))
+                    c.execute("DELETE FROM ssl_acme_jobs WHERE userId = ?", (user_id,)) if table_exists("ssl_acme_jobs") else None
+                    c.execute("DELETE FROM dns_credentials WHERE userId = ? AND provider IN ('tencent_ssl', 'dnspod')", (user_id,))
+                    c.execute(
+                        f"DELETE FROM dns_credentials WHERE userId = ? AND provider IN ({SUPPORTED_CERT_UPLOAD_PROVIDER_SQL})",
+                        (user_id, *SUPPORTED_CERT_UPLOAD_PROVIDER_TYPES),
+                    )
+                    if table_exists("ssl_platform_deployments"):
+                        c.execute("DELETE FROM ssl_platform_deployments WHERE userId = ?", (user_id,))
+                    # 加速（EdgeOne/CDN）相关数据同样随 SSL 备份恢复。
+                    if table_exists("acceleration_cert_bindings"):
+                        c.execute("DELETE FROM acceleration_cert_bindings WHERE userId = ?", (user_id,))
+                    if table_exists("acceleration_cert_requests"):
+                        c.execute("DELETE FROM acceleration_cert_requests WHERE userId = ?", (user_id,))
+                    if table_exists("dns_record_acceleration_states"):
+                        c.execute("DELETE FROM dns_record_acceleration_states WHERE userId = ?", (user_id,))
 
                 if isinstance(cred_items, list):
                     for item in cred_items:
@@ -586,10 +827,12 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                             continue
                         name = str(item.get("name") or "").strip()
                         provider = str(item.get("provider") or "tencent_ssl").strip() or "tencent_ssl"
+                        if provider not in (SUPPORTED_CERT_UPLOAD_PROVIDER_SET | {"tencent_ssl", "dnspod"}):
+                            continue
                         secrets = item.get("secrets")
                         if not name or not isinstance(secrets, dict):
                             continue
-                        if provider not in SUPPORTED_SSL_PROVIDER_SET:
+                        if provider not in SSL_CAPABLE_PROVIDER_SET:
                             continue
                         cur = c.execute(
                             """
@@ -620,9 +863,18 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                         old_cred_id = int(item.get("credentialId") or 0)
                         new_cred_id = credential_id_map.get(old_cred_id)
                         cert_provider = str(item.get("provider") or "tencent_ssl").strip() or "tencent_ssl"
-                        if not remote_cert_id or not new_cred_id or cert_provider not in SUPPORTED_SSL_PROVIDER_SET:
+                        # ACME certificates persist a generated credential row
+                        # even when creation happened before the credential was
+                        # linked, so an omitted credentialId must not discard them.
+                        if cert_provider == "acme" and not new_cred_id:
+                            fallback_cred = c.execute(
+                                "SELECT id FROM dns_credentials WHERE userId = ? ORDER BY id ASC LIMIT 1",
+                                (user_id,),
+                            ).fetchone()
+                            new_cred_id = int(fallback_cred["id"]) if fallback_cred else None
+                        if not remote_cert_id or not new_cred_id or cert_provider not in (SSL_CAPABLE_PROVIDER_SET | {"acme"}):
                             continue
-                        c.execute(
+                        cur = c.execute(
                             """
                             INSERT INTO ssl_certificates (
                               userId, credentialId, provider, remoteCertId, domain, san, certType, productName,
@@ -652,7 +904,147 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                                 str(item.get("updatedAt") or now_iso()),
                             ),
                         )
+                        old_cert_id = int(item.get("id") or 0)
+                        if old_cert_id > 0:
+                            certificate_id_map[old_cert_id] = int(cur.lastrowid)
                         result["sslCertificates"] += 1
+
+                if isinstance(acme_job_items, list) and table_exists("ssl_acme_jobs"):
+                    for item in acme_job_items:
+                        if not isinstance(item, dict):
+                            continue
+                        domain = str(item.get("domain") or "").strip()
+                        if not domain:
+                            continue
+                        old_cert_id = int(item.get("certificateId") or 0)
+                        new_cert_id = certificate_id_map.get(old_cert_id)
+                        if not new_cert_id:
+                            continue
+                        old_dns_cred_id = int(item.get("credentialId") or item.get("dnsCredentialId") or 0)
+                        new_dns_cred_id = credential_id_map.get(old_dns_cred_id)
+                        c.execute(
+                            """INSERT INTO ssl_acme_jobs
+                                 (userId, certificateId, dnsCredentialId, domain, domains, keyLength,
+                                  ca, eabKid, eabHmac, operation, status, attempts, error,
+                                  createdAt, updatedAt, completedAt)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                user_id,
+                                new_cert_id,
+                                new_dns_cred_id,
+                                domain,
+                                item.get("domains"),
+                                str(item.get("keyLength") or "2048"),
+                                str(item.get("ca") or ""),
+                                str(item.get("eabKid") or ""),
+                                str(item.get("eabHmac") or ""),
+                                str(item.get("operation") or "issue"),
+                                str(item.get("status") or "queued"),
+                                int(item.get("attempts") or 0),
+                                item.get("lastError") or item.get("error"),
+                                str(item.get("createdAt") or now_iso()),
+                                str(item.get("updatedAt") or now_iso()),
+                                item.get("completedAt"),
+                            ),
+                        )
+                        result["acmeJobs"] += 1
+
+                if isinstance(accel_state_items, list) and table_exists("dns_record_acceleration_states"):
+                    # dns_record_acceleration_states has no UNIQUE key in the
+                    # current schema; clear only that table for this user so an
+                    # overwrite restore cannot create duplicate rows.
+                    c.execute("DELETE FROM dns_record_acceleration_states WHERE userId = ?", (user_id,))
+                    for item in accel_state_items:
+                        if not isinstance(item, dict):
+                            continue
+                        c.execute(
+                            """INSERT INTO dns_record_acceleration_states
+                                 (userId, dnsCredentialId, zoneId, zoneName, recordId, recordName,
+                                  accelerationProvider, accelerationCredentialId, accelerationSiteId,
+                                  accelerationDomain, accelerationTarget, originalRecord, acceleratedRecord,
+                                  enabled, createdAt, updatedAt)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                user_id,
+                                item.get("dnsCredentialId"),
+                                item.get("zoneId"),
+                                item.get("zoneName"),
+                                item.get("recordId"),
+                                item.get("recordName"),
+                                str(item.get("accelerationProvider") or "edgeone"),
+                                item.get("accelerationCredentialId"),
+                                item.get("accelerationSiteId"),
+                                item.get("accelerationDomain"),
+                                item.get("accelerationTarget"),
+                                item.get("originalRecord"),
+                                item.get("acceleratedRecord"),
+                                1 if bool(item.get("enabled")) else 0,
+                                str(item.get("createdAt") or now_iso()),
+                                str(item.get("updatedAt") or now_iso()),
+                            ),
+                        )
+                        result["accelerationStates"] += 1
+
+                if isinstance(accel_binding_items, list) and table_exists("acceleration_cert_bindings"):
+                    for item in accel_binding_items:
+                        if not isinstance(item, dict):
+                            continue
+                        c.execute(
+                            """INSERT INTO acceleration_cert_bindings
+                                 (userId, provider, accelerationCredentialId, siteId, domainName, source,
+                                  certRemoteId, edgeCertId, fingerprint, notAfter, status, lastError,
+                                  syncedAt, createdAt, updatedAt)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                user_id,
+                                str(item.get("provider") or "edgeone"),
+                                item.get("accelerationCredentialId"),
+                                item.get("siteId"),
+                                item.get("domainName"),
+                                str(item.get("source") or "tencent"),
+                                item.get("certRemoteId"),
+                                item.get("edgeCertId"),
+                                item.get("fingerprint"),
+                                item.get("notAfter"),
+                                str(item.get("status") or "pending"),
+                                item.get("lastError"),
+                                item.get("syncedAt"),
+                                str(item.get("createdAt") or now_iso()),
+                                str(item.get("updatedAt") or now_iso()),
+                            ),
+                        )
+                        result["accelerationBindings"] += 1
+
+                if isinstance(accel_request_items, list) and table_exists("acceleration_cert_requests"):
+                    for item in accel_request_items:
+                        if not isinstance(item, dict):
+                            continue
+                        c.execute(
+                            """INSERT INTO acceleration_cert_requests
+                                 (userId, provider, credentialId, siteId, domainNames, status, attempts,
+                                  lastError, verification, createdAt, updatedAt, completedAt)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                user_id,
+                                str(item.get("provider") or "edgeone"),
+                                item.get("credentialId"),
+                                item.get("siteId"),
+                                item.get("domainNames"),
+                                str(item.get("status") or "pending"),
+                                int(item.get("attempts") or 0),
+                                item.get("lastError"),
+                                item.get("verification"),
+                                str(item.get("createdAt") or now_iso()),
+                                str(item.get("updatedAt") or now_iso()),
+                                item.get("completedAt"),
+                            ),
+                        )
+                        result["accelerationRequests"] += 1
+
+                if isinstance(runtime_items, list):
+                    runtime_restored = _restore_acme_runtime_files(runtime_items)
+                    result["acmeRuntimeCertificates"] += int(runtime_restored.get("certificates") or 0)
+                    result["acmeRuntimeFiles"] += int(runtime_restored.get("files") or 0)
 
         c.commit()
 
@@ -853,6 +1245,32 @@ def init_db() -> None:
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_accel_cert_binding_domain ON acceleration_cert_bindings(userId, accelerationCredentialId, siteId, domainName)")
         c.execute(
             """
+            CREATE TABLE IF NOT EXISTS ssl_platform_deployments (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              userId INTEGER NOT NULL,
+              provider TEXT NOT NULL,
+              credentialId INTEGER NOT NULL,
+              certRowId INTEGER,
+              certRemoteId TEXT NOT NULL DEFAULT '',
+              fingerprint TEXT,
+              domain TEXT NOT NULL,
+              platformCertId TEXT,
+              platformCertName TEXT,
+              notBefore TEXT,
+              notAfter TEXT,
+              status TEXT NOT NULL DEFAULT 'pending',
+              lastError TEXT,
+              uploadedAt DATETIME,
+              syncedAt DATETIME,
+              createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_ssl_platform_deploy_domain ON ssl_platform_deployments(userId, provider, credentialId, domain)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_platform_deploy_cert ON ssl_platform_deployments(userId, certRemoteId)")
+        c.execute(
+            """
             CREATE TABLE IF NOT EXISTS dns_record_history (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               userId INTEGER NOT NULL,
@@ -918,6 +1336,12 @@ def init_db() -> None:
             "backup_file_prefix": DEFAULT_BACKUP_FILE_PREFIX,
             "backup_write_server_copy": "1",
             "setup_complete": "1" if has_any_users() else "0",
+            # SSL: the panel renews inside the last 30 days (Let's Encrypt /
+            # Tencent), and only accepts a replacement upload in the last 7 days.
+            "sslAutoRenewEnabled": "1",
+            "sslAutoRenewDays": str(DEFAULT_SSL_RENEWAL_DAYS),
+            "sslAutoRenewLastRunAt": "",
+            "sslAutoRenewLastResult": "",
         }
         for key, value in defaults.items():
             c.execute("INSERT OR IGNORE INTO system_settings (key, value) VALUES (?, ?)", (key, value))
@@ -1704,7 +2128,7 @@ class H(BaseHTTPRequestHandler):
         if path in ("/api/openapi.json", "/api/docs"):
             self._json(200, {
                 "openapi": "3.0.3",
-                "info": {"title": "DNS Panel API", "version": APP_VERSION if "APP_VERSION" in globals() else "0.24"},
+                "info": {"title": "DNS Panel API", "version": APP_VERSION if "APP_VERSION" in globals() else "0.29"},
                 "paths": {
                     "/api/auth/login": {"post": {"summary": "登录"}},
                     "/api/dns-records/zones": {"get": {"summary": "域名列表"}},
@@ -2857,11 +3281,28 @@ def _ssl_autorenew_worker() -> None:
                                 done.append(f"{u['username']}(到期前部署{pre.get('queued')})")
                         except Exception:
                             pass
-                        # Safety net: re-bind the latest certificate to every
-                        # EdgeOne acceleration domain. Catches drift where the
-                        # edge is still serving an older cert (renewal happened
-                        # but the site plugin hasn't redeployed, or the cloud
-                        # cert was rotated out of band).
+                        # Keep exactly ONE usable certificate per domain: prune
+                        # the duplicates a previous panel version created (three
+                        # identical *.shifuf.com uploads and the like) before the
+                        # CDN pass picks a certificate to bind.
+                        try:
+                            from modules.route_handlers import _dedup_certificates
+                            dedup = _dedup_certificates(int(u["id"]), delete_cloud=True)
+                            if dedup.get("removedCount"):
+                                done.append(f"{u['username']}(去重{dedup['removedCount']})")
+                        except Exception:
+                            pass
+                        # Safety net: re-point every accelerated host whose edge
+                        # certificate is missing / stale / EXPIRED at the best
+                        # valid certificate for its domain (exact root domain
+                        # first, then the wildcard), then sweep the rest.
+                        try:
+                            repair = _post("/api/ssl/certificates/repair-acceleration", {"dryRun": False})
+                            repaired = int((repair.get("data") or {}).get("totalRepaired") or 0)
+                            if repaired:
+                                done.append(f"{u['username']}(加速修复{repaired})")
+                        except Exception:
+                            pass
                         try:
                             sync = _post("/api/ssl/certificates/sync-edgeone", {})
                             n = int((sync.get("data") or {}).get("totalSynced") or 0)

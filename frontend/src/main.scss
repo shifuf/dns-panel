@@ -1628,6 +1628,10 @@ html.dark {
       color: #cbd5e1;
     }
 
+    .nav-icon {
+      background: rgba(77, 124, 255, 0.12);
+    }
+
     &.active {
       background: linear-gradient(135deg, rgba(77, 124, 255, 0.12), rgba(99, 102, 241, 0.18));
       border-color: rgba(77, 124, 255, 0.3);

@@ -1,4 +1,4 @@
-export type BuiltinProviderType =
+﻿export type BuiltinProviderType =
   | 'cloudflare'
   | 'aliyun'
   | 'dnspod'
@@ -17,7 +17,7 @@ export type BuiltinProviderType =
 
 export type ProviderType = BuiltinProviderType | (string & {});
 
-export type ProviderCategory = 'dns' | 'ssl' | 'acceleration';
+export type ProviderCategory = 'dns' | 'ssl' | 'acceleration' | 'cert_upload';
 
 export interface DnsCredential {
   id: number;

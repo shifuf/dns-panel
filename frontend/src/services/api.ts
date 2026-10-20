@@ -1,5 +1,17 @@
 import axios from 'axios';
 
+/**
+ * Auth lifecycle events. The interceptor must NEVER navigate on its own: a hard
+ * window.location.href = '/login' combined with the router guard produced an
+ * endless reload (401 -> assign('/login') -> guard sends '/' -> 401 -> ...).
+ * The session is cleared here and the router performs ONE redirect instead.
+ */
+export const AUTH_UNAUTHORIZED_EVENT = 'dns-panel:unauthorized';
+export function onUnauthorized(handler: () => void): () => void {
+  window.addEventListener(AUTH_UNAUTHORIZED_EVENT, handler);
+  return () => window.removeEventListener(AUTH_UNAUTHORIZED_EVENT, handler);
+}
+
 const base = String(import.meta.env.BASE_URL || '/');
 const apiBase = base.endsWith('/') ? `${base}api` : `${base}/api`;
 
@@ -41,16 +53,22 @@ api.interceptors.response.use(
     if (error.response) {
       const { status, data } = error.response;
 
-      // 401 未授权 - 清除 Token 并跳转登录
+      // 401 未授权 - 只清理会话并广播事件，由路由统一跳转一次。
+      //（这里以前直接 window.location.href = '/login'，与路由守卫互相弹跳，
+      //  形成 401 -> /login -> '/' -> 401 ... 的无限刷新。）
       if (status === 401) {
         const message = String(data?.message || '');
         const authMessages = ['未提供认证令牌', '无效或过期的令牌', '认证失败'];
         const shouldLogout = authMessages.some(m => message.includes(m));
 
         if (shouldLogout) {
+          const hadToken = Boolean(localStorage.getItem('token'));
           localStorage.removeItem('token');
           localStorage.removeItem('user');
-          window.location.href = '/login';
+          // 只有在确实存在会话时才广播，避免登录页自身的 401 反复触发跳转。
+          if (hadToken) {
+            window.dispatchEvent(new CustomEvent(AUTH_UNAUTHORIZED_EVENT));
+          }
         }
       }
 

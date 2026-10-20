@@ -330,6 +330,57 @@ PROVIDER_CAPABILITIES: List[Dict[str, Any]] = [
         "maxRetries": 2,
     },
     {
+        # 七牛云 CDN 证书上传目标（官方 API，QBox AK/SK 鉴权）。
+        # 证书上传：POST https://fusion.qiniuapi.com/sslcert
+        # 域名绑定：PUT  https://api.qiniu.com/domain/<domain>/httpsconf
+        "provider": "qiniu",
+        "name": "七牛云",
+        "category": "cert_upload",
+        "supportsWeight": False,
+        "supportsLine": False,
+        "supportsStatus": False,
+        "supportsRemark": False,
+        "supportsUrlForward": False,
+        "supportsLogs": False,
+        "remarkMode": "unsupported",
+        "paging": "server",
+        "requiresDomainId": False,
+        "recordTypes": [],
+        "authFields": [
+            {"name": "accessKey", "label": "AccessKey", "type": "text", "required": True, "placeholder": "七牛云 AccessKey"},
+            {"name": "secretKey", "label": "SecretKey", "type": "password", "required": True, "placeholder": "七牛云 SecretKey"},
+        ],
+        "domainCacheTtl": 0,
+        "recordCacheTtl": 0,
+        "retryableErrors": [],
+        "maxRetries": 2,
+    },
+    {
+        # 又拍云没有官方 SSL 证书 API，只能用网站账号+密码模拟登录控制台
+        # （console.upyun.com）上传/绑定证书。该通道可能因验证码或两步验证失效。
+        "provider": "upyun",
+        "name": "又拍云",
+        "category": "cert_upload",
+        "supportsWeight": False,
+        "supportsLine": False,
+        "supportsStatus": False,
+        "supportsRemark": False,
+        "supportsUrlForward": False,
+        "supportsLogs": False,
+        "remarkMode": "unsupported",
+        "paging": "server",
+        "requiresDomainId": False,
+        "recordTypes": [],
+        "authFields": [
+            {"name": "username", "label": "登录账号", "type": "text", "required": True, "placeholder": "又拍云控制台登录账号"},
+            {"name": "password", "label": "登录密码", "type": "password", "required": True, "placeholder": "又拍云控制台登录密码"},
+        ],
+        "domainCacheTtl": 0,
+        "recordCacheTtl": 0,
+        "retryableErrors": [],
+        "maxRetries": 2,
+    },
+    {
         # acme.sh signing channel (Let's Encrypt via DNS-01). Unlike tencent_ssl
         # this provider does NOT own credentials — it reuses an existing DNS
         # credential (cloudflare / dnspod / aliyun ...) for the DNS-01 challenge.

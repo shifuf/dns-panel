@@ -3,7 +3,8 @@ import { onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { NAlert, NButton, NFormItem, NInput } from 'naive-ui';
 import { KeyRound, Mail, ShieldCheck, UserRound, Wrench } from 'lucide-vue-next';
-import { getSetupStatus, initializeSetup, saveAuthData } from '@/services/auth';
+import { getSetupStatus, initializeSetup, saveAuthData, clearAuthData } from '@/services/auth';
+import { resetSessionCache } from '@/router';
 import { isStrongPassword, isValidEmail } from '@/utils/validators';
 
 const router = useRouter();
@@ -25,6 +26,9 @@ onMounted(async () => {
       router.replace('/login');
       return;
     }
+    // 安装向导必须在干净会话下运行：残留的旧 token 会让后续跳转互相弹跳。
+    clearAuthData();
+    resetSessionCache();
   } catch {
     // Keep the wizard available even if status fetch fails temporarily.
   } finally {
@@ -61,6 +65,8 @@ async function handleSetup() {
     });
     if (res.data.token && res.data.user) {
       saveAuthData(res.data.token, res.data.user);
+      // 新建会话：清掉守卫缓存的“未登录”判定，否则会被弹回 /login。
+      resetSessionCache();
       router.replace('/?scope=all');
     }
   } catch (err: any) {

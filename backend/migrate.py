@@ -235,6 +235,20 @@ MIGRATIONS: list[str] = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_ssl_deploy_events_queue ON ssl_deployment_events(userId, status, nextAttemptAt)",
+    # 宝塔插件上报的「域名 → 站点 / 反代目标」快照（每次同步全量替换）。
+    """
+    CREATE TABLE IF NOT EXISTS ssl_site_bindings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      domain TEXT NOT NULL,
+      siteNames TEXT NOT NULL DEFAULT '[]',
+      proxyTargets TEXT NOT NULL DEFAULT '[]',
+      serverIps TEXT NOT NULL DEFAULT '[]',
+      reportedAt DATETIME,
+      UNIQUE(userId, domain)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ssl_site_bindings_user ON ssl_site_bindings(userId, domain)",
     """
     CREATE TABLE IF NOT EXISTS ssl_task_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -276,6 +290,33 @@ MIGRATIONS: list[str] = [
     )
     """,
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_accel_cert_binding_domain ON acceleration_cert_bindings(userId, accelerationCredentialId, siteId, domainName)",
+    # Tracks which panel certificate was uploaded/bound to each third-party
+    # CDN platform (七牛云 / 又拍云) domain, so renewals can re-upload and the
+    # UI can show "deployed where / expires when".
+    """
+    CREATE TABLE IF NOT EXISTS ssl_platform_deployments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      provider TEXT NOT NULL,
+      credentialId INTEGER NOT NULL,
+      certRowId INTEGER,
+      certRemoteId TEXT NOT NULL DEFAULT '',
+      fingerprint TEXT,
+      domain TEXT NOT NULL,
+      platformCertId TEXT,
+      platformCertName TEXT,
+      notBefore TEXT,
+      notAfter TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      lastError TEXT,
+      uploadedAt DATETIME,
+      syncedAt DATETIME,
+      createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updatedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_ssl_platform_deploy_domain ON ssl_platform_deployments(userId, provider, credentialId, domain)",
+    "CREATE INDEX IF NOT EXISTS idx_ssl_platform_deploy_cert ON ssl_platform_deployments(userId, certRemoteId)",
 
     # ── system_settings table (global config, not per-user) ──
     """

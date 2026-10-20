@@ -355,6 +355,100 @@ export async function getSslDeploymentsBySite(): Promise<ApiResponse<SiteDeploym
   return res as unknown as ApiResponse<SiteDeploymentOverview[]>;
 }
 
+export interface SslDedupEntry {
+  keep: string;
+  domain: string;
+  removed?: Array<{ id: number; domain: string; certId: string; cloudDeleted?: boolean; cloudError?: string }>;
+  errors?: Array<{ id: number; error: string }>;
+  dryRun?: boolean;
+  wouldRemove?: Array<{ id: number; certId: string }>;
+}
+
+export interface SslDedupResult {
+  groups: number;
+  removed: SslDedupEntry[];
+  removedCount: number;
+  errors: Array<{ id?: number; error: string }>;
+}
+
+/** Collapse duplicate certificates down to one per domain (identical copies + superseded renewals). */
+export async function dedupeSslCertificates(
+  payload?: { dryRun?: boolean; keepCloud?: boolean },
+): Promise<ApiResponse<SslDedupResult>> {
+  const res = await api.post('/ssl/certificates/dedup', payload || {});
+  return res as unknown as ApiResponse<SslDedupResult>;
+}
+
+export interface AccelerationRepairEntry {
+  domain: string;
+  provider?: string;
+  certId?: string;
+  certDomain?: string;
+  reason?: string;
+  action: string;
+  edgeCertId?: string;
+  error?: string;
+}
+
+export interface AccelerationRepairResult {
+  checked: number;
+  repaired: number;
+  totalRepaired: number;
+  skipped: number;
+  errors: Array<{ domain: string; error: string }>;
+  results: AccelerationRepairEntry[];
+  dryRun?: boolean;
+}
+
+/**
+ * Detect accelerated hosts whose edge certificate is missing / stale / expired
+ * and re-point them at the best valid certificate (exact root domain first,
+ * wildcard second).
+ */
+export async function repairAccelerationCertificates(
+  payload?: { dryRun?: boolean },
+): Promise<ApiResponse<AccelerationRepairResult>> {
+  const res = await api.post('/ssl/certificates/repair-acceleration', payload || {});
+  return res as unknown as ApiResponse<AccelerationRepairResult>;
+}
+
+export interface AccelerationCertBinding {
+  host: string;
+  domainName: string;
+  names: string[];
+  provider: string;
+  credentialId: number;
+  siteId: string;
+  cname?: string;
+  supported: boolean;
+  bindable: boolean;
+  certId: string;
+  certDomain?: string;
+  panelDomain: string;
+  panelExpireTime: string;
+  panelIssuer: string;
+  panelFingerprint?: string;
+  accelCertificateId: string;
+  accelStatus: string;
+  accelExpireTime: string;
+  accelIssuer?: string;
+  accelEffectiveTime?: string;
+  accelFingerprint?: string;
+  accelDaysRemaining: number | null;
+  status: string;
+  message?: string;
+  upToDate: boolean | null;
+}
+
+/** Every accelerated host with its edge certificate state (shared with the BaoTa plugin). */
+export async function getAccelerationCertBindings(
+  domains?: string[],
+): Promise<ApiResponse<{ items: AccelerationCertBinding[]; bindings: EdgeOneCertBinding[]; total: number }>> {
+  const params = domains && domains.length ? { domains: domains.join(',') } : undefined;
+  const res = await api.get('/ssl/acceleration-bindings', { params });
+  return res as unknown as ApiResponse<{ items: AccelerationCertBinding[]; bindings: EdgeOneCertBinding[]; total: number }>;
+}
+
 export async function getSslPluginVersion(): Promise<ApiResponse<{ expectedVersion: string; minVersion: string; releaseNotes?: string }>> {
   const res = await api.get('/ssl/plugin-version');
   return res as unknown as ApiResponse<{ expectedVersion: string; minVersion: string; releaseNotes?: string }>;
@@ -468,4 +562,186 @@ export async function cleanupDnsSslCertificate(
 ): Promise<ApiResponse<{ deleted: any[]; errors: any[] }>> {
   const res = await api.post(`/ssl/certificates/${encodeURIComponent(certId)}/cleanup-dns`, { credentialId });
   return res as unknown as ApiResponse<{ deleted: any[]; errors: any[] }>;
+}
+
+// ── Third-party platform deployment (七牛云 / 又拍云) ──────────────
+export interface PlatformCredential {
+  id: number;
+  name: string;
+  provider: 'qiniu' | 'upyun' | string;
+  createdAt: string;
+}
+
+export interface PlatformDeployment {
+  id: number;
+  provider: 'qiniu' | 'upyun' | string;
+  providerLabel?: string;
+  credentialId: number;
+  credentialName?: string;
+  certRowId?: number | null;
+  certRemoteId: string;
+  fingerprint?: string;
+  domain: string;
+  platformCertId?: string;
+  platformCertName?: string;
+  notBefore?: string;
+  notAfter?: string;
+  status: 'synced' | 'failed' | 'pending' | string;
+  lastError?: string;
+  uploadedAt?: string;
+  syncedAt?: string;
+  updatedAt?: string;
+  certDomain?: string;
+  certStatus?: string;
+  /** EdgeOne 加速绑定（实时扫描生成，负数 id，不可删除记录）。 */
+  isEdgeOne?: boolean;
+  daysRemaining?: number | null;
+  isExpired?: boolean;
+}
+
+export interface UpyunAccountDomain {
+  domain: string;
+  bucket: string;
+  status: string;
+  /** 后端预计算的通配符覆盖判断：该域名是否被面板某张已签发证书覆盖。 */
+  covered?: boolean;
+}
+
+export interface PlatformDeploymentsResponse {
+  deployments: PlatformDeployment[];
+  upyunDomains?: UpyunAccountDomain[];
+  overview: {
+    total: number;
+    byProvider: Record<string, { total: number; failed: number; expiringSoon: number; expired: number; domains: Array<{ domain: string; notAfter?: string; status?: string }> }>;
+    expiringSoon: number;
+    failed: number;
+    expired: number;
+  };
+}
+
+export async function getPlatformDeployments(): Promise<ApiResponse<PlatformDeploymentsResponse>> {
+  const res = await api.get('/ssl/platform-deployments');
+  return res as unknown as ApiResponse<PlatformDeploymentsResponse>;
+}
+
+export interface DeployToPlatformParams {
+  provider: 'qiniu' | 'upyun' | 'tencent';
+  credentialId: number;
+  certRowId?: number;
+  certId?: string;
+  domains: string[];
+  force?: boolean;
+}
+
+export async function deployCertToPlatform(
+  params: DeployToPlatformParams,
+): Promise<ApiResponse<{ platformCertId: string; platformCertName: string; fingerprint: string; results: Array<{ domain: string; ok: boolean; error?: string }> }>> {
+  const res = await api.post('/ssl/platform-deployments', params);
+  return res as unknown as ApiResponse<{ platformCertId: string; platformCertName: string; fingerprint: string; results: Array<{ domain: string; ok: boolean; error?: string }> }>;
+}
+
+export interface PlatformBindingCheck {
+  deploymentId: number;
+  provider: string;
+  providerLabel?: string;
+  domain: string;
+  credentialName?: string;
+  platformCertId?: string;
+  platformCertName?: string;
+  recordedNotAfter?: string;
+  recordedStatus?: string;
+  checked: boolean;
+  drift?: boolean;
+  error?: string;
+  live?: {
+    bound?: boolean | null;
+    certificateId?: string;
+    commonName?: string;
+    https?: boolean;
+    forceHttps?: boolean;
+    crtType?: string;
+    notBefore?: string;
+    notAfter?: string;
+    error?: string;
+  };
+  liveNotAfter?: string;
+  liveDaysRemaining?: number | null;
+}
+
+export async function checkPlatformDeployments(): Promise<ApiResponse<{ checks: PlatformBindingCheck[]; checked: number; total: number; drift: number }>> {
+  const res = await api.post('/ssl/platform-deployments/check', {});
+  return res as unknown as ApiResponse<{ checks: PlatformBindingCheck[]; checked: number; total: number; drift: number }>;
+}
+
+export async function deletePlatformDeployment(id: number): Promise<ApiResponse> {
+  const res = await api.delete(`/ssl/platform-deployments/${id}`);
+  return res as unknown as ApiResponse;
+}
+
+export async function getPlatformCredentials(): Promise<ApiResponse<PlatformCredential[]>> {
+  const res = await api.get('/ssl/platform-credentials');
+  return res as unknown as ApiResponse<PlatformCredential[]>;
+}
+
+export async function testPlatformCredential(data: {
+  provider: 'qiniu' | 'upyun' | 'tencent';
+  secrets?: Record<string, string>;
+  credentialId?: number;
+}): Promise<ApiResponse<{ ok: boolean; certCount?: number; cdnDomains?: number }>> {
+  const res = await api.post('/ssl/platform-credentials/test', data);
+  return res as unknown as ApiResponse<{ ok: boolean; certCount?: number; cdnDomains?: number }>;
+}
+
+export async function createPlatformCredential(data: {
+  name: string;
+  provider: 'qiniu' | 'upyun';
+  secrets: Record<string, string>;
+}): Promise<ApiResponse<{ id: number }>> {
+  const res = await api.post('/ssl/platform-credentials', data);
+  return res as unknown as ApiResponse<{ id: number }>;
+}
+
+export async function deletePlatformCredential(id: number): Promise<ApiResponse> {
+  const res = await api.delete(`/ssl/platform-credentials/${id}`);
+  return res as unknown as ApiResponse;
+}
+
+/** 查看已保存的平台凭证明文密钥（仅七牛云 / 又拍云）。 */
+export async function getPlatformCredentialSecrets(id: number): Promise<ApiResponse<{
+  id: number;
+  name: string;
+  provider: 'qiniu' | 'upyun';
+  secrets: Record<string, string>;
+}>> {
+  const res = await api.get(`/ssl/platform-credentials/${id}/secrets`);
+  return res as unknown as ApiResponse<{ id: number; name: string; provider: 'qiniu' | 'upyun'; secrets: Record<string, string> }>;
+}
+
+/** 宝塔插件上报的「域名 → 站点 / 反代目标」快照。 */
+export interface SiteBinding {
+  id: number;
+  domain: string;
+  siteNames: string[];
+  proxyTargets: string[];
+  serverIps: string[];
+  reportedAt?: string;
+}
+
+export interface SiteBindingsResponse {
+  bindings: SiteBinding[];
+  reportedAt: string;
+}
+
+export async function getSiteBindings(): Promise<ApiResponse<SiteBindingsResponse>> {
+  const res = await api.get('/ssl/site-bindings');
+  return res as unknown as ApiResponse<SiteBindingsResponse>;
+}
+
+/** Full PEM (public key + PRIVATE KEY) for online viewing. */
+export async function getSslCertificatePem(
+  credentialId: number,
+  certId: string,
+): Promise<ApiResponse<{ publicKey: string; privateKey: string; certId: string }>> {
+  const res = await api.get(`/ssl/certificates/${encodeURIComponent(certId)}/pem?credentialId=${credentialId}`);
+  return res as unknown as ApiResponse<{ publicKey: string; privateKey: string; certId: string }>;
 }

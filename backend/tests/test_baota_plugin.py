@@ -398,5 +398,156 @@ class AccelCheckTests(unittest.TestCase):
         self.assertEqual(result["data"]["items"][0]["domainName"], "bad.example.com")
 
 
+
+class SharedAccelEndpointTests(unittest.TestCase):
+    """The 加速证书检测 tab must read the panel's SHARED binding view.
+
+    The per-provider /acceleration/certificates route needs a siteId, so the tab
+    always came back empty even when EdgeOne was accelerated and the panel
+    supported certificate uploads.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = PluginLoadedOnce.get()
+
+    def test_uses_shared_binding_endpoint(self) -> None:
+        self.assertIn("/ssl/acceleration-bindings", self.mod.ACCEL_PANEL_PATH)
+
+    def test_render_states_cover_edge_failures(self) -> None:
+        cfg = {"serverUrl": "https://panel.example.com", "apiToken": "token"}
+        rows = [
+            {"host": "a.example.com", "domainName": "a.example.com", "provider": "edgeone",
+             "supported": True, "certId": "keep", "accelCertificateId": "",
+             "accelDaysRemaining": None, "status": "missing"},
+            {"host": "b.example.com", "domainName": "b.example.com", "provider": "edgeone",
+             "supported": True, "certId": "good", "accelCertificateId": "old",
+             "accelDaysRemaining": -2, "status": "expired"},
+            {"host": "c.example.com", "domainName": "c.example.com", "provider": "edgeone",
+             "supported": False, "message": "缺少腾讯云 SecretId / SecretKey"},
+        ]
+        with patch.object(self.mod, "_get_config", lambda *a, **k: cfg), \
+             patch.object(self.mod, "_set_config", lambda *a, **k: True), \
+             patch.object(self.mod, "_panel_get", lambda path, timeout=60: {"success": True, "data": {"items": rows}}):
+            result = self.mod.dnspanel_ssl_main().accel_check(None)
+        self.assertTrue(result.get("success"), result)
+        states = {item["domainName"]: item["state"] for item in result["data"]["items"]}
+        self.assertEqual(states["a.example.com"], "missing")
+        self.assertEqual(states["b.example.com"], "expired")
+        self.assertEqual(states["c.example.com"], "unsupported")
+        self.assertEqual(result["data"]["summary"]["total"], 3)
+
+
+    def test_expired_certificate_is_rejected_before_deploy(self) -> None:
+        plugin = (Path(__file__).resolve().parents[2] / "baota-ssl-plugin" / "dnspanel_ssl_main.py").read_text(encoding="utf-8")
+        self.assertIn("证书已过期，禁止部署（请续期或删除）", plugin)
+        self.assertIn('detail_path = "/ssl/certificates/" + cert_id', plugin)
+
+class SiteBindingReportTests(unittest.TestCase):
+    """v2.1.0: the plugin reports domain→site/proxy-IP snapshots on sync."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = PluginLoadedOnce.get()
+
+    def test_proxy_pass_parsing(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proxy_dir = Path(tmp) / "proxy"
+            site_dir = proxy_dir / "siteA"
+            site_dir.mkdir(parents=True)
+            (site_dir / "proxy.conf").write_text(
+                "location / {\n  proxy_pass http://203.0.113.9:8080;\n}\n",
+                encoding="utf-8",
+            )
+            (site_dir / "ws.conf").write_text(
+                "location /ws {\n  proxy_pass http://10.0.0.5:3000;\n}\n",
+                encoding="utf-8",
+            )
+            old_dirs = self.mod._PROXY_CONF_DIRS
+            old_paths = self.mod._site_vhost_conf_paths
+            try:
+                self.mod._PROXY_CONF_DIRS = (str(proxy_dir),)
+                self.mod._site_vhost_conf_paths = lambda name: []
+                targets = self.mod._site_proxy_targets("siteA")
+            finally:
+                self.mod._PROXY_CONF_DIRS = old_dirs
+                self.mod._site_vhost_conf_paths = old_paths
+            self.assertEqual(targets, ["http://203.0.113.9:8080", "http://10.0.0.5:3000"])
+
+    def test_apache_proxypass_parsing(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            proxy_dir = Path(tmp) / "proxy"
+            site_dir = proxy_dir / "siteB"
+            site_dir.mkdir(parents=True)
+            (site_dir / "proxy.conf").write_text(
+                "ProxyPass / http://198.51.100.7:9000/\n",
+                encoding="utf-8",
+            )
+            old_dirs = self.mod._PROXY_CONF_DIRS
+            old_paths = self.mod._site_vhost_conf_paths
+            try:
+                self.mod._PROXY_CONF_DIRS = (str(proxy_dir),)
+                self.mod._site_vhost_conf_paths = lambda name: []
+                targets = self.mod._site_proxy_targets("siteB")
+            finally:
+                self.mod._PROXY_CONF_DIRS = old_dirs
+                self.mod._site_vhost_conf_paths = old_paths
+            self.assertEqual(targets, ["http://198.51.100.7:9000"])
+
+    def test_collect_groups_per_domain(self) -> None:
+        sites = [
+            {"id": 1, "name": "shifuf", "domains": ["yp.shifuf.com", "shifuf.com"]},
+            {"id": 2, "name": "cdn-proxy", "domains": ["cdn.shifuf.com"]},
+        ]
+        old_sites = self.mod._list_bt_sites
+        old_ips = self.mod._server_ips
+        old_targets = self.mod._site_proxy_targets
+        try:
+            self.mod._list_bt_sites = lambda: sites
+            self.mod._server_ips = lambda: ["203.0.113.7"]
+            self.mod._site_proxy_targets = lambda name: ["http://10.0.0.5:8080"] if name == "shifuf" else []
+            bindings, server_ips = self.mod._collect_site_bindings()
+        finally:
+            self.mod._list_bt_sites = old_sites
+            self.mod._server_ips = old_ips
+            self.mod._site_proxy_targets = old_targets
+        by_domain = {b["domain"]: b for b in bindings}
+        self.assertEqual(server_ips, ["203.0.113.7"])
+        self.assertEqual(by_domain["yp.shifuf.com"]["siteName"], "shifuf")
+        self.assertEqual(by_domain["yp.shifuf.com"]["proxyTargets"], ["http://10.0.0.5:8080"])
+        self.assertEqual(by_domain["cdn.shifuf.com"]["siteName"], "cdn-proxy")
+        self.assertEqual(by_domain["cdn.shifuf.com"]["proxyTargets"], [])
+
+    def test_report_bindings_action_posts_to_panel(self) -> None:
+        cfg = {"serverUrl": "https://panel.example.com", "apiToken": "tok"}
+        captured = {}
+
+        def fake_post(path, payload=None, timeout=60):
+            captured["path"] = path
+            captured["payload"] = payload
+            return {"success": True, "data": {"domains": 2}}
+
+        with patch.object(self.mod, "_get_config", lambda *a, **k: cfg), \
+             patch.object(self.mod, "_panel_post", fake_post), \
+             patch.object(self.mod, "_collect_site_bindings",
+                          lambda: ([{"domain": "a.example.com", "siteName": "s1", "proxyTargets": []},
+                                    {"domain": "b.example.com", "siteName": "s2", "proxyTargets": []}],
+                                   ["203.0.113.7"])):
+            result = self.mod.dnspanel_ssl_main().report_bindings(type("A", (), {})())
+        self.assertTrue(result.get("status"), result)
+        self.assertEqual(captured["path"], "/ssl/site-bindings/report")
+        self.assertEqual(len(captured["payload"]["bindings"]), 2)
+        self.assertEqual(captured["payload"]["serverIps"], ["203.0.113.7"])
+
+    def test_report_failure_returns_none(self) -> None:
+        cfg = {"serverUrl": "https://panel.example.com", "apiToken": "tok"}
+        with patch.object(self.mod, "_get_config", lambda *a, **k: cfg), \
+             patch.object(self.mod, "_panel_post", lambda *a, **k: {"success": False, "message": "denied"}), \
+             patch.object(self.mod, "_collect_site_bindings", lambda: ([], [])):
+            self.assertIsNone(self.mod._report_site_bindings())
+
+
 if __name__ == "__main__":
     unittest.main()

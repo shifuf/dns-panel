@@ -349,6 +349,34 @@ class SslRouteContractTests(unittest.TestCase):
         self.assertIn("BEGIN IMMEDIATE", self.source)
         self.assertIn("WHERE id = ? AND status = 'queued'", self.source)
 
+    def test_expired_certificates_are_blocked_from_deploy_paths(self) -> None:
+        self.assertIn('证书已过期，禁止部署（请先续期）', self.source)
+        self.assertIn('证书已过期，禁止部署（请续期或删除）', self.source)
+        self.assertIn('reason": "证书已过期"', self.source)
+        self.assertIn('"证书已过期，禁止部署（请续期或删除）"', self.source)
+
+    def test_upload_accepts_unique_ssl_credential_when_credential_missing(self) -> None:
+        self.assertIn('if not cred_id_raw:', self.source)
+        self.assertIn("provider IN ('tencent_ssl', 'dnspod')", self.source)
+        self.assertIn('ORDER BY isDefault DESC, createdAt ASC', self.source)
+
+    def test_ssl_backup_includes_acme_and_edgeone_runtime_state(self) -> None:
+        app_source = (BACKEND_DIR / "app.py").read_text(encoding="utf-8")
+        for probe in (
+            '"acmeCertificates"',
+            '"acmeJobs"',
+            '"accelerationStates"',
+            '"accelerationBindings"',
+            '"accelerationRequests"',
+            '"acmeRuntime"',
+            'def _export_acme_runtime_files',
+            'def _restore_acme_runtime_files',
+            'Path("deployed") / safe / name',
+        ):
+            self.assertIn(probe, app_source)
+        self.assertIn('certificate_id_map', app_source)
+        self.assertIn('acmeRuntimeFiles', app_source)
+
     def test_deployment_queue_is_atomic_retriable_and_rejects_stale_results(self) -> None:
         self.assertIn('sub == "/deployment-events/claim"', self.source)
         self.assertIn('r"/deployment-events/(\\d+)/result"', self.source)

@@ -4,6 +4,7 @@ import { useRouter, useRoute } from 'vue-router';
 import { NFormItem, NInput, NButton, NAlert, NTag } from 'naive-ui';
 import { ShieldCheck, LogIn, ArrowLeft, KeyRound, UserRound } from 'lucide-vue-next';
 import { login, verify2FA, saveAuthData, getRegistrationStatus } from '@/services/auth';
+import { resetSessionCache } from '@/router';
 
 const router = useRouter();
 const route = useRoute();
@@ -45,6 +46,9 @@ async function handleLogin() {
 
     if (res.data.token && res.data.user) {
       saveAuthData(res.data.token, res.data.user);
+      // The guard caches "no valid session"; a fresh login must clear it or the
+      // next navigation would bounce straight back to /login.
+      resetSessionCache();
       const redirect = route.query.redirect as string;
       router.push(redirect || '/?scope=all');
     }
@@ -67,6 +71,7 @@ async function handle2FA() {
     const res = await verify2FA({ tempToken: tempToken.value, code: tfaCode.value });
     if (res.data.token && res.data.user) {
       saveAuthData(res.data.token, res.data.user);
+      resetSessionCache();
       router.push('/?scope=all');
     }
   } catch (err: any) {

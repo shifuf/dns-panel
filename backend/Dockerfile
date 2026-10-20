@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 FROM python:3.11-slim-trixie
 
-ARG APP_VERSION=0.24
+ARG APP_VERSION=0.29
 ARG PIP_INDEX_URL=https://pypi.org/simple
 
 WORKDIR /app

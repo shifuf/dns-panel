@@ -33,8 +33,17 @@ frontend/*.log
 
 # Backup and temp files
 *.tmp
+
+# Dev scratch scripts (never commit)
+_app_ssl_block.py
+_c3b.py
+_ins_app.py
+
 *.temp
 *.swp
 *.swo
 *.bak
 *.backup
+
+# Local runtime database & backups (never commit)
+backend/db/

@@ -754,12 +754,14 @@ var dnspanel_ssl = {
             return;
         }
         var stateMap = {
-            synced:   ['ok',   '已同步'],
-            stale:    ['warn', '加速需同步'],
-            expiring: ['warn', '临近到期'],
-            expired:  ['err',  '已过期'],
-            failed:   ['err',  '同步失败'],
-            unknown:  ['info', '状态未知']
+            synced:      ['ok',   '已同步'],
+            stale:       ['warn', '加速需同步'],
+            missing:     ['warn', '未绑定证书'],
+            expiring:    ['warn', '临近到期'],
+            expired:     ['err',  '已过期'],
+            failed:      ['err',  '同步失败'],
+            unsupported: ['info', '不支持推送'],
+            unknown:     ['info', '状态未知']
         };
         var rows = '';
         for (var i = 0; i < items.length; i++) {
@@ -793,11 +795,34 @@ var dnspanel_ssl = {
             + ' · 临近到期 <b>' + (summary.expiring || 0) + '</b> 个'
             + ' · 已过期 <b>' + (summary.expired || 0) + '</b> 个'
             + ' · 同步失败 <b>' + (summary.failed || 0) + '</b> 个</div>'
-            + '<div class="dps-alert info" style="margin-bottom:12px;">加速证书由 DNS 面板自动绑定与续期同步（每日任务 + 过期前 7 天强制部署）。此处仅作只读检查；如需立即重试，请到面板「SSL 证书管理 → 任务 → 加速绑定」点「同步加速」。</div>';
+            + '<div class="dps-alert info" style="margin-bottom:12px;">加速证书由 DNS 面板自动绑定与续期同步（每日任务 + 过期前 7 天强制部署）。已过期或缺失的加速域名，可用下方按钮让面板自动改绑有效证书（优先匹配根域名，其次泛解域名）。</div>'
+            + '<div style="margin-bottom:12px;">'
+            + '<button class="dps-btn dps-btn-ghost" onclick="dnspanel_ssl.accel_repair(false)">检测并修复失效证书</button>'
+            + '<button class="dps-btn dps-btn-ghost" onclick="dnspanel_ssl.accel_repair(true)">预览可修复项</button>'
+            + '</div>';
         $('#accel_check_body').html(
             summaryHtml
             + '<div class="dps-table-wrap"><table class="dps-table"><thead><tr><th>加速域名</th><th>来源</th><th>状态</th><th>到期时间</th><th>证书</th><th>最近同步</th></tr></thead>'
             + '<tbody>' + rows + '</tbody></table></div>');
+    },
+
+    accel_repair: function (dryRun) {
+        var that = this;
+        var title = dryRun ? '预览加速证书修复？' : '检测并修复加速证书？';
+        var tip = dryRun
+            ? '将扫描所有加速域名，报告哪些边缘证书需要改绑（不会真正修改）。'
+            : '将扫描所有加速域名，把过期/缺失/过期的边缘证书改绑为面板当前有效证书（优先根域名，其次泛解域名）。';
+        layer.confirm(title, { btn: [dryRun ? '开始预览' : '开始修复', '取消'] }, function (index) {
+            layer.close(index);
+            var loadIdx = layer.load(1, { shade: [0.1, '#fff'] });
+            that.request('accel_repair', { dryRun: dryRun ? '1' : '' }, function (rdata) {
+                layer.close(loadIdx);
+                that.handle(rdata, function (d) {
+                    that.showMsg((d && d.msg) || (dryRun ? '预览完成' : '修复完成'), 1);
+                    that.show_accel_check();
+                }, function (err) { that.showMsg(err, 2); });
+            });
+        });
     },
 
     sync_now: function () {

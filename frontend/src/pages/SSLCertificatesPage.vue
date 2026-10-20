@@ -8,7 +8,7 @@ import {
   NEmpty, NSpin, NPagination, NDrawer, NDrawerContent, NDescriptions,
   NDescriptionsItem, NSwitch, NTooltip, NTabs, NTabPane, NInputNumber, NDropdown, useMessage, useDialog,
 } from 'naive-ui';
-import { RefreshCw, Search, Plus, Upload, Download, Trash2, Eye, CheckCircle, KeyRound, Pencil, AlertTriangle, RotateCw, ArrowUpDown, FileDown, ListChecks, FileText, Rocket, Copy, Zap } from 'lucide-vue-next';
+import { RefreshCw, Search, Plus, Upload, Download, Trash2, Eye, CheckCircle, KeyRound, Pencil, AlertTriangle, RotateCw, ArrowUpDown, FileDown, ListChecks, FileText, Rocket, Copy, Zap, Globe } from 'lucide-vue-next';
 import {
   getSslCredentials, createSslCredential, updateSslCredential, deleteSslCredential as deleteSslCred,
   getSslCertificates, getSslCertificateDetail, applySslCertificate,
@@ -23,8 +23,16 @@ import {
   batchDeploySslCertificates, batchSetSslAutoRenew, checkSslExpiry,
   getSslAcmeCas, getSslDeploymentsBySite,
   getSslEdgeOneBindings, syncSslCertToEdgeOne,
+  dedupeSslCertificates, repairAccelerationCertificates, getAccelerationCertBindings,
+  getPlatformDeployments, deployCertToPlatform, deletePlatformDeployment,
+  getPlatformCredentials, createPlatformCredential, testPlatformCredential, getSslCertificatePem,
+  checkPlatformDeployments, getSiteBindings,
 } from '@/services/ssl';
-import type { SslCaOption, SiteDeploymentOverview, EdgeOneCertBinding } from '@/services/ssl';
+import type {
+  SslCaOption, SiteDeploymentOverview, EdgeOneCertBinding,
+  PlatformCredential, PlatformDeployment, PlatformDeploymentsResponse, UpyunAccountDomain,
+  PlatformBindingCheck, SiteBinding,
+} from '@/services/ssl';
 import { getDnsCredentials } from '@/services/dnsCredentials';
 import { getDomains } from '@/services/domains';
 import AddZoneDialog from '@/components/Dashboard/AddZoneDialog.vue';
@@ -375,12 +383,77 @@ const { data: edgeOneBindings, isFetching: edgeOneBindingsFetching } = useQuery(
   refetchInterval: computed(() => showTaskDrawer.value ? 20000 : 60000),
 });
 
+// Live edge certificate state per accelerated host (panel-wide, not one site).
+const { data: accelBindings, isFetching: accelBindingsFetching } = useQuery({
+  queryKey: ['ssl-acceleration-bindings'],
+  queryFn: async () => (await getAccelerationCertBindings()).data?.items || [],
+  enabled: computed(() => !!selectedCredentialId.value),
+  staleTime: 30_000,
+  refetchInterval: computed(() => showTaskDrawer.value ? 30000 : 120000),
+});
+
 // Bindings whose edge cert is stale or whose last sync failed.
-const edgeOneDriftCount = computed(() =>
-  (edgeOneBindings.value || []).filter(b =>
+const edgeOneDriftCount = computed(() => {
+  const bindingDrift = (edgeOneBindings.value || []).filter(b =>
     b.status === 'failed' || b.upToDate === false,
-  ).length,
-);
+  ).length;
+  const edgeDrift = (accelBindings.value || []).filter(a =>
+    a.supported && (a.status === 'expired' || a.status === 'missing' || a.status === 'expiring' || a.upToDate === false),
+  ).length;
+  return bindingDrift + edgeDrift;
+});
+
+// ── Acceleration certificate repair + duplicate cleanup ─────────
+const repairAccelMutation = useMutation({
+  mutationFn: (payload: { dryRun?: boolean }) => repairAccelerationCertificates(payload),
+  onSuccess: (res, vars) => {
+    const d = res.data;
+    const n = d?.totalRepaired || 0;
+    if (vars?.dryRun) {
+      message.info(n ? `预览：${n} 个加速域名需要改绑有效证书` : '加速证书均已是最新，无需修复');
+    } else {
+      message.success(res.message || `已修复 ${n} 个加速域名的证书`);
+    }
+    queryClient.invalidateQueries({ queryKey: ['ssl-edgeone-bindings'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+const dedupeMutation = useMutation({
+  mutationFn: (payload: { dryRun?: boolean }) => dedupeSslCertificates(payload),
+  onSuccess: (res, vars) => {
+    const d = res.data;
+    const n = d?.removedCount || 0;
+    if (vars?.dryRun) {
+      message.info(n ? `预览：发现 ${n} 张重复/被替代证书可清理` : '未发现重复证书');
+      return;
+    }
+    message.success(res.message || `已清理 ${n} 张重复证书`);
+    queryClient.invalidateQueries({ queryKey: ['ssl-certificates'] });
+    queryClient.invalidateQueries({ queryKey: ['ssl-edgeone-bindings'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+function handleDedupe() {
+  dialog.info({
+    title: '清理重复证书',
+    content: '将保留每个域名最合适的一张证书，删除完全相同的重复证书以及已被续期替代的旧证书（含云端副本）。是否继续？',
+    positiveText: '开始清理',
+    negativeText: '取消',
+    onPositiveClick: () => dedupeMutation.mutate({}),
+  });
+}
+
+function handleRepairAcceleration() {
+  dialog.info({
+    title: '检测并修复加速证书',
+    content: '检测所有已加速域名（EdgeOne/Cloudflare/ESA）的边缘证书：过期或缺失时自动改绑有效证书（优先匹配根域名，其次泛解域名）。是否继续？',
+    positiveText: '开始检测',
+    negativeText: '取消',
+    onPositiveClick: () => repairAccelMutation.mutate({}),
+  });
+}
 
 function openTaskDrawer() {
   // With drift present, land on the 加速绑定 tab where "重新同步" lives.
@@ -1185,15 +1258,50 @@ function openApply() {
 }
 
 // ── Upload modal ───────────────────────────────────────────────
+// 上传必须使用「SSL 凭证」而不是申请弹窗里的凭证：表格处于「全部账号」时
+// applyEffectiveCredId 会退回到申请弹窗自己那个空的 select，上传就被判成
+// “请先选择一个具体的 SSL 凭证”，表现就是怎么点都传不上去。
 const showUpload = ref(false);
 const uploadPublicKey = ref('');
 const uploadPrivateKey = ref('');
 const uploadAlias = ref('');
+const uploadCredId = ref<number | null>(null);
+
+// Credentials that can actually accept an upload (腾讯云 SSL / DNSPod 密钥).
+const uploadCredentialOptions = computed(() =>
+  (sslCredentials.value || []).map(c => (
+    { label: c.name, value: c.id }
+  )),
+);
+
+const uploadEffectiveCredId = computed(() => {
+  if (uploadCredId.value) return uploadCredId.value;
+  const selected = Number(selectedCredentialId.value);
+  if (Number.isFinite(selected)) return selected;
+  const first = uploadCredentialOptions.value[0];
+  return first ? Number(first.value) : null;
+});
+
+function openUpload() {
+  const selected = Number(selectedCredentialId.value);
+  if (Number.isFinite(selected)) {
+    uploadCredId.value = selected;
+  } else if (!uploadCredId.value) {
+    uploadCredId.value = (uploadCredentialOptions.value[0]?.value as number | undefined) ?? null;
+  }
+  uploadPublicKey.value = '';
+  uploadPrivateKey.value = '';
+  uploadAlias.value = '';
+  showUpload.value = true;
+}
 
 const uploadMutation = useMutation({
   mutationFn: () => {
-    const credId = applyEffectiveCredId.value;
-    if (!credId) throw new Error('请先选择一个具体的 SSL 凭证');
+    const credId = uploadEffectiveCredId.value;
+    if (!credId) throw new Error('请先选择一个腾讯云 SSL 凭证（需含 SecretId / SecretKey）');
+    if (!uploadPublicKey.value.trim() || !uploadPrivateKey.value.trim()) {
+      throw new Error('请填写证书公钥与私钥');
+    }
     return uploadSslCertificate({
       credentialId: credId,
       publicKey: uploadPublicKey.value,
@@ -1201,13 +1309,270 @@ const uploadMutation = useMutation({
       alias: uploadAlias.value || undefined,
     });
   },
-  onSuccess: () => {
-    message.success('证书上传成功');
+  onSuccess: (res: any) => {
+    const removed = res?.data?.cleanup?.removed?.length || 0;
+    message.success(res?.message || ('证书上传成功' + (removed ? '，已清理重复证书 ' + removed + ' 张' : '')));
     showUpload.value = false;
     uploadPublicKey.value = '';
     uploadPrivateKey.value = '';
     uploadAlias.value = '';
     queryClient.invalidateQueries({ queryKey: ['ssl-certificates'] });
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+// ── Platform deploy (七牛云 / 又拍云) ───────────────────────────
+const { data: platformDeploymentsData, isFetching: platformDeployFetching } = useQuery({
+  queryKey: ['ssl-platform-deployments'],
+  queryFn: async (): Promise<PlatformDeploymentsResponse | undefined> => {
+    const res = await getPlatformDeployments();
+    return res.data;
+  },
+});
+const upyunAccountDomains = computed<UpyunAccountDomain[]>(() => platformDeploymentsData.value?.upyunDomains || []);
+// 实时绑定状态检查结果（点「检查部署状态」后填充）。
+const platformChecks = ref<PlatformBindingCheck[]>([]);
+const platformCheckFetching = ref(false);
+const checksForCert = (cert: SslCertificate | null | undefined): PlatformBindingCheck[] => {
+  if (!cert || !platformChecks.value.length) return [];
+  const byRemote = platformChecks.value.filter(c2 => {
+    const dep = platformDeployments.value.find(d => d.id === c2.deploymentId);
+    return dep && dep.certRemoteId === cert.remoteCertId;
+  });
+  return byRemote;
+};
+const platformDeployments = computed<PlatformDeployment[]>(() => {
+  const payload = platformDeploymentsData.value as unknown as { deployments?: PlatformDeployment[] } | PlatformDeployment[] | undefined;
+  if (Array.isArray(payload)) return payload;
+  return payload?.deployments || [];
+});
+const platformOverview = computed(() => platformDeploymentsData.value?.overview);
+const platformDeploymentsFor = (cert: SslCertificate | null | undefined): PlatformDeployment[] => {
+  if (!cert) return [];
+  const byRemote = platformDeployments.value.filter(d => d.certRemoteId && d.certRemoteId === cert.remoteCertId);
+  if (byRemote.length) return byRemote;
+  if (cert.id) return platformDeployments.value.filter(d => d.certRowId === cert.id);
+  return [];
+};
+
+const { data: platformCredentials } = useQuery({
+  queryKey: ['ssl-platform-credentials'],
+  queryFn: async (): Promise<PlatformCredential[]> => {
+    const res = await getPlatformCredentials();
+    const payload = res.data as unknown as { credentials?: PlatformCredential[] } | PlatformCredential[] | undefined;
+    const list = Array.isArray(payload) ? payload : (payload?.credentials || []);
+    return list as PlatformCredential[];
+  },
+});
+
+// ── 宝塔站点绑定（插件上报：域名 → 站点 / 反代 IP） ──
+const { data: siteBindingsData, isFetching: siteBindingsFetching } = useQuery({
+  queryKey: ['ssl-site-bindings'],
+  queryFn: async (): Promise<SiteBinding[]> => {
+    const res = await getSiteBindings();
+    return res.data?.bindings || [];
+  },
+  staleTime: 60_000,
+});
+const siteBindingFor = (domain?: string | null): SiteBinding | null => {
+  const target = String(domain || '').trim().toLowerCase().replace(/^\*\./, '').replace(/\.+$/, '');
+  if (!target) return null;
+  const list = siteBindingsData.value || [];
+  const exact = list.find(b => String(b.domain || '').toLowerCase() === target);
+  if (exact) return exact;
+  return list.find(b => {
+    const d = String(b.domain || '').toLowerCase().replace(/^\*\./, '');
+    return d && (target.endsWith('.' + d) || d.endsWith('.' + target));
+  }) || null;
+};
+const proxyHostOf = (target: string): string => {
+  try {
+    return new URL(target).host || target;
+  } catch {
+    return target;
+  }
+};
+
+const PLATFORM_LABELS: Record<string, string> = { qiniu: '七牛云', upyun: '又拍云', tencent: '腾讯云', edgeone: '腾讯云 EdgeOne' };
+
+const showPlatformDeploy = ref(false);
+const pdCertId = ref<string | null>(null);
+const pdProvider = ref<'qiniu' | 'upyun' | 'tencent'>('qiniu');
+const pdCredId = ref<number | null>(null);
+const pdDomains = ref('');
+// 快捷添加平台凭证
+const showPdQuickAdd = ref(false);
+const pdQuickName = ref('');
+const pdQuickKey1 = ref('');
+const pdQuickKey2 = ref('');
+
+// 弹窗打开时跨账号拉取全部已签发证书（当前页可能不含目标证书）。
+const { data: allIssuedCerts } = useQuery({
+  queryKey: ['ssl-all-issued-certs'],
+  queryFn: async (): Promise<SslCertificate[]> => {
+    const res = await getSslCertificates('all', { page: 1, limit: 200 });
+    return (res.data || []).filter(c => c.status === 'issued');
+  },
+  enabled: computed(() => showPlatformDeploy.value),
+  staleTime: 30_000,
+});
+const pdCertOptions = computed(() =>
+  (allIssuedCerts.value || certificates.value)
+    .filter(c => c.status === 'issued' && c.remoteCertId)
+    .map(c => {
+      const deployed = platformsForCertId(c.remoteCertId);
+      const label = `${c.domain}${c.notAfter ? '（到期 ' + formatDate(c.notAfter) + '）' : ''}${deployed ? ' · 已部署: ' + deployed : ''}`;
+      return { label, value: c.remoteCertId };
+    })
+    .filter(o => o.value),
+);
+
+const pdCredentialOptions = computed(() =>
+  (platformCredentials.value || [])
+    .filter(c => c.provider === pdProvider.value)
+    .map(c => ({ label: c.name, value: c.id })),
+);
+
+// 选择证书下拉里显示该证书已部署到哪些平台。
+const platformsForCertId = (certId?: string | null): string => {
+  if (!certId) return '';
+  const names = new Set<string>();
+  for (const d of platformDeployments.value) {
+    if (d.certRemoteId === certId) names.add(PLATFORM_LABELS[d.provider] || d.provider);
+  }
+  return [...names].join('、');
+};
+
+const pdCertNames = computed(() => {
+  const cert = (allIssuedCerts.value || certificates.value).find(c => c.remoteCertId === pdCertId.value);
+  if (!cert) return [] as string[];
+  const names: string[] = [cert.domain];
+  if (Array.isArray(cert.san)) names.push(...cert.san);
+  else if (typeof cert.san === 'string' && cert.san) names.push(cert.san);
+  return names.filter(Boolean);
+});
+
+watch(pdProvider, () => { pdCredId.value = null; });
+
+function openPlatformDeploy(cert?: SslCertificate) {
+  if (cert) {
+    if (cert.status !== 'issued') { message.error('只有已签发的证书才能上传到平台'); return; }
+    pdCertId.value = cert.remoteCertId || null;
+  } else {
+    pdCertId.value = pdCertOptions.value[0]?.value ?? null;
+  }
+  pdProvider.value = 'qiniu';
+  pdCredId.value = null;
+  const target = (allIssuedCerts.value || certificates.value).find(c => c.remoteCertId === pdCertId.value);
+  pdDomains.value = target?.domain || '';
+  showPdQuickAdd.value = false;
+  pdTestResult.value = null;
+  showPlatformDeploy.value = true;
+}
+
+function addPdDomain(domain: string) {
+  const current = pdDomains.value.split(/[,,\s]+/).map(s => s.trim()).filter(Boolean);
+  if (!current.includes(domain)) current.push(domain);
+  pdDomains.value = current.join(', ');
+}
+
+const pdDeployMutation = useMutation({
+  mutationFn: () => {
+    if (!pdCertId.value) throw new Error('请选择要上传的面板证书');
+    if (!pdCredId.value) throw new Error('请选择平台凭证');
+    const domains = pdDomains.value.split(/[,,\s]+/).map(s => s.trim()).filter(Boolean);
+    if (!domains.length) throw new Error('请填写要绑定的 CDN 域名');
+    return deployCertToPlatform({
+      provider: pdProvider.value,
+      credentialId: pdCredId.value,
+      certId: pdCertId.value,
+      domains,
+    });
+  },
+  onSuccess: async (res: any) => {
+    message.success(res?.message || '上传成功');
+    showPlatformDeploy.value = false;
+    queryClient.invalidateQueries({ queryKey: ['ssl-platform-deployments'] });
+    // 上传成功后立即做一次实时状态检查，让用户马上看到绑定结果。
+    try { await runPlatformCheck(); } catch { /* ignore */ }
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+const pdQuickAddMutation = useMutation({
+  mutationFn: () => {
+    if (!pdQuickName.value.trim()) throw new Error('请填写凭证名称');
+    const provider = pdProvider.value as 'qiniu' | 'upyun';
+    const secrets: Record<string, string> = provider === 'qiniu'
+      ? { accessKey: pdQuickKey1.value.trim(), secretKey: pdQuickKey2.value.trim() }
+      : { username: pdQuickKey1.value.trim(), password: pdQuickKey2.value.trim() };
+    if (provider === 'qiniu' && !secrets.accessKey) throw new Error('请填写 AccessKey');
+    if (provider === 'upyun' && !secrets.username) throw new Error('请填写登录账号');
+    return createPlatformCredential({ name: pdQuickName.value.trim(), provider, secrets });
+  },
+  onSuccess: (res: any) => {
+    message.success(res?.message || '平台凭证已添加');
+    pdTestResult.value = null;
+    queryClient.invalidateQueries({ queryKey: ['ssl-platform-credentials'] });
+    showPdQuickAdd.value = false;
+    pdQuickName.value = ''; pdQuickKey1.value = ''; pdQuickKey2.value = '';
+    // 新凭证创建后自动选中。
+    setTimeout(() => {
+      const list = (platformCredentials.value || []).filter(c => c.provider === pdProvider.value);
+      if (list.length) pdCredId.value = list[list.length - 1].id;
+    }, 300);
+  },
+  onError: (err: any) => message.error(String(err)),
+});
+
+// 又拍云/七牛云凭证：先测试连接，成功后再保存。
+const pdTestResult = ref<{ ok: boolean; message: string } | null>(null);
+const pdTestMutation = useMutation({
+  mutationFn: () => {
+    const provider = pdProvider.value;
+    if (provider === 'tencent') {
+      if (!pdCredId.value) throw new Error('请选择腾讯云凭证');
+      return testPlatformCredential({ provider, credentialId: pdCredId.value });
+    }
+    const secrets: Record<string, string> = provider === 'qiniu'
+      ? { accessKey: pdQuickKey1.value.trim(), secretKey: pdQuickKey2.value.trim() }
+      : { username: pdQuickKey1.value.trim(), password: pdQuickKey2.value.trim() };
+    return testPlatformCredential({ provider, secrets });
+  },
+  onSuccess: (res: any) => {
+    pdTestResult.value = { ok: true, message: res?.message || '连接成功' };
+    message.success(res?.message || '连接成功');
+  },
+  onError: (err: any) => {
+    pdTestResult.value = { ok: false, message: String(err) };
+    message.error(String(err));
+  },
+});
+
+async function runPlatformCheck() {
+  platformCheckFetching.value = true;
+  try {
+    const res = await checkPlatformDeployments();
+    platformChecks.value = res.data?.checks || [];
+    const checked = res.data?.checked ?? 0;
+    const total = res.data?.total ?? 0;
+    const drift = res.data?.drift ?? 0;
+    let msg = `检查完成：${checked}/${total} 个域名状态已核实`;
+    if (drift) msg += `，${drift} 个漂移`;
+    message.success(msg);
+    queryClient.invalidateQueries({ queryKey: ['ssl-platform-deployments'] });
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    platformCheckFetching.value = false;
+  }
+}
+
+const pdDeleteMutation = useMutation({
+  mutationFn: (id: number) => deletePlatformDeployment(id),
+  onSuccess: (res: any) => {
+    message.success(res?.message || '已删除部署记录');
+    queryClient.invalidateQueries({ queryKey: ['ssl-platform-deployments'] });
   },
   onError: (err: any) => message.error(String(err)),
 });
@@ -1526,7 +1891,8 @@ function handleDownload(cert: SslCertificate) {
 // ── Online certificate viewer (no download) ────────────────────
 const showCertView = ref(false);
 const certViewLoading = ref(false);
-const certViewData = ref<{ certId: string; domain: string; credentialId: number; publicKey: string; meta: Record<string, any> } | null>(null);
+const certViewData = ref<{ certId: string; domain: string; credentialId: number; publicKey: string; privateKey: string; meta: Record<string, any> } | null>(null);
+const showPrivateKey = ref(false);
 
 async function openCertView(cert: SslCertificate) {
   const credId = getCredIdForCert(cert) || (typeof cert.credentialId === 'number' ? cert.credentialId : 0);
@@ -1536,11 +1902,18 @@ async function openCertView(cert: SslCertificate) {
   certViewData.value = null;
   try {
     const res = await viewSslCertificate(credId, cert.remoteCertId);
+    // 在线查看同时返回私钥：/pem 端点提供 publicKey + privateKey。
+    let privateKey = '';
+    try {
+      const pemRes = await getSslCertificatePem(credId, cert.remoteCertId);
+      privateKey = pemRes.data?.privateKey || '';
+    } catch { /* 私钥获取失败时仍展示公钥 */ }
     certViewData.value = {
       certId: cert.remoteCertId,
       domain: cert.domain || cert.remoteCertId,
       credentialId: credId,
       publicKey: res.data?.publicKey || '',
+      privateKey,
       meta: (res.data?.meta || {}) as Record<string, any>,
     };
   } catch (err: any) {
@@ -1554,6 +1927,17 @@ function downloadViewedCert() {
   const d = certViewData.value;
   if (!d) return;
   downloadSslCertificate(d.credentialId, d.certId).catch((err: any) => message.error(String(err)));
+}
+
+async function copyPrivateKey() {
+  const key = certViewData.value?.privateKey;
+  if (!key) return;
+  try {
+    await navigator.clipboard.writeText(key);
+    message.success('私钥已复制到剪贴板');
+  } catch {
+    message.error('复制失败，请手动选择复制');
+  }
 }
 
 async function copyCertPem() {
@@ -1764,6 +2148,76 @@ const columns = computed(() => {
       },
     },
     {
+      title: '宝塔站点',
+      key: 'siteBinding',
+      width: 190,
+      render: (row: SslCertificate) => {
+        const binding = siteBindingFor(row.domain);
+        if (!binding) {
+          return h('span', { class: 'text-xs text-slate-300' }, '—');
+        }
+        const siteTags = (binding.siteNames || []).map(name =>
+          h(NTag, { size: 'tiny', bordered: false, type: 'info', class: 'mr-1' }, () => name),
+        );
+        const ips = [...new Set((binding.proxyTargets || []).map(t => proxyHostOf(t)))];
+        const ipLine = ips.length
+          ? h('div', { class: 'mt-0.5 text-xs text-slate-400 truncate', title: (binding.proxyTargets || []).join(', ') }, '反代 ' + ips.slice(0, 2).join('、') + (ips.length > 2 ? ' 等' : ''))
+          : h('div', { class: 'mt-0.5 text-xs text-slate-300' }, '无反代');
+        return h('div', { class: 'min-w-0' }, [...siteTags, ipLine]);
+      },
+    },
+    {
+      title: '平台',
+      key: 'platforms',
+      width: 170,
+      render: (row: SslCertificate) => {
+        const deps = platformDeploymentsFor(row);
+        if (!deps.length) {
+          return row.status === 'issued'
+            ? h('div', { class: 'flex items-center gap-1.5' }, [
+                h('span', { class: 'text-xs text-slate-400' }, '未上传平台'),
+                h(NButton, {
+                  size: 'tiny', quaternary: true, type: 'primary',
+                  onClick: () => openPlatformDeploy(row),
+                }, { icon: () => h(Globe, { size: 12 }), default: () => '上传' }),
+              ])
+            : h('span', { class: 'text-xs text-slate-400' }, '-');
+        }
+        // 按 (平台, 凭证) 分组，每组显示徽标 + 到期时间；失败时红色角标。
+        const groups = new Map<string, PlatformDeployment[]>();
+        for (const d of deps) {
+          const key = `${d.provider}|${d.credentialName || d.credentialId}`;
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key)!.push(d);
+        }
+        const children: any[] = [];
+        for (const [key, list] of groups) {
+          const [provider, credName] = key.split('|');
+          const failed = list.filter(d => d.status === 'failed').length;
+          const notAfters = list.map(d => d.notAfter).filter(Boolean).sort();
+          const notAfter = notAfters[notAfters.length - 1] || '';
+          const expiry = notAfter ? expiryDaysText(notAfter) : null;
+          const tag = h(NTag, {
+            size: 'tiny', bordered: false,
+            type: failed ? 'error' : (expiry && expiry.type === 'error' ? 'warning' : 'success'),
+          }, () => `${PLATFORM_LABELS[provider] || provider}·${list.length}`);
+          const lines: any[] = [tag];
+          lines.push(h('div', { class: 'text-xs text-slate-500 mt-0.5 truncate' }, credName));
+          if (notAfter) {
+            lines.push(h('div', { class: 'text-xs text-slate-400' }, `到期 ${formatDate(notAfter)}`));
+          }
+          children.push(h('div', { class: 'space-y-0.5' }, lines));
+        }
+        const tooltip = deps.map(d =>
+          `${PLATFORM_LABELS[d.provider] || d.provider} · ${d.credentialName || d.credentialId} · ${d.domain}${d.status === 'failed' ? '（失败: ' + (d.lastError || '') + '）' : ''}${d.notAfter ? ' · 到期 ' + formatDate(d.notAfter) : ''}`
+        ).join('\n');
+        return h(NTooltip, { trigger: 'hover' }, {
+          trigger: () => h('div', { class: 'cursor-help space-y-1' }, children),
+          default: () => tooltip,
+        });
+      },
+    },
+    {
       title: '部署',
       key: 'deployment',
       width: 150,
@@ -1943,9 +2397,28 @@ const tableScrollX = computed(() =>
           <template #icon><Plus :size="14" /></template>
           申请
         </NButton>
-        <NButton v-if="channelTab !== 'letsencrypt'" size="small" secondary :disabled="!selectedCredentialId || selectedCredentialId === 'all'" @click="showUpload = true">
+        <NButton
+          v-if="channelTab !== 'letsencrypt'"
+          size="small"
+          secondary
+          :disabled="uploadCredentialOptions.length === 0"
+          :title="uploadCredentialOptions.length === 0
+            ? '请先添加腾讯云 SSL 或 DNSPod 凭证后再上传证书'
+            : '上传第三方证书（PEM）'"
+          @click="openUpload"
+        >
           <template #icon><Upload :size="14" /></template>
           上传
+        </NButton>
+        <NButton
+          size="small"
+          secondary
+          :disabled="pdCertOptions.length === 0"
+          :title="'把面板证书上传到七牛云 / 又拍云并绑定 CDN 域名'"
+          @click="openPlatformDeploy()"
+        >
+          <template #icon><Globe :size="14" /></template>
+          平台部署
         </NButton>
         <NButton
           v-if="channelTab !== 'letsencrypt'"
@@ -1978,6 +2451,26 @@ const tableScrollX = computed(() =>
             清理失效
           </NButton>
         </NDropdown>
+        <NButton
+          size="small"
+          secondary
+          :loading="dedupeMutation.isPending.value"
+          @click="handleDedupe"
+          title="删除相同/已被续期替代的重复证书，每个域名只保留一张"
+        >
+          <template #icon><Copy :size="14" /></template>
+          去重
+        </NButton>
+        <NButton
+          size="small"
+          secondary
+          :loading="repairAccelMutation.isPending.value"
+          @click="handleRepairAcceleration"
+          title="检测加速域名边缘证书，过期/缺失时自动改绑有效证书（优先根域名，其次泛解域名）"
+        >
+          <template #icon><Zap :size="14" /></template>
+          修复加速
+        </NButton>
         <NButton size="small" secondary @click="openTaskDrawer" title="查看持久化签发任务与自动部署事件">
           <template #icon><ListChecks :size="14" /></template>
           任务
@@ -1997,7 +2490,7 @@ const tableScrollX = computed(() =>
           <template #icon><RotateCw :size="14" /></template>
           自动续期
         </NButton>
-        <div class="flex items-center gap-1.5 pl-1" title="开启后后台每日自动检查，剩余 ≤7 天即续期并清理过期证书">
+        <div class="flex items-center gap-1.5 pl-1" title="开启后后台每日自动检查：剩余 ≤30 天自动续期（Let's Encrypt / 腾讯云），并把新证书同步到宝塔站点与 EdgeOne 等加速域名；上传替换证书仅允许在到期前 7 天内且必须是新签发证书">
           <NSwitch :value="autoRenewEnabled" :loading="autoRenewToggling" size="small" @update:value="toggleAutoRenew" />
           <span class="text-xs" :class="autoRenewEnabled ? 'text-emerald-600 font-semibold' : 'text-slate-400'">
             {{ autoRenewEnabled ? '自动续期已开启' : '自动续期未开启' }}
@@ -2021,6 +2514,76 @@ const tableScrollX = computed(() =>
         <div class="flex-1" />
         <span v-if="channelTab === 'tencent'" class="text-xs text-slate-400">仅显示腾讯云签发的证书</span>
         <span v-else-if="channelTab === 'letsencrypt'" class="text-xs text-slate-400">仅显示 Let's Encrypt (acme.sh) 签发的证书</span>
+      </div>
+    </section>
+
+    <!-- 平台部署概览（七牛云 / 又拍云） -->
+    <section v-if="platformOverview && platformOverview.total > 0" class="panel p-4">
+      <div class="flex flex-wrap items-center gap-2 mb-3">
+        <p class="text-sm font-semibold text-slate-700">平台部署概览</p>
+        <span class="text-xs text-slate-400">证书上传到哪里、什么时候过期</span>
+        <div class="flex-1" />
+        <NButton size="tiny" secondary :loading="platformCheckFetching" @click="runPlatformCheck">
+          <template #icon><Zap :size="12" /></template>
+          检查部署状态
+        </NButton>
+        <NButton size="tiny" quaternary :loading="platformDeployFetching" @click="() => queryClient.invalidateQueries({ queryKey: ['ssl-platform-deployments'] })">
+          <template #icon><RefreshCw :size="12" /></template>
+          刷新
+        </NButton>
+      </div>
+      <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div class="rounded-xl border border-panel-border bg-panel-bg p-3">
+          <p class="text-xs text-slate-400">部署域名总数</p>
+          <p class="mt-1 text-xl font-semibold text-slate-700">{{ platformOverview.total }}</p>
+        </div>
+        <div
+          v-for="(stat, p) in platformOverview.byProvider"
+          :key="p"
+          class="rounded-xl border border-panel-border bg-panel-bg p-3"
+        >
+          <p class="text-xs text-slate-400">{{ PLATFORM_LABELS[String(p)] || p }}</p>
+          <p class="mt-1 text-xl font-semibold text-slate-700">{{ stat.total }}</p>
+          <div class="mt-1 flex flex-wrap gap-1">
+            <NTag v-if="stat.expiringSoon" size="tiny" type="warning" :bordered="false">30 天内到期 {{ stat.expiringSoon }}</NTag>
+            <NTag v-if="stat.failed" size="tiny" type="error" :bordered="false">失败 {{ stat.failed }}</NTag>
+            <NTag v-if="stat.expired" size="tiny" type="error" :bordered="false">已过期 {{ stat.expired }}</NTag>
+            <NTag v-if="!stat.failed && !stat.expiringSoon && !stat.expired" size="tiny" type="success" :bordered="false">全部正常</NTag>
+          </div>
+        </div>
+        <!-- 实时绑定状态检查结果 -->
+        <div v-if="platformChecks.length" class="mt-4 space-y-2">
+          <p class="text-xs font-semibold text-slate-600">实时绑定状态（点上方「检查部署状态」刷新）</p>
+          <div
+            v-for="chk in platformChecks"
+            :key="chk.deploymentId"
+            class="rounded-xl border p-3 text-sm"
+            :class="chk.drift ? 'border-amber-300 bg-amber-50/60' : chk.live?.bound ? 'border-emerald-200 bg-emerald-50/40' : 'border-panel-border bg-panel-bg'"
+          >
+            <div class="flex flex-wrap items-center gap-2">
+              <NTag size="tiny" :bordered="false" type="info">{{ chk.providerLabel || chk.provider }}</NTag>
+              <span class="font-medium text-slate-700">{{ chk.domain }}</span>
+              <NTag v-if="!chk.checked" size="tiny" type="error" :bordered="false">检查失败</NTag>
+              <NTag v-else-if="chk.drift" size="tiny" type="warning" :bordered="false">证书漂移</NTag>
+              <NTag v-else-if="chk.live?.bound" size="tiny" type="success" :bordered="false">已绑定</NTag>
+              <NTag v-else size="tiny" type="error" :bordered="false">未绑定</NTag>
+              <NTag v-if="chk.live?.https === false && chk.live?.bound" size="tiny" type="warning" :bordered="false">HTTPS 未开启</NTag>
+              <span v-if="chk.live?.notAfter" class="ml-auto text-xs text-slate-400">
+                平台实际到期：{{ formatDate(chk.live.notAfter) }}
+                <NTag v-if="chk.liveDaysRemaining !== null && chk.liveDaysRemaining !== undefined && chk.liveDaysRemaining <= 30" size="tiny" type="warning" :bordered="false" class="ml-1">剩 {{ chk.liveDaysRemaining }} 天</NTag>
+              </span>
+            </div>
+            <p v-if="chk.live?.certificateId" class="mt-1 text-xs text-slate-500">
+              平台当前证书：{{ chk.live.certificateId }}
+              <span v-if="chk.live.commonName">（{{ chk.live.commonName }}）</span>
+            </p>
+            <p v-if="chk.drift" class="mt-1 text-xs text-amber-700">
+              面板记录的证书（{{ chk.platformCertId }}）与平台实际绑定的不一致——可能有人在该平台手动更换过证书，或续期后未同步。
+            </p>
+            <p v-if="chk.error" class="mt-1 break-all text-xs text-red-500">{{ chk.error }}</p>
+            <p v-if="chk.live?.error" class="mt-1 break-all text-xs text-red-500">{{ chk.live.error }}</p>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -2494,9 +3057,139 @@ const tableScrollX = computed(() =>
       :initial-domains-text="addZoneInitialText"
     />
 
+    <!-- Platform Deploy Modal (七牛云 / 又拍云) -->
+    <NModal v-model:show="showPlatformDeploy" preset="dialog" title="上传证书到平台" :mask-closable="false" style="max-width: 560px;">
+      <div class="space-y-4 pt-2">
+        <NAlert type="info" :bordered="false">
+          读取面板已签发的证书（Let's Encrypt / 腾讯云）上传到七牛云或又拍云，并自动绑定到指定 CDN 域名。
+          acme.sh 自动续期成功后会自动重新上传新证书并替换。
+        </NAlert>
+        <NFormItem label="选择证书" required>
+          <NSelect v-model:value="pdCertId" :options="pdCertOptions" filterable placeholder="选择面板中已签发的证书" />
+        </NFormItem>
+        <NFormItem label="目标平台" required>
+          <NSelect
+            v-model:value="pdProvider"
+            :options="[
+              { label: '七牛云（官方 API · AccessKey）', value: 'qiniu' },
+              { label: '又拍云（模拟登录 · 账号密码）', value: 'upyun' },
+              { label: '腾讯云（SSL 证书库 + CDN 域名绑定）', value: 'tencent' },
+            ]"
+          />
+        </NFormItem>
+        <NFormItem label="平台凭证" required>
+          <div class="w-full space-y-2">
+            <NSelect
+              v-model:value="pdCredId"
+              :options="pdCredentialOptions"
+              :placeholder="pdProvider === 'qiniu' ? '选择七牛云 AccessKey 凭证' : pdProvider === 'upyun' ? '选择又拍云账号凭证' : '选择腾讯云凭证（SSL 专属或 DNS 共用）'"
+            />
+            <div class="flex items-center gap-2">
+              <NButton
+                v-if="pdProvider !== 'tencent'"
+                size="tiny" quaternary type="primary"
+                @click="showPdQuickAdd = !showPdQuickAdd"
+              >
+                <template #icon><Plus :size="12" /></template>
+                {{ showPdQuickAdd ? '收起' : '快速添加凭证' }}
+              </NButton>
+              <span v-if="pdProvider === 'tencent'" class="text-xs text-slate-400">
+                腾讯云复用「腾讯云 SSL / DNSPod」凭证，无需单独创建
+              </span>
+              <span v-else-if="pdCredentialOptions.length === 0" class="text-xs text-amber-600">
+                还没有{{ PLATFORM_LABELS[pdProvider] }}凭证，请先添加
+              </span>
+            </div>
+            <div v-if="showPdQuickAdd" class="space-y-2 rounded-xl border border-panel-border bg-panel-bg p-3">
+              <NInput v-model:value="pdQuickName" size="small" placeholder="凭证名称，如：七牛云主账号" />
+              <NInput v-model:value="pdQuickKey1" size="small" :placeholder="pdProvider === 'qiniu' ? 'AccessKey' : '登录账号'" />
+              <NInput
+                v-model:value="pdQuickKey2"
+                size="small"
+                type="password"
+                show-password-on="click"
+                :placeholder="pdProvider === 'qiniu' ? 'SecretKey' : '登录密码'"
+              />
+              <p v-if="pdProvider === 'upyun'" class="text-xs text-amber-600">
+                又拍云没有官方证书 API，将使用账号密码模拟登录控制台；若账号开启验证码/两步验证会失败，需手动到控制台更新。
+              </p>
+              <div class="flex items-center gap-2">
+                <NButton size="tiny" secondary :loading="pdTestMutation.isPending.value" @click="pdTestMutation.mutate()">
+                  测试连接
+                </NButton>
+                <NButton
+                  size="tiny" type="primary"
+                  :loading="pdQuickAddMutation.isPending.value"
+                  :disabled="!pdTestResult?.ok"
+                  :title="pdTestResult?.ok ? '连接已验证，保存凭证' : '请先点击「测试连接」，成功后才能保存'"
+                  @click="pdQuickAddMutation.mutate()"
+                >
+                  保存
+                </NButton>
+                <NTag v-if="pdTestResult" size="tiny" :bordered="false" :type="pdTestResult.ok ? 'success' : 'error'">
+                  {{ pdTestResult.ok ? '连接成功' : '连接失败' }}
+                </NTag>
+              </div>
+              <p v-if="pdTestResult && !pdTestResult.ok" class="break-all text-xs text-red-500">{{ pdTestResult.message }}</p>
+            </div>
+          </div>
+        </NFormItem>
+        <NFormItem label="绑定域名" required>
+          <NInput
+            v-model:value="pdDomains"
+            type="textarea"
+            :rows="2"
+            :placeholder="(pdCertNames[0] || 'cdn.example.com') + '，多个域名用逗号分隔'"
+          />
+          <p class="mt-1 text-xs text-slate-400">
+            证书覆盖：{{ pdCertNames.join('、') || '-' }}；只能绑定证书覆盖范围内的域名
+          </p>
+          <div v-if="pdProvider === 'upyun'" class="mt-2 w-full">
+            <p class="mb-1 text-xs text-slate-500">
+              你又拍云账号下已接入的域名（点击快选）：
+              <span v-if="upyunAccountDomains.length === 0" class="text-amber-600">加载中/暂无</span>
+            </p>
+            <div class="flex flex-wrap gap-1">
+              <NTag
+                v-for="d in upyunAccountDomains"
+                :key="d.domain"
+                size="tiny"
+                :bordered="false"
+                :type="pdCertNames.includes(d.domain) ? 'success' : 'default'"
+                :class="pdCertNames.includes(d.domain) ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'"
+                @click="pdCertNames.includes(d.domain) && addPdDomain(d.domain)"
+              >{{ d.domain }}（{{ d.bucket }}）</NTag>
+            </div>
+          </div>
+        </NFormItem>
+      </div>
+      <template #action>
+        <NButton @click="showPlatformDeploy = false">取消</NButton>
+        <NButton
+          type="primary"
+          :loading="pdDeployMutation.isPending.value"
+          :disabled="!pdCertId || !pdCredId || !pdDomains.trim()"
+          @click="pdDeployMutation.mutate()"
+        >
+          上传并绑定
+        </NButton>
+      </template>
+    </NModal>
+
     <!-- Upload Modal -->
     <NModal v-model:show="showUpload" preset="dialog" title="上传第三方证书" :mask-closable="false" style="max-width: 560px;">
       <div class="space-y-4 pt-2">
+        <NAlert type="warning" :bordered="false">
+          上传限制：面板只保留每个域名最合适的一张证书。完全相同的证书会被直接拒绝；
+          替换证书仅允许在当前证书到期前 7 天内（或已过期）上传，且必须是新签发的证书
+          （签发时间需晚于当前证书）。
+        </NAlert>
+        <NAlert v-if="uploadCredentialOptions.length === 1" type="info" :bordered="false">
+          当前将上传到「{{ uploadCredentialOptions[0].label }}」；如需切换账号，请回到凭证管理切换当前账号。
+        </NAlert>
+        <NFormItem v-if="uploadCredentialOptions.length > 1" label="上传到凭证" required>
+          <NSelect v-model:value="uploadCredId" :options="uploadCredentialOptions" placeholder="选择腾讯云 SSL 凭证" />
+        </NFormItem>
         <NFormItem label="证书公钥 (PEM)" required>
           <NInput
             v-model:value="uploadPublicKey"
@@ -2522,7 +3215,7 @@ const tableScrollX = computed(() =>
         <NButton
           type="primary"
           :loading="uploadMutation.isPending.value"
-          :disabled="!uploadPublicKey.trim() || !uploadPrivateKey.trim()"
+          :disabled="!uploadEffectiveCredId || !uploadPublicKey.trim() || !uploadPrivateKey.trim()"
           @click="uploadMutation.mutate()"
         >
           上传
@@ -2534,7 +3227,8 @@ const tableScrollX = computed(() =>
     <NModal v-model:show="showRenewModal" preset="dialog" title="自动续期" :mask-closable="false" style="max-width: 480px;">
       <div class="space-y-4 pt-2">
         <NAlert type="info" :bordered="false">
-          自动检查所有账号下即将过期（或已过期）的证书，为相同域名重新申请免费 DV 证书。
+          自动检查所有账号下即将过期（或已过期）的证书：Let's Encrypt / 腾讯云证书剩余 ≤30 天即自动续期，
+        续期成功后自动同步到宝塔站点与 EdgeOne 等加速域名；已被有效证书覆盖的域名不会重复申请。
         </NAlert>
         <NFormItem label="提前续期天数">
           <NSelect
@@ -2776,17 +3470,46 @@ const tableScrollX = computed(() =>
             </div>
           </NTabPane>
           <NTabPane name="edgeone" tab="加速绑定">
-            <div class="mb-3 flex items-center gap-2">
+            <div class="mb-3 flex flex-wrap items-center gap-2">
               <NButton size="small" type="warning" secondary :loading="syncEdgeOneMutation.isPending.value" @click="syncEdgeOneMutation.mutate({})">
                 全部同步到 CDN
               </NButton>
               <NButton size="small" quaternary :loading="syncEdgeOneMutation.isPending.value" @click="syncEdgeOneMutation.mutate({ dryRun: true })">
                 预览
               </NButton>
-              <span class="text-xs text-slate-400">将面板证书绑定到匹配的加速域名（EdgeOne / Cloudflare / ESA），消除 CDN 侧证书过期</span>
+              <NButton size="small" secondary :loading="repairAccelMutation.isPending.value" @click="handleRepairAcceleration">
+                检测并修复失效证书
+              </NButton>
+              <span class="text-xs text-slate-400">将面板证书绑定到匹配的加速域名（EdgeOne / Cloudflare / ESA）；边缘证书过期时自动改绑有效证书（优先根域名，其次泛解域名）</span>
+            </div>
+            <div v-if="accelBindingsFetching && !(accelBindings || []).length" class="flex justify-center py-12"><NSpin /></div>
+            <div v-if="(accelBindings || []).length" class="mb-3 space-y-2">
+              <div v-for="a in accelBindings" :key="a.host + a.provider" class="rounded-xl border border-panel-border p-3">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="font-medium text-slate-700">{{ a.host }}</span>
+                  <NTag size="tiny" :bordered="false" type="info">
+                    {{ a.provider === 'cloudflare' ? 'Cloudflare' : a.provider === 'aliyun_esa' ? '阿里云 ESA' : 'EdgeOne' }}
+                  </NTag>
+                  <NTag v-if="!a.supported" size="tiny" :bordered="false" type="warning">不支持推送证书</NTag>
+                  <NTag v-else-if="a.status === 'expired'" size="tiny" :bordered="false" type="error">边缘证书已过期</NTag>
+                  <NTag v-else-if="a.status === 'missing'" size="tiny" :bordered="false" type="warning">未绑定证书</NTag>
+                  <NTag v-else-if="a.status === 'expiring'" size="tiny" :bordered="false" type="warning">即将到期</NTag>
+                  <NTag v-else size="tiny" :bordered="false" type="success">边缘证书有效</NTag>
+                  <span class="ml-auto text-xs text-slate-400">
+                    边缘证书：{{ a.accelCertificateId || '-' }}
+                    <template v-if="a.accelDaysRemaining !== null && a.accelDaysRemaining !== undefined">（剩余 {{ a.accelDaysRemaining }} 天）</template>
+                  </span>
+                </div>
+                <p class="mt-1 text-xs text-slate-500">
+                  应绑定证书：{{ a.certId || '面板无可用证书' }}
+                  <span v-if="a.certDomain">（{{ a.certDomain }}）</span>
+                  <span v-if="a.panelExpireTime"> · 到期：{{ formatDateTime(a.panelExpireTime) }}</span>
+                </p>
+                <p v-if="a.message" class="mt-1 text-xs text-slate-400">{{ a.message }}</p>
+              </div>
             </div>
             <div v-if="edgeOneBindingsFetching && !(edgeOneBindings || []).length" class="flex justify-center py-12"><NSpin /></div>
-            <NEmpty v-else-if="!(edgeOneBindings || []).length" description="暂无加速证书绑定记录（启用域名加速或部署证书后自动生成）" class="py-12" />
+            <NEmpty v-else-if="!(edgeOneBindings || []).length && !(accelBindings || []).length" description="暂无加速证书绑定记录（启用域名加速或部署证书后自动生成）" class="py-12" />
             <div v-else class="space-y-3">
               <div v-for="b in edgeOneBindings" :key="b.id" class="rounded-xl border border-panel-border p-3">
                 <div class="flex flex-wrap items-center gap-2">
@@ -3077,6 +3800,47 @@ const tableScrollX = computed(() =>
             </NButton>
           </div>
 
+          <!-- 平台部署记录（七牛云 / 又拍云 / 腾讯云） -->
+          <template v-if="platformDeploymentsFor(detailData).length > 0">
+            <div class="mt-6 mb-3 flex items-center justify-between">
+              <h3 class="text-sm font-semibold text-slate-700">平台部署</h3>
+              <NButton size="tiny" secondary :loading="platformCheckFetching" @click="runPlatformCheck">
+                <template #icon><Zap :size="12" /></template>
+                检查实时状态
+              </NButton>
+            </div>
+            <div
+              v-for="dep in platformDeploymentsFor(detailData)"
+              :key="dep.id"
+              class="panel-muted mb-2 p-3 text-sm"
+            >
+              <div class="flex flex-wrap items-center gap-2">
+                <NTag size="tiny" :bordered="false" :type="dep.status === 'synced' ? 'success' : dep.status === 'failed' ? 'error' : 'warning'">
+                  {{ PLATFORM_LABELS[dep.provider] || dep.provider }} · {{ dep.credentialName || dep.credentialId }}
+                </NTag>
+                <NTag size="tiny" :bordered="false" :type="dep.isExpired ? 'error' : (dep.daysRemaining !== null && dep.daysRemaining !== undefined && dep.daysRemaining <= 30 ? 'warning' : 'default')">
+                  {{ dep.isExpired ? '已过期' : (dep.daysRemaining !== null && dep.daysRemaining !== undefined ? `剩余 ${dep.daysRemaining} 天` : '到期未知') }}
+                </NTag>
+                <NButton size="tiny" quaternary type="error" class="ml-auto" @click="pdDeleteMutation.mutate(dep.id)">删除记录</NButton>
+              </div>
+              <p class="mt-1 text-xs text-slate-600">绑定域名：{{ dep.domain }}</p>
+              <p v-if="dep.platformCertName" class="text-xs text-slate-500">平台证书：{{ dep.platformCertName }}<span v-if="dep.platformCertId">（{{ dep.platformCertId }}）</span></p>
+              <p class="text-xs text-slate-400">
+                到期：{{ formatDateTime(dep.notAfter) }}
+                <span v-if="dep.uploadedAt"> · 上传于 {{ formatDateTime(dep.uploadedAt) }}</span>
+              </p>
+              <p v-if="dep.lastError" class="mt-1 break-all text-xs text-red-500">{{ dep.lastError }}</p>
+              <template v-for="chk in checksForCert(detailData).filter(c2 => c2.deploymentId === dep.id)" :key="'chk-' + chk.deploymentId">
+                <p v-if="chk.checked" class="mt-1 text-xs" :class="chk.drift ? 'text-amber-700' : 'text-emerald-700'">
+                  实时状态：<strong>{{ chk.drift ? '证书漂移' : chk.live?.bound ? '已绑定' : '未绑定' }}</strong>
+                  <span v-if="chk.live?.certificateId"> · 平台证书 {{ chk.live.certificateId }}</span>
+                  <span v-if="chk.live?.notAfter"> · 实际到期 {{ formatDateTime(chk.live.notAfter) }}</span>
+                </p>
+                <p v-else-if="chk.error" class="mt-1 break-all text-xs text-red-500">实时检查失败：{{ chk.error }}</p>
+              </template>
+            </div>
+          </template>
+
           <!-- Deployed resources -->
           <template v-if="detailData.deployedResources && detailData.deployedResources.length > 0">
             <h3 class="mt-6 mb-3 text-sm font-semibold text-slate-700">部署资源</h3>
@@ -3124,7 +3888,23 @@ const tableScrollX = computed(() =>
           </NButton>
         </div>
         <pre class="max-h-96 overflow-auto rounded-lg border border-panel-border bg-slate-50 p-3 text-xs leading-relaxed break-all whitespace-pre-wrap">{{ certViewData.publicKey }}</pre>
-        <p class="mt-2 text-xs text-slate-400">仅显示公钥证书（包含完整证书链）；私钥不会在此展示。</p>
+        <div v-if="certViewData.privateKey" class="mt-3">
+          <div class="mb-2 flex items-center justify-between">
+            <span class="text-sm font-semibold text-slate-700">私钥 (KEY)</span>
+            <div class="flex gap-2">
+              <NButton size="tiny" secondary @click="showPrivateKey = !showPrivateKey">
+                {{ showPrivateKey ? '隐藏私钥' : '显示私钥' }}
+              </NButton>
+              <NButton size="tiny" secondary @click="copyPrivateKey">
+                <template #icon><Copy :size="12" /></template>
+                复制
+              </NButton>
+            </div>
+          </div>
+          <pre v-if="showPrivateKey" class="max-h-72 overflow-auto rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs leading-relaxed break-all whitespace-pre-wrap">{{ certViewData.privateKey }}</pre>
+          <p v-else class="text-xs text-slate-400">私钥已隐藏，点击「显示私钥」查看。</p>
+        </div>
+        <p class="mt-2 text-xs text-slate-400">包含完整证书链公钥与私钥（KEY）；请勿泄露私钥。</p>
       </template>
       <template #footer>
         <NButton @click="showCertView = false">关闭</NButton>

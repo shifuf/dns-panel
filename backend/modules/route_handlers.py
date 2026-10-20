@@ -5,10 +5,12 @@ from typing import Any, Dict, List
 
 from concurrent.futures import ThreadPoolExecutor
 import csv
+import time
 import io
 import ipaddress
 import json
 import socket
+from datetime import datetime, timezone
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -35,6 +37,9 @@ from modules.tencent_ssl_api import (
     TencentSslApi, TencentSslApiError, parse_certificate_datetime,
     certificate_days_remaining, certificate_is_expired,
 )
+from modules.qiniu_cdn_api import QiniuCdnApi, QiniuApiError
+from modules.tencent_cdn_api import TencentPlatformApi
+from modules.upyun_console_api import UpyunConsoleApi, UpyunConsoleError, upyun_validity_ms_to_iso
 from modules.acme_api import AcmeService, AcmeApiError
 from modules import dns_extras
 from modules.notification import (
@@ -1721,7 +1726,9 @@ def _dns_credentials_routes(self, path: str, q: Dict[str, List[str]], b: bytes) 
             return SUPPORTED_SSL_PROVIDER_TYPES
         if normalized == "acceleration":
             return SUPPORTED_ACCELERATION_PROVIDER_TYPES
-        raise ValueError("无效的 category 参数，仅支持 dns / ssl / acceleration / all")
+        if normalized == "cert_upload":
+            return SUPPORTED_CERT_UPLOAD_PROVIDER_TYPES
+        raise ValueError("无效的 category 参数，仅支持 dns / ssl / acceleration / cert_upload / all")
 
     def _provider_sql(provider_types: tuple[str, ...]) -> str:
         return ", ".join("?" for _ in provider_types)
@@ -2889,6 +2896,20 @@ def _acceleration_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> 
                         cname_target_check = str(domain.get("cnameTarget") or "").strip()
                         if not cname_target_check:
                             ui_state = "cname_pending"
+                    certificate_state = acceleration_cert_state({
+                        "accelerationDomain": domain_name,
+                        "accelerationCredentialId": auth["credential"]["id"],
+                        "accelerationSiteId": site_id,
+                        "accelerationProvider": auth.get("provider") or "edgeone",
+                        "recordName": domain_name,
+                    })
+                    data["certificate"] = certificate_state
+                    data["certId"] = certificate_state.get("certId") or ""
+                    data["accelCertificateId"] = certificate_state.get("accelCertificateId") or ""
+                    data["accelDaysRemaining"] = certificate_state.get("accelDaysRemaining")
+                    data["accelExpireTime"] = certificate_state.get("accelExpireTime") or ""
+                    data["accelIssuer"] = certificate_state.get("accelIssuer") or ""
+                    data["bindable"] = bool(certificate_state.get("bindable"))
                     cached_status_key = domain_status_cache_key(auth['credential']['id'], site_id, domain_name)
                     cache_set(cached_status_key, ui_state, 30)
                     cname_target = str(domain.get("cnameTarget") or "").strip()
@@ -3501,6 +3522,108 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
             ).fetchall()
         return {str(row["recordId"] or ""): row for row in rows if str(row["recordId"] or "").strip()}
 
+    def acceleration_cert_state(state_row: Any) -> Dict[str, Any]:
+        """Edge certificate state of one accelerated host.
+
+        Reads the binding this panel tracks in acceleration_cert_bindings and
+        compares it with the certificate that SHOULD serve the host (see
+        _effective_cert_for_host). This is what lets the plugin (and the UI) tell
+        "the edge is still on an expired certificate" from "nothing to do".
+        """
+        empty = {
+            "panelSupported": True,
+            "certId": "",
+            "panelDomain": "",
+            "panelFingerprint": "",
+            "panelExpireTime": "",
+            "panelIssuer": "",
+            "accelCertificateId": "",
+            "accelStatus": "",
+            "accelIssuer": "",
+            "accelEffectiveTime": "",
+            "accelExpireTime": "",
+            "accelFingerprint": "",
+            "accelDaysRemaining": None,
+            "bindable": False,
+        }
+        if not state_row:
+            return empty
+        accel_domain = _norm_host(state_row["accelerationDomain"])
+        if not accel_domain:
+            return empty
+        accel_cred_id = state_row["accelerationCredentialId"]
+        site_id = str(state_row["accelerationSiteId"] or "").strip()
+        try:
+            with conn() as c:
+                binding = c.execute(
+                    """SELECT * FROM acceleration_cert_bindings
+                       WHERE userId = ? AND accelerationCredentialId = ? AND siteId = ? AND domainName = ?
+                       LIMIT 1""",
+                    (uid, int(accel_cred_id or 0), site_id, accel_domain),
+                ).fetchone()
+        except Exception:
+            binding = None
+        candidates = _ssl_candidate_rows(uid)
+        # Hosts that may serve this accelerated domain, best match first: the
+        # accelerated host itself, then the DNS record it was created from.
+        probe_hosts: List[str] = [accel_domain]
+        record_name = _norm_host(state_row["recordName"])
+        if record_name and record_name not in probe_hosts:
+            probe_hosts.append(record_name)
+        chosen = None
+        for probe in probe_hosts:
+            chosen = _effective_cert_for_host(uid, probe, candidates)
+            if chosen is not None:
+                break
+        current = None
+        if binding is not None:
+            bound_id = str(binding["certRemoteId"] or "")
+            for row in candidates:
+                if str(row["remoteCertId"] or "") == bound_id and str(row["provider"] or "") == str(binding["source"] or "tencent_ssl"):
+                    current = row
+                    break
+        best = chosen or current
+        if best is not None:
+            empty["certId"] = str(best["remoteCertId"] or "")
+            empty["panelDomain"] = str(best["domain"] or "")
+            empty["panelFingerprint"] = str(best["fingerprintSha256"] or "") if "fingerprintSha256" in best.keys() else ""
+            empty["panelExpireTime"] = str(best["notAfter"] or "")
+            empty["panelIssuer"] = str(best["issuer"] or "")
+            empty["bindable"] = not certificate_is_expired(best["notAfter"] or "", now())
+        if binding is not None:
+            empty["accelCertificateId"] = str(binding["edgeCertId"] or "")
+            empty["accelStatus"] = str(binding["status"] or "")
+            empty["accelExpireTime"] = str(binding["notAfter"] or "")
+            empty["accelFingerprint"] = str(binding["fingerprint"] or "")
+            empty["accelDaysRemaining"] = certificate_days_remaining(binding["notAfter"] or "", now())
+        # Acceleration plugins expose the certificate attached to a host
+        # themselves; when they do, their answer wins over our stored binding.
+        try:
+            accel_ctx = self._acceleration_auth(uid, int(accel_cred_id or 0))
+            accel_api = accel_ctx.get("api")
+            if accel_api is not None and hasattr(accel_api, "describe_host_certificates"):
+                listed = accel_api.describe_host_certificates(site_id, [accel_domain])
+                for item in (listed.get("items") or []):
+                    if accel_domain not in [_norm_host(h) for h in (item.get("hosts") or [item.get("host")] or [])]:
+                        continue
+                    live_id = str(item.get("certificateId") or "").strip()
+                    if live_id:
+                        empty["accelCertificateId"] = live_id
+                    expire = item.get("expireTime")
+                    if expire:
+                        empty["accelExpireTime"] = str(expire)
+                        empty["accelDaysRemaining"] = certificate_days_remaining(expire, now())
+                    if item.get("issuer"):
+                        empty["accelIssuer"] = str(item.get("issuer"))
+                    if item.get("effectiveTime"):
+                        empty["accelEffectiveTime"] = str(item.get("effectiveTime"))
+                    if item.get("status"):
+                        empty["accelStatus"] = str(item.get("status"))
+                    break
+        except Exception:
+            pass
+        return empty
+
     def build_acceleration_state_payload(state_row: Any) -> Dict[str, Any]:
         original = parse_json_dict(state_row["originalRecord"] if state_row else None)
         target = str((state_row["accelerationTarget"] if state_row else None) or "").strip()
@@ -3516,7 +3639,7 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 cached_ui = cache_get(cached_status_key)
                 if cached_ui is not None and isinstance(cached_ui, str):
                     ui_state = cached_ui
-        return {
+        payload = {
             "enabled": enabled,
             "source": "state",
             "restorable": has_original,
@@ -3537,6 +3660,15 @@ def _dns_records_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> N
                 "weight": original.get("weight"),
             },
         }
+        # Certificate state is what the BaoTa plugin reports as 加速证书检测;
+        # without it every accelerated host looked like "未纳入".
+        try:
+            payload["certificate"] = acceleration_cert_state(state_row)
+            payload["accelDaysRemaining"] = payload["certificate"].get("accelDaysRemaining")
+            payload["accelCertificateId"] = payload["certificate"].get("accelCertificateId")
+        except Exception:
+            payload["certificate"] = None
+        return payload
 
     def attach_acceleration_state(record: Dict[str, Any], state_row: Any = None) -> Dict[str, Any]:
         if not isinstance(record, dict):
@@ -6335,6 +6467,924 @@ def _panel_cert_pem(handler: Any, uid: int, cert_row: Any) -> Dict[str, str]:
     return {"publicKey": public_pem, "privateKey": private_pem}
 
 
+# ── Third-party platform (七牛云 / 又拍云) certificate deployment ──
+
+PLATFORM_UPLOAD_PROVIDERS = ("qiniu", "upyun", "tencent")
+PLATFORM_PROVIDER_LABELS = {"qiniu": "七牛云", "upyun": "又拍云", "tencent": "腾讯云"}
+# 腾讯云平台复用已有的腾讯云凭证（tencent_ssl / dnspod），无独立凭证类型。
+TENCENT_PLATFORM_SOURCE_PROVIDERS = ("tencent_ssl", "dnspod")
+
+
+def _build_platform_api(provider: str, secrets: Dict[str, Any]):
+    provider = str(provider or "").strip().lower()
+    if provider == "qiniu":
+        return QiniuCdnApi(
+            str(secrets.get("accessKey") or secrets.get("accessKeyId") or ""),
+            str(secrets.get("secretKey") or ""),
+        )
+    if provider == "upyun":
+        return UpyunConsoleApi(
+            str(secrets.get("username") or ""),
+            str(secrets.get("password") or ""),
+        )
+    if provider == "tencent":
+        return TencentPlatformApi(
+            str(secrets.get("secretId") or ""),
+            str(secrets.get("secretKey") or ""),
+        )
+    raise ValueError(f"不支持的平台: {provider}")
+
+
+def _platform_credential_row(handler, uid: int, cred_id: Any):
+    try:
+        cred_id_int = int(cred_id)
+    except (TypeError, ValueError):
+        raise ValueError("缺少平台凭证 credentialId")
+    row = handler._get_credential_row(uid, cred_id_int)
+    if row is None:
+        raise ValueError("平台凭证不存在或无权访问", )
+    provider = str(row["provider"] or "").strip().lower()
+    if provider == "tencent":
+        raise ValueError("该凭证不是平台凭证")
+    if provider in TENCENT_PLATFORM_SOURCE_PROVIDERS:
+        provider = "tencent"
+    if provider not in PLATFORM_UPLOAD_PROVIDERS:
+        raise ValueError("该凭证不是七牛云/又拍云/腾讯云平台凭证")
+    secrets = handler._credential_secrets(row)
+    if provider == "qiniu" and not (secrets.get("accessKey") and secrets.get("secretKey")):
+        raise ValueError("七牛云凭证缺少 AccessKey / SecretKey")
+    if provider == "upyun" and not (secrets.get("username") and secrets.get("password")):
+        raise ValueError("又拍云凭证缺少登录账号 / 密码")
+    if provider == "tencent" and not (secrets.get("secretId") and secrets.get("secretKey")):
+        raise ValueError("腾讯云凭证缺少 SecretId / SecretKey")
+    return row, provider, secrets
+
+
+def _platform_upload_name(cert_row: Any, fingerprint: str) -> str:
+    base = str(cert_row["domain"] or "cert").strip().strip(".") or "cert"
+    safe = base.replace("*", "wildcard")
+    stamp = time.strftime("%Y%m%d")
+    fp = (fingerprint or "")[:10] or str(int(time.time()))
+    return f"dnspanel-{safe}-{stamp}-{fp}"[:120]
+
+
+def _upsert_platform_deployment(
+    uid: int, provider: str, cred_id: int, cert_row: Any, domain: str,
+    platform_cert_id: str, platform_cert_name: str, fingerprint: str,
+    not_before: str, not_after: str, status: str, error: str,
+) -> None:
+    ts = now_iso()
+    try:
+        with conn() as c:
+            c.execute(
+                """INSERT INTO ssl_platform_deployments
+                     (userId, provider, credentialId, certRowId, certRemoteId, fingerprint,
+                      domain, platformCertId, platformCertName, notBefore, notAfter,
+                      status, lastError, uploadedAt, syncedAt, createdAt, updatedAt)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(userId, provider, credentialId, domain) DO UPDATE SET
+                     certRowId = excluded.certRowId,
+                     certRemoteId = excluded.certRemoteId,
+                     fingerprint = excluded.fingerprint,
+                     platformCertId = excluded.platformCertId,
+                     platformCertName = excluded.platformCertName,
+                     notBefore = excluded.notBefore,
+                     notAfter = excluded.notAfter,
+                     status = excluded.status,
+                     lastError = excluded.lastError,
+                     uploadedAt = excluded.uploadedAt,
+                     syncedAt = excluded.syncedAt,
+                     updatedAt = excluded.updatedAt""",
+                (
+                    uid, provider, cred_id,
+                    int(cert_row["id"]) if cert_row is not None and cert_row["id"] else None,
+                    str(cert_row["remoteCertId"] or "") if cert_row is not None else "",
+                    fingerprint, domain, platform_cert_id, platform_cert_name,
+                    not_before, not_after, status, error or None,
+                    ts if status == "synced" else None,
+                    ts if status == "synced" else None,
+                    ts, ts,
+                ),
+            )
+            c.commit()
+    except Exception:
+        pass
+
+
+def _deploy_pem_to_platform(
+    handler, uid: int, provider: str, cred_row: Any, secrets: Dict[str, Any],
+    cert_row: Any, pem: Dict[str, str], domains: List[str],
+) -> Dict[str, Any]:
+    """Upload a panel PEM to one platform account and bind every domain.
+
+    Returns {platformCertId, results: [{domain, ok, error?}]}.
+    """
+    provider = str(provider or "").strip().lower()
+    public_pem = str(pem.get("publicKey") or "")
+    private_pem = str(pem.get("privateKey") or "")
+    if not public_pem or not private_pem:
+        raise ValueError("无法获取证书公钥或私钥，无法上传到平台")
+    meta = acme_api.parse_cert_pem(public_pem)
+    fingerprint = str(meta.get("fingerprintSha256") or "").strip()
+    not_before = str(meta.get("notBefore") or "")
+    not_after = str(meta.get("notAfter") or "")
+    cert_name = _platform_upload_name(cert_row, fingerprint)
+    api = _build_platform_api(provider, secrets)
+    results: List[Dict[str, Any]] = []
+    platform_cert_id = ""
+    platform_cert_name = ""
+
+    if provider == "qiniu":
+        upload = api.upload_cert(cert_name, public_pem, private_pem, common_name=str(cert_row["domain"] or ""))
+        platform_cert_id = str(upload.get("certID") or "")
+        platform_cert_name = cert_name
+        for domain in domains:
+            try:
+                api.bind_domain(domain, platform_cert_id)
+                results.append({"domain": domain, "ok": True})
+            except Exception as exc:
+                results.append({"domain": domain, "ok": False, "error": str(exc)[:300]})
+    elif provider == "upyun":
+        upload = api.upload_cert(public_pem, private_pem)
+        platform_cert_id = str(upload.get("certificateId") or "")
+        platform_cert_name = cert_name
+        # 上传响应直接返回了证书解析信息，优先采用（比本地 parse 更权威）。
+        up_meta = upload.get("meta") or {}
+        if up_meta.get("notAfter"):
+            not_after = str(up_meta["notAfter"])
+        if up_meta.get("notBefore"):
+            not_before = str(up_meta["notBefore"])
+        not_after_ms = 0
+        try:
+            parsed = parse_certificate_datetime(not_after)
+            if parsed is not None:
+                not_after_ms = int(parsed.timestamp() * 1000)
+        except Exception:
+            not_after_ms = 0
+        for domain in domains:
+            try:
+                cert_id_for_domain = platform_cert_id
+                if not cert_id_for_domain:
+                    # 上传响应未带 ID 时，用域名当前证书列表里最新的自定义证书兜底。
+                    current = api.get_domain_cert(domain)
+                    data = current.get("data") if isinstance(current, dict) else None
+                    listing = data.get("result") if isinstance(data, dict) else None
+                    candidates = [i for i in (listing or []) if isinstance(i, dict)]
+                    matched = ""
+                    if not_after_ms:
+                        for item in candidates:
+                            validity = item.get("validity") if isinstance(item, dict) else None
+                            end = item.get("end") or (validity or {}).get("end") if isinstance(validity, dict) else item.get("end")
+                            try:
+                                if end and abs(int(end) - not_after_ms) <= 90_000:
+                                    matched = str(item.get("certificate_id") or "").strip()
+                                    break
+                            except (TypeError, ValueError):
+                                continue
+                    if not matched:
+                        customs = [i for i in candidates if str(i.get("crt_type") or "") == "custom"]
+                        pool = customs or candidates
+                        if pool:
+                            def _end(item: Dict[str, Any]) -> int:
+                                validity = item.get("validity") if isinstance(item, dict) else None
+                                end = item.get("end")
+                                if isinstance(validity, dict) and validity.get("end"):
+                                    end = validity.get("end")
+                                try:
+                                    return int(end or 0)
+                                except (TypeError, ValueError):
+                                    return 0
+                            best = max(pool, key=_end)
+                            matched = str(best.get("certificate_id") or "").strip()
+                    if matched:
+                        platform_cert_id = matched
+                        cert_id_for_domain = matched
+                if not cert_id_for_domain:
+                    raise ValueError("无法确定上传后的证书 ID")
+                api.bind_domain(domain, cert_id_for_domain)
+                results.append({"domain": domain, "ok": True})
+            except Exception as exc:
+                results.append({"domain": domain, "ok": False, "error": str(exc)[:300]})
+    elif provider == "tencent":
+        platform_cert_id = api.upload_cert(cert_name, public_pem, private_pem)
+        platform_cert_name = cert_name
+        for domain in domains:
+            try:
+                api.bind_cdn_domain(domain, platform_cert_id)
+                results.append({"domain": domain, "ok": True})
+            except Exception as exc:
+                results.append({"domain": domain, "ok": False, "error": str(exc)[:300]})
+    else:
+        raise ValueError(f"不支持的平台: {provider}")
+
+    cred_id_int = int(cred_row["id"])
+    for item in results:
+        _upsert_platform_deployment(
+            uid, provider, cred_id_int, cert_row, item["domain"],
+            platform_cert_id, platform_cert_name, fingerprint,
+            not_before, not_after,
+            "synced" if item.get("ok") else "failed",
+            "" if item.get("ok") else str(item.get("error") or ""),
+        )
+    return {
+        "platformCertId": platform_cert_id,
+        "platformCertName": platform_cert_name,
+        "fingerprint": fingerprint,
+        "notBefore": not_before,
+        "notAfter": not_after,
+        "results": results,
+    }
+
+
+def _sync_cert_to_platforms(handler, uid: int, cert_row: Any) -> Dict[str, Any]:
+    """After a successful (re)issuance, re-upload the new PEM to every
+    third-party platform the OLD certificate was deployed to.
+
+    Deployment rows are matched by bound domain: whichever platform domains this
+    certificate covers follow the renewal automatically. Never raises.
+    """
+    results: List[Dict[str, Any]] = []
+    try:
+        names = _cert_all_names(cert_row)
+    except Exception:
+        names = []
+    if not names:
+        return {"synced": 0, "results": results, "skipped": "证书缺少域名"}
+    placeholders = ",".join("?" for _ in names)
+    try:
+        with conn() as c:
+            rows = c.execute(
+                f"""SELECT d.*, cr.name AS credentialName
+                      FROM ssl_platform_deployments d
+                      LEFT JOIN dns_credentials cr ON cr.id = d.credentialId
+                     WHERE d.userId = ? AND d.domain IN ({placeholders})""",
+                (uid, *names),
+            ).fetchall()
+    except Exception:
+        rows = []
+    if not rows:
+        return {"synced": 0, "results": results, "skipped": "该证书没有平台部署记录"}
+    try:
+        pem = _panel_cert_pem(handler, uid, cert_row)
+    except Exception as exc:
+        return {"synced": 0, "results": results, "skipped": f"无法获取新证书 PEM: {exc}"}
+    grouped: Dict[tuple, list] = {}
+    for row in rows:
+        grouped.setdefault(
+            (str(row["provider"] or "").lower(), int(row["credentialId"] or 0)), []
+        ).append(row)
+    synced = 0
+    for (provider, cred_id), group in grouped.items():
+        try:
+            cred_row = handler._get_credential_row(uid, cred_id)
+            if cred_row is None:
+                raise ValueError("平台凭证已删除")
+            secrets = handler._credential_secrets(cred_row)
+            domains = sorted({str(r["domain"] or "").strip().strip(".") for r in group if r["domain"]})
+            deploy = _deploy_pem_to_platform(handler, uid, provider, cred_row, secrets, cert_row, pem, domains)
+        except Exception as exc:
+            err = str(exc)[:400]
+            for row in group:
+                _upsert_platform_deployment(
+                    uid, provider, cred_id, cert_row, str(row["domain"] or ""),
+                    str(row["platformCertId"] or ""), str(row["platformCertName"] or ""),
+                    str(row["fingerprint"] or ""), str(row["notBefore"] or ""),
+                    str(row["notAfter"] or ""), "failed", err,
+                )
+                results.append({"provider": provider, "domain": row["domain"], "ok": False, "error": err[:200]})
+                _write_ssl_task_log(uid, "platform-deploy", None, row["domain"], provider, "failed", message=err[:500])
+            continue
+        ok_domains = [r["domain"] for r in deploy["results"] if r.get("ok")]
+        synced += len(ok_domains)
+        for item in deploy["results"]:
+            results.append({
+                "provider": provider, "domain": item["domain"], "ok": bool(item.get("ok")),
+                "error": item.get("error"),
+            })
+            _write_ssl_task_log(
+                uid, "platform-deploy", None, item["domain"], provider,
+                "success" if item.get("ok") else "failed",
+                message=(f"已上传新证书 {deploy['platformCertName']}" if item.get("ok") else str(item.get("error") or ""))[:500],
+            )
+    return {"synced": synced, "results": results}
+
+
+# ── Shared helpers: certificate identity / dedup / effective lookup ──
+
+# A replacement upload may only arrive once the certificate it replaces is
+# inside this window (or already expired): 只允许在『过期的前七天』上传新的证书.
+REPLACE_UPLOAD_WINDOW_DAYS = 7
+# Anything nearer than this to expiry is always worth re-issuing.
+RENEWAL_TRIGGER_DAYS = 30
+# Two renderings of the same instant must collapse onto ONE identity.
+_CERT_IDENTITY_TOLERANCE_SECONDS = 1
+
+
+
+
+
+
+
+
+def now_iso() -> str:
+    """UTC timestamp helper; app.py replaces this at startup."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def now() -> Any:
+    """UTC now; app.py replaces this at startup."""
+    return datetime.now(timezone.utc)
+
+
+def cache_delete_pattern(pattern: str) -> None:
+    """Cache busting shim; app.py replaces this at startup."""
+    try:
+        from modules.cache import cache_delete_pattern as _bust
+        _bust(pattern)
+    except Exception:
+        return None
+
+def _default_conn() -> Any:
+    """Fallback DB connection used before app.py injects its own `conn`.
+
+    Tests (and any tooling importing this module standalone) get a working
+    connection to the panel database instead of an AttributeError; app.py
+    overwrites this name at startup with its own implementation.
+    """
+    try:
+        from app import conn as _app_conn  # type: ignore
+        return _app_conn()
+    except Exception:
+        import sqlite3 as _sqlite3
+        from pathlib import Path as _Path
+        db_path = _Path(__file__).resolve().parents[1] / "db" / "database.db"
+        handle = _sqlite3.connect(str(db_path))
+        handle.row_factory = _sqlite3.Row
+        return handle
+
+
+conn = _default_conn
+
+def _ssl_now() -> Any:
+    """UTC now, via the app's helper when attached (kept import-safe for tests)."""
+    fn = globals().get("now")
+    if callable(fn):
+        return fn()
+    return datetime.now(timezone.utc)
+
+
+def _ssl_conn() -> Any:
+    """Database connection, via the app's helper when attached."""
+    fn = globals().get("conn")
+    if callable(fn):
+        return fn()
+    raise RuntimeError("数据库连接不可用")
+
+
+def _ssl_cache_bust(pattern: str) -> None:
+    fn = globals().get("cache_delete_pattern")
+    if callable(fn):
+        fn(pattern)
+
+def _cert_san_names(cert_row: Any) -> List[str]:
+    """Primary domain + SANs, normalized, de-duplicated, order preserved."""
+    names: List[str] = []
+    try:
+        primary = _norm_host(cert_row["domain"])
+    except Exception:
+        primary = ""
+    if primary:
+        names.append(primary)
+    raw: Any = None
+    try:
+        raw = cert_row["san"]
+    except Exception:
+        if isinstance(cert_row, dict):
+            raw = cert_row.get("san")
+    parsed: Any = raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw or "[]")
+        except Exception:
+            parsed = [raw] if raw.strip() else []
+    if isinstance(parsed, str):
+        parsed = [parsed]
+    if isinstance(parsed, list):
+        for item in parsed:
+            name = _norm_host(item)
+            if name:
+                names.append(name)
+    seen: set = set()
+    out: List[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _cert_identity_key(domain: Any, san_json: Any, not_before: Any, not_after: Any) -> str:
+    """Stable identity of a certificate's CONTENT.
+
+    Same names + same validity window ⇒ same key, so a re-upload is detected
+    even when the alias or the remote certificate id differs.
+    """
+    names = sorted(_cert_san_names({"domain": domain, "san": san_json}))
+    stamp: List[str] = []
+    for value in (not_before, not_after):
+        parsed = parse_certificate_datetime(value) if value else None
+        stamp.append(str(int(parsed.timestamp())) if parsed is not None else str(value or ""))
+    return "|".join(["~".join(names), stamp[0], stamp[1]])
+
+
+def _cert_identity_of_row(cert_row: Any) -> str:
+    try:
+        return _cert_identity_key(cert_row["domain"], cert_row["san"], cert_row["notBefore"], cert_row["notAfter"])
+    except Exception:
+        return ""
+
+
+def _is_renewal_upgrade(prior_names: List[str], incoming_names: List[str]) -> bool:
+    """Whether `incoming_names` are the renewed successor of `prior_names`.
+
+    A renewal keeps the same name set; CA/Browser Forum policy requires every
+    re-issuance to add the fresh validation token, so acme.sh (Let's Encrypt)
+    and Tencent DV renewals both append a `_dnsauth.<domain>` SAN that the
+    previous certificate did not carry.
+    """
+    prior = {_norm_host(n) for n in (prior_names or []) if _norm_host(n)}
+    incoming = {_norm_host(n) for n in (incoming_names or []) if _norm_host(n)}
+    if not prior or not incoming or incoming == prior:
+        return False
+    prior_base = {n for n in prior if not n.startswith("_dnsauth.")}
+    incoming_base = {n for n in incoming if not n.startswith("_dnsauth.")}
+    added_validation = any(n.startswith("_dnsauth.") for n in incoming - prior)
+    return added_validation and incoming_base == prior_base
+
+
+def _tolerant_not_before_equal(left: Any, right: Any) -> bool:
+    """Whether two NotBefore values describe the same instant (±1s)."""
+    a = parse_certificate_datetime(left) if left else None
+    b = parse_certificate_datetime(right) if right else None
+    if a is None or b is None:
+        return False
+    return abs((a - b).total_seconds()) <= _CERT_IDENTITY_TOLERANCE_SECONDS
+
+
+def _ssl_candidate_rows(uid: int, states: tuple = ("issued", "expired", "upload")) -> List[Any]:
+    """Every certificate row of this user that could serve traffic."""
+    placeholders = ",".join("?" for _ in states)
+    try:
+        with _ssl_conn() as c:
+            return c.execute(
+                f"""SELECT * FROM ssl_certificates
+                    WHERE userId = ? AND status IN ({placeholders}) AND TRIM(domain) != ''
+                    ORDER BY notAfter DESC""",
+                (uid, *states),
+            ).fetchall()
+    except Exception:
+        return []
+
+
+def _covers_host(cert_row: Any, host: str) -> bool:
+    target = _norm_host(host)
+    if not target:
+        return False
+    return any(_wildcard_covers(name, target) or name == target for name in _cert_san_names(cert_row))
+
+
+def _usable_cert_rank(host: str, cert_row: Any, now_dt: Any) -> Any:
+    """Ordering key for candidate certificates of `host`.
+
+    Requested precedence: never an expired certificate while a usable one
+    exists, then an EXACT root/primary-domain certificate (x.shifuf.com), then a
+    wildcard covering the host (*.shifuf.com), then a SAN match, and finally
+    the longest remaining lifetime.
+    """
+    normalized = _norm_host(host)
+    names = _cert_san_names(cert_row)
+    primary = names[0] if names else ""
+    exact_primary = bool(normalized) and primary == normalized
+    exact_san = bool(normalized) and any(n == normalized for n in names[1:])
+    wildcard_cover = any(_wildcard_covers(n, normalized) for n in names if n.startswith("*."))
+    expired = certificate_is_expired(cert_row["notAfter"] or "", now_dt)
+    remaining = certificate_days_remaining(cert_row["notAfter"] or "", now_dt)
+    return (
+        0 if not expired else 1,
+        0 if exact_primary else (1 if wildcard_cover else (2 if exact_san else 3)),
+        -(remaining if remaining is not None else -99999),
+    )
+
+
+def _effective_cert_for_host(uid: int, host: str, rows: List[Any] | None = None) -> Any:
+    """The certificate that SHOULD be serving `host` right now.
+
+    有效证书优先：exact root-domain certificate first (x.shifuf.com), then the
+    wildcard (*.shifuf.com), then SAN matches. An expired row is only returned
+    when nothing usable covers the host at all — a dead certificate must never
+    shadow a live one.
+    """
+    normalized = _norm_host(host)
+    if not normalized:
+        return None
+    if rows is None:
+        rows = _ssl_candidate_rows(uid)
+    now_dt = _ssl_now()
+    usable: List[Any] = []
+    fallback: List[Any] = []
+    for row in rows or []:
+        if not _covers_host(row, normalized):
+            continue
+        if certificate_is_expired(row["notAfter"] or "", now_dt):
+            fallback.append(row)
+        else:
+            usable.append(row)
+    pool = usable or fallback
+    if not pool:
+        return None
+    return sorted(pool, key=lambda r: _usable_cert_rank(normalized, r, now_dt))[0]
+
+
+def _has_active_acme_job(uid: int, certificate_id: Any) -> bool:
+    try:
+        with _ssl_conn() as c:
+            job = c.execute(
+                """SELECT id FROM ssl_acme_jobs
+                   WHERE userId = ? AND certificateId = ? AND status IN ('queued', 'running')
+                   LIMIT 1""",
+                (uid, int(certificate_id or 0)),
+            ).fetchone()
+        return job is not None
+    except Exception:
+        return False
+
+
+def _superseded_cert_rows(uid: int, cert_row: Any) -> List[Any]:
+    """Rows that are a duplicate/stale copy of `cert_row`.
+
+    A replacement is only recognized when it is a genuine renewal of this
+    certificate (same names, newer validity, plus the mandatory `_dnsauth.`
+    validation SAN) or an outright identical copy. Anything else — an unrelated
+    certificate, an older sibling, an expired row — is preserved so the renewal
+    trail and manual uploads are never silently erased.
+    """
+    identity = _cert_identity_of_row(cert_row)
+    names = set(_cert_san_names(cert_row))
+    if not identity or not names:
+        return []
+    out: List[Any] = []
+    try:
+        with _ssl_conn() as c:
+            rows = c.execute(
+                """SELECT * FROM ssl_certificates
+                   WHERE userId = ? AND TRIM(domain) != '' AND id != ?
+                   ORDER BY notAfter DESC""",
+                (uid, int(cert_row["id"] or 0)),
+            ).fetchall()
+    except Exception:
+        return []
+    for row in rows:
+        if set(_cert_san_names(row)) != names and not _is_renewal_upgrade(_cert_san_names(row), _cert_san_names(cert_row)):
+            continue
+        same_identity = _cert_identity_of_row(row) == identity
+        if not same_identity:
+            if str(row["status"] or "") != "issued":
+                # An expired/failed sibling of a certificate we just replaced is
+                # dead weight and only confuses the pickers.
+                out.append(row)
+                continue
+            if not _is_renewal_upgrade(_cert_san_names(row), _cert_san_names(cert_row)):
+                continue
+            prior_after = parse_certificate_datetime(row["notAfter"] or "")
+            new_after = parse_certificate_datetime(cert_row["notAfter"] or "")
+            if prior_after is None or new_after is None or prior_after >= new_after:
+                continue
+        elif str(row["status"] or "") not in ("issued", "expired", "upload", "failed", "cancelled", "revoked"):
+            continue
+        if _has_active_acme_job(uid, row["id"]):
+            continue
+        out.append(row)
+    return out
+
+
+def _remove_cert_row(uid: int, cert_row: Any, delete_cloud: bool = True) -> Dict[str, Any]:
+    """Drop one certificate row plus its cloud/edge/binding leftovers."""
+    result: Dict[str, Any] = {
+        "id": cert_row["id"],
+        "domain": str(cert_row["domain"] or ""),
+        "certId": str(cert_row["remoteCertId"] or ""),
+    }
+    remote_id = str(cert_row["remoteCertId"] or "")
+    provider = str(cert_row["provider"] or "")
+    try:
+        _cleanup_edgeone_cert_for_cert(_SSL_MAINTENANCE_HANDLER, uid, cert_row)
+    except Exception:
+        pass
+    if delete_cloud and provider == "acme":
+        try:
+            acme_api.AcmeService(key_length=str(cert_row["certType"] or "2048")).remove(remote_id)
+        except Exception:
+            pass
+    if delete_cloud and provider != "acme":
+        try:
+            cred_row = _SSL_MAINTENANCE_HANDLER._get_credential_row(uid, cert_row["credentialId"])
+            if cred_row is not None and str(cred_row["provider"] or "") == "tencent_ssl":
+                secrets = _SSL_MAINTENANCE_HANDLER._credential_secrets(cred_row)
+                sid = str(secrets.get("secretId") or "").strip()
+                skey = str(secrets.get("secretKey") or "").strip()
+                if sid and skey:
+                    TencentSslApi(sid, skey).delete_certificate(remote_id)
+                    result["cloudDeleted"] = True
+        except Exception as ex:
+            result["cloudError"] = str(ex)[:200]
+    try:
+        with _ssl_conn() as c:
+            c.execute("DELETE FROM acceleration_cert_bindings WHERE userId = ? AND certRemoteId = ?", (uid, remote_id))
+            c.execute(
+                "DELETE FROM ssl_deployment_events WHERE userId = ? AND provider = ? AND remoteCertId = ?",
+                (uid, provider, remote_id),
+            )
+            c.execute("DELETE FROM ssl_certificates WHERE userId = ? AND id = ?", (uid, int(cert_row["id"] or 0)))
+            c.commit()
+    except Exception as ex:
+        result["error"] = str(ex)[:200]
+    return result
+
+
+def _prune_superseded_rows(uid: int, cert_row: Any, delete_cloud: bool = True) -> Dict[str, Any]:
+    """Delete every stored copy that `cert_row` has made obsolete."""
+    summary: Dict[str, Any] = {"removed": [], "errors": []}
+    for stale in _superseded_cert_rows(uid, cert_row):
+        try:
+            summary["removed"].append(_remove_cert_row(uid, stale, delete_cloud=delete_cloud))
+        except Exception as ex:
+            summary["errors"].append({"id": stale["id"], "error": str(ex)[:200]})
+    if summary["removed"]:
+        try:
+            _ssl_cache_bust(f"ssl:certs:all:user:{uid}:*")
+        except Exception:
+            pass
+    return summary
+
+
+def _dedup_certificates(uid: int, delete_cloud: bool = True, dry_run: bool = False) -> Dict[str, Any]:
+    """One-shot cleanup of duplicates a previous panel version created.
+
+    For every group of rows sharing one name set, only the best certificate is
+    kept; identical copies, expired siblings and certificates a renewal already
+    replaced are removed (from the cloud account too when asked). Idempotent and
+    best-effort — it never raises.
+    """
+    summary: Dict[str, Any] = {"removed": [], "errors": [], "groups": 0, "removedCount": 0}
+    # Work off the same authoritative set the UI lists: mirror the cloud accounts
+    # into ssl_certificates first, otherwise duplicates that only exist in the
+    # cloud account look perfectly clean locally.
+    refresh = _refresh_ssl_rows_from_cloud(uid)
+    if refresh.get("errors"):
+        summary["errors"].extend(refresh["errors"])
+    rows = _ssl_candidate_rows(uid, ("issued", "expired", "upload", "failed", "cancelled", "revoked"))
+    # Group by the certificate's REAL name set (primary + SANs minus the
+    # `_dnsauth.` validation tokens every renewal adds), so a renewed
+    # certificate lands in the same group as the one it replaced. Without this
+    # normalization each renewal looked like its own domain and the superseded
+    # copy was never cleaned up.
+    groups: Dict[str, List[Any]] = {}
+    for row in rows:
+        names = [n for n in _cert_san_names(row) if not n.startswith("_dnsauth.")]
+        if not names:
+            continue
+        groups.setdefault("~".join(sorted(names)), []).append(row)
+    seen_ids: set = set()
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        summary["groups"] += 1
+        winner = sorted(members, key=lambda r: _usable_cert_rank(_cert_san_names(r)[0], r, _ssl_now()))[0]
+        if int(winner["id"] or 0) in seen_ids:
+            continue
+        pending = _superseded_cert_rows(uid, winner)
+        pending = [row for row in pending if int(row["id"] or 0) not in seen_ids]
+        if not pending:
+            continue
+        if dry_run:
+            summary["removed"].append({
+                "keep": str(winner["remoteCertId"] or ""),
+                "domain": str(winner["domain"] or ""),
+                "dryRun": True,
+                "wouldRemove": [{"id": int(x["id"] or 0), "certId": str(x["remoteCertId"] or "")} for x in pending],
+            })
+            continue
+        summary["removed"].append({
+            "keep": str(winner["remoteCertId"] or ""),
+            "domain": str(winner["domain"] or ""),
+            "removed": [
+                _remove_cert_row(uid, stale, delete_cloud=delete_cloud) for stale in pending
+            ],
+            "errors": [],
+        })
+        for stale in pending:
+            seen_ids.add(int(stale["id"] or 0))
+    summary["removedCount"] = sum(len(item.get("removed") or []) for item in summary["removed"])
+    if summary["removedCount"] and not dry_run:
+        _ssl_cache_bust(f"ssl:certs:all:user:{uid}:*")
+    return summary
+
+
+
+
+class _SslMaintenanceHandler:
+    """Minimal stand-in exposing the handlers used by the module-level
+    certificate maintenance helpers (_remove_cert_row / _dedup_certificates).
+
+    Reuses the real H implementation via bound methods when app.py has already
+    attached the route methods, and stays inert otherwise (import-time safe,
+    and in unit tests that never bind a socket).
+    """
+
+    def __init__(self) -> None:
+        pass
+
+    def _get_credential_row(self, uid: int, credential_id: Any) -> Any:
+        try:
+            with _ssl_conn() as c:
+                return c.execute(
+                    "SELECT * FROM dns_credentials WHERE id = ? AND userId = ? LIMIT 1",
+                    (int(credential_id or 0), uid),
+                ).fetchone()
+        except Exception:
+            return None
+
+    def _credential_secrets(self, credential_row: Any) -> Dict[str, Any]:
+        try:
+            secrets = decrypt_text(credential_row["secrets"])
+            parsed = json.loads(secrets)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+
+_SSL_MAINTENANCE_HANDLER = _SslMaintenanceHandler()
+
+
+
+def _sync_uploaded_cert_row(uid: int, cred_row: Any, upload_result: Dict[str, Any], parsed_status: Dict[str, Any], alias: Any) -> None:
+    """Record a freshly uploaded third-party certificate in ssl_certificates.
+
+    Without this row the panel could not tell that the certificate it just
+    uploaded still exists, so the next duplicate-upload check (and the BaoTa
+    plugin's certificate picker) had nothing to compare against.
+    """
+    cert_id = str((upload_result or {}).get("CertificateId") or (upload_result or {}).get("CertId") or "").strip()
+    if not cert_id:
+        return
+    names = [_norm_host(x) for x in ((parsed_status.get("san") or []) + [parsed_status.get("subjectCN") or ""]) if _norm_host(x)]
+    seen: set = set()
+    names = [n for n in names if not (n in seen or seen.add(n))]
+    primary = names[0] if names else _norm_host(alias)
+    # Certificate rows keep the cloud status vocabulary; an already-expired
+    # upload is still reported as expired so every picker skips it.
+    status = "expired" if certificate_is_expired(parsed_status.get("notAfter") or "") else "issued"
+    ts = now_iso()
+    with _ssl_conn() as c:
+        c.execute(
+            """INSERT INTO ssl_certificates
+                 (userId, credentialId, provider, remoteCertId, domain, san, certType,
+                  productName, status, statusMsg, issuer, notBefore, notAfter, dvAuthMethod,
+                  isUploaded, autoRenew, syncedAt, createdAt, updatedAt)
+               VALUES (?, ?, 'tencent_ssl', ?, ?, ?, 'upload', ?, ?, '', ?, ?, ?, 'FILE',
+                       1, 0, ?, ?, ?)
+               ON CONFLICT(userId, provider, remoteCertId) DO UPDATE SET
+                 domain = excluded.domain, san = excluded.san, status = excluded.status,
+                 issuer = excluded.issuer, notBefore = excluded.notBefore,
+                 notAfter = excluded.notAfter, isUploaded = 1, syncedAt = excluded.syncedAt,
+                 updatedAt = excluded.updatedAt""",
+            (
+                uid, int(cred_row["id"]), cert_id, primary,
+                json.dumps(names, ensure_ascii=False),
+                str((upload_result or {}).get("Alias") or alias or "")[:200],
+                status, str(parsed_status.get("issuer") or ""),
+                str(parsed_status.get("notBefore") or ""), str(parsed_status.get("notAfter") or ""),
+                ts, ts, ts,
+            ),
+        )
+        c.commit()
+    _ssl_cache_bust(f"ssl:certs:all:user:{uid}:*")
+
+def _needs_replacement_upload(uid: int, status: Dict[str, Any]) -> Dict[str, Any]:
+    """Gate a third-party certificate upload. `status` is parsed PEM metadata.
+
+    Rules:
+      1. The identical certificate is never stored twice — an identical identity
+         (names + validity window) is rejected even when the cloud API would
+         happily create another object.
+      2. A second certificate for a name set that already has a usable one is a
+         REPLACEMENT, and replacements are accepted only inside the last
+         REPLACE_UPLOAD_WINDOW_DAYS days of the current certificate's life, or
+         once it has expired.
+      3. The uploaded certificate must be a NEW issuance: its NotBefore must be
+         later than the certificate it replaces, and its validity must not end
+         earlier. Tencent Cloud applies the same check server-side.
+    """
+    names = [n for n in (_norm_host(x) for x in (status.get("names") or [])) if n]
+    verdict: Dict[str, Any] = {
+        "allowed": True, "mode": "initial", "reason": "",
+        "currentCertId": "", "currentNotAfter": "", "currentDays": None,
+    }
+    if not names:
+        return verdict
+    identity = _cert_identity_key(
+        names[0], json.dumps(names, ensure_ascii=False),
+        status.get("notBefore"), status.get("notAfter"),
+    )
+    rows = _ssl_candidate_rows(uid)
+    if not rows:
+        return verdict
+    name_set = set(names)
+    same_names = [row for row in rows if set(_cert_san_names(row)) == name_set]
+    overlapping = [row for row in rows if set(_cert_san_names(row)) & name_set]
+    if not same_names and not overlapping:
+        return verdict
+
+    for row in same_names:
+        if _cert_identity_of_row(row) == identity:
+            return {
+                "allowed": False, "mode": "duplicate",
+                "reason": "该证书与面板中已有证书完全相同，已拒绝重复上传（重复只保留一个）",
+                "currentCertId": str(row["remoteCertId"] or ""),
+                "currentNotAfter": str(row["notAfter"] or ""),
+                "currentDays": certificate_days_remaining(row["notAfter"] or "", _ssl_now()),
+            }
+
+    lookup_host = names[0]
+    current = _effective_cert_for_host(uid, lookup_host, rows)
+    if current is None and overlapping:
+        current = _effective_cert_for_host(uid, str(overlapping[0]["domain"] or ""), rows)
+    now_dt = _ssl_now()
+    if current is not None:
+        if _cert_identity_of_row(current) == identity:
+            return {
+                "allowed": False, "mode": "duplicate",
+                "reason": "该证书与当前正在使用的证书完全相同，已拒绝重复上传（重复只保留一个）",
+                "currentCertId": str(current["remoteCertId"] or ""),
+                "currentNotAfter": str(current["notAfter"] or ""),
+                "currentDays": certificate_days_remaining(current["notAfter"] or "", now_dt),
+            }
+        current_id = str(current["remoteCertId"] or "")
+        current_not_after = str(current["notAfter"] or "")
+        remaining = certificate_days_remaining(current_not_after, now_dt)
+        verdict["currentCertId"] = current_id
+        verdict["currentNotAfter"] = current_not_after
+        verdict["currentDays"] = remaining
+        if remaining is not None and remaining > REPLACE_UPLOAD_WINDOW_DAYS:
+            return {
+                **verdict, "allowed": False, "mode": "too_early",
+                "reason": (
+                    "当前证书（" + current_id + "）仍有 " + str(remaining) + " 天有效期，"
+                    "只允许在到期前 " + str(REPLACE_UPLOAD_WINDOW_DAYS) + " 天内上传新证书"
+                ),
+            }
+        incoming_not_before = parse_certificate_datetime(status.get("notBefore"))
+        incoming_not_after = parse_certificate_datetime(status.get("notAfter"))
+        current_not_before = parse_certificate_datetime(current["notBefore"] or "")
+        current_after_dt = parse_certificate_datetime(current_not_after)
+        if incoming_not_before is None:
+            return {
+                **verdict, "allowed": False, "mode": "unverifiable",
+                "reason": "无法解析上传证书的签发时间，无法确认是否为新申请证书，已拒绝",
+            }
+        if current_not_before is not None and incoming_not_before <= current_not_before:
+            return {
+                **verdict, "allowed": False, "mode": "stale",
+                "reason": "上传证书的签发时间不晚于当前正在使用的证书，不是新申请的证书，已拒绝",
+            }
+        if incoming_not_after is not None and current_after_dt is not None and incoming_not_after <= current_after_dt:
+            return {
+                **verdict, "allowed": False, "mode": "shorter",
+                "reason": "上传证书的有效期不晚于当前证书，无法作为续期证书",
+            }
+        return {
+            **verdict, "allowed": True, "mode": "renewal",
+            "reason": "处于到期前 " + str(REPLACE_UPLOAD_WINDOW_DAYS) + " 天窗口内，允许上传新申请证书",
+        }
+
+    if same_names:
+        newest_prior = same_names[0]
+        incoming_not_before = parse_certificate_datetime(status.get("notBefore"))
+        prior_not_before = parse_certificate_datetime(newest_prior["notBefore"] or "")
+        if incoming_not_before is not None and prior_not_before is not None and incoming_not_before <= prior_not_before:
+            return {
+                "allowed": False, "mode": "stale",
+                "reason": "上传证书的签发时间不晚于已失效的旧证书，不是新申请的证书，已拒绝",
+                "currentCertId": str(newest_prior["remoteCertId"] or ""),
+                "currentNotAfter": str(newest_prior["notAfter"] or ""),
+                "currentDays": certificate_days_remaining(newest_prior["notAfter"] or "", now_dt),
+            }
+    return {
+        **verdict, "allowed": True, "mode": "recovery",
+        "reason": "当前证书已失效或不存在，允许上传新申请证书",
+    }
+
+
 def _cdn_binding_credential(handler: Any, uid: int, accel_cred_id: int, expect_provider: str) -> Dict[str, Any]:
     """Resolve the credential behind a CF/ESA cert binding.
 
@@ -6675,14 +7725,22 @@ def _cleanup_edgeone_cert_for_cert(handler: Any, uid: int, cert_row: Any) -> Dic
                     removed.append(edge_cert_id)
             except Exception as exc:
                 errors.append({"edgeCertId": edge_cert_id, "error": str(exc)[:200]})
-    # Drop the binding rows regardless (the panel cert is gone).
+    # Drop the binding rows regardless (the panel cert is gone) — EXCEPT
+    # bindings whose certificate row still exists and is issued: those record
+    # a live deployment (e.g. an EdgeOne zone binding discovered from the API)
+    # and must survive duplicate-row cleanup.
     try:
         with conn() as c:
-            c.execute(
-                "DELETE FROM acceleration_cert_bindings WHERE userId = ? AND certRemoteId = ?",
+            cert_still_alive = c.execute(
+                "SELECT COUNT(*) AS n FROM ssl_certificates WHERE userId = ? AND remoteCertId = ? AND status = 'issued'",
                 (uid, remote_id),
-            )
-            c.commit()
+            ).fetchone()["n"]
+            if not cert_still_alive:
+                c.execute(
+                    "DELETE FROM acceleration_cert_bindings WHERE userId = ? AND certRemoteId = ?",
+                    (uid, remote_id),
+                )
+                c.commit()
     except Exception:
         pass
     return {"removedEdgeCerts": removed, "errors": errors}
@@ -7111,7 +8169,7 @@ def _check_ssl_expiry_notifications(uid: int) -> Dict[str, Any]:
                  AND notAfter IS NOT NULL AND TRIM(notAfter) != ''""",
             (uid,),
         ).fetchall()
-    now_dt = now()
+    now_dt = _ssl_now()
     for row in rows:
         status = str(row["status"] or "").strip().lower()
         if status in ("failed", "cancelled", "revoked"):
@@ -7256,6 +8314,359 @@ def _ensure_pre_expiry_deployments(uid: int, days: int = PRE_EXPIRY_DEPLOY_DAYS)
     return summary
 
 
+
+
+def _acceleration_repair_targets(uid: int) -> List[Dict[str, Any]]:
+    """Every accelerated host that needs its edge certificate re-pointed.
+
+    Sources, in order of trust:
+      1. dns_record_acceleration_states — accelerations enabled from the panel.
+      2. acceleration_cert_bindings — hosts the panel has already bound before
+         (this is what keeps drift repair working for hosts whose DNS record
+         was moved out of the panel).
+    For each host the effective certificate is resolved with the SAME rule as
+    everywhere else: a valid certificate for the exact root domain first, then
+    the wildcard that covers it (*.example.com). An expired certificate is
+    never chosen while a usable one exists.
+    """
+    targets: Dict[tuple, Dict[str, Any]] = {}
+    try:
+        with conn() as c:
+            state_rows = c.execute(
+                """SELECT accelerationProvider, accelerationCredentialId, accelerationSiteId,
+                          accelerationDomain, recordName
+                   FROM dns_record_acceleration_states
+                   WHERE userId = ? AND enabled = 1""",
+                (uid,),
+            ).fetchall()
+            binding_rows = c.execute(
+                """SELECT provider, accelerationCredentialId, siteId, domainName
+                   FROM acceleration_cert_bindings WHERE userId = ?""",
+                (uid,),
+            ).fetchall()
+    except Exception:
+        return []
+    for row in list(state_rows) + list(binding_rows):
+        key = (
+            str(row["accelerationProvider"] if "accelerationProvider" in row.keys() else row["provider"] or "edgeone").strip().lower(),
+            int(row["accelerationCredentialId"] or 0),
+            str(row["accelerationSiteId"] if "accelerationSiteId" in row.keys() else row["siteId"] or "").strip(),
+            _norm_host(row["accelerationDomain"] if "accelerationDomain" in row.keys() else row["domainName"]),
+        )
+        if not key[2] or not key[3]:
+            continue
+        targets.setdefault(key, {"provider": key[0], "credentialId": key[1], "siteId": key[2], "domainName": key[3]})
+    return list(targets.values())
+
+
+def _acceleration_edge_state(handler: Any, uid: int, api: Any, target: Dict[str, Any]) -> Dict[str, Any]:
+    """What the acceleration provider currently serves for one host."""
+    state: Dict[str, Any] = {"certificateId": "", "expireTime": "", "daysRemaining": None, "status": ""}
+    describe = getattr(api, "describe_host_certificates", None)
+    if describe is None:
+        return state
+    try:
+        listed = describe(target["siteId"], [target["domainName"]])
+    except Exception:
+        return state
+    wanted = _norm_host(target["domainName"])
+    for item in (listed.get("items") or []):
+        host_list = [_norm_host(h) for h in (item.get("hosts") or [item.get("host")] or [])]
+        if wanted not in host_list:
+            continue
+        state["certificateId"] = str(item.get("certificateId") or "").strip()
+        state["expireTime"] = str(item.get("expireTime") or "")
+        state["status"] = str(item.get("status") or "")
+        state["daysRemaining"] = certificate_days_remaining(item.get("expireTime"), _ssl_now())
+        break
+    return state
+
+
+def _repair_acceleration_certificates(uid: int, dry_run: bool = False) -> Dict[str, Any]:
+    """Re-point every accelerated host whose edge certificate is unusable.
+
+    A host is repaired when the edge serves no certificate, a certificate that
+    already EXPIRED, one inside the pre-expiry window, or a certificate that no
+    longer belongs to the best available panel certificate for that host. The
+    replacement is always the effective certificate for the domain: exact root
+    domain certificate first, wildcard second.
+    """
+    summary: Dict[str, Any] = {"checked": 0, "repaired": 0, "totalRepaired": 0, "skipped": 0, "errors": [], "results": []}
+    if not dry_run:
+        _refresh_ssl_rows_from_cloud(uid)
+    targets = _acceleration_repair_targets(uid)
+    candidates = _ssl_candidate_rows(uid)
+    if not candidates:
+        return summary
+    for target in targets:
+        summary["checked"] += 1
+        try:
+            accel_ctx = _SSL_MAINTENANCE_HANDLER_ACCEL(uid, int(target["credentialId"] or 0))
+        except Exception as ex:
+            summary["errors"].append({"domain": target["domainName"], "error": str(ex)[:200]})
+            continue
+        api = accel_ctx.get("api") if isinstance(accel_ctx, dict) else None
+        if api is None or not hasattr(api, "modify_hosts_certificate"):
+            summary["skipped"] += 1
+            continue
+        edge = _acceleration_edge_state(_SSL_MAINTENANCE_HANDLER, uid, api, target)
+        best = _effective_cert_for_host(uid, target["domainName"], candidates)
+        if best is None:
+            summary["skipped"] += 1
+            summary["results"].append({"domain": target["domainName"], "action": "skip", "reason": "面板没有可用证书"})
+            continue
+        best_valid = not certificate_is_expired(best["notAfter"] or "", _ssl_now())
+        edge_days = edge.get("daysRemaining")
+        needs = False
+        reason = ""
+        if not edge.get("certificateId"):
+            needs, reason = True, "加速域名尚未绑定证书"
+        elif isinstance(edge_days, int) and edge_days < 0:
+            needs, reason = True, "加速证书已过期"
+        elif isinstance(edge_days, int) and edge_days <= PRE_EXPIRY_DEPLOY_DAYS:
+            needs, reason = True, "加速证书即将到期"
+        elif not isinstance(edge_days, int):
+            needs, reason = True, "加速证书有效期不可读"
+        if not needs and best_valid:
+            bound_id = str(edge.get("certificateId") or "")
+            panel_id = str(best["remoteCertId"] or "")
+            edge_expiry = parse_certificate_datetime(edge.get("expireTime"))
+            best_expiry = parse_certificate_datetime(best["notAfter"] or "")
+            if edge_expiry is not None and best_expiry is not None and best_expiry >= edge_expiry and bound_id and bound_id != panel_id:
+                # The edge may legitimately hold a panel-uploaded temp copy;
+                # only re-point when the panel certificate is at least as fresh.
+                needs, reason = True, "加速证书并非当前有效证书"
+        if not needs:
+            summary["results"].append({"domain": target["domainName"], "action": "keep", "certId": str(best["remoteCertId"] or "")})
+            continue
+        if not best_valid:
+            summary["skipped"] += 1
+            summary["results"].append({"domain": target["domainName"], "action": "skip", "reason": "面板没有可用证书，无法修复"})
+            continue
+        item = {
+            "domain": target["domainName"], "provider": target["provider"],
+            "certId": str(best["remoteCertId"] or ""), "certDomain": str(best["domain"] or ""),
+            "reason": reason, "edgeCertId": edge.get("certificateId") or "",
+        }
+        if dry_run:
+            item["action"] = "would_repair"
+            summary["repaired"] += 1
+            summary["totalRepaired"] += 1
+            summary["results"].append(item)
+            continue
+        try:
+            binder = _ACCEL_CERT_BINDERS.get(str(target["provider"] or "edgeone").lower())
+            if binder is None:
+                raise ValueError(f"加速服务商 {target['provider']} 暂不支持推送证书")
+            bound = binder(_SSL_MAINTENANCE_HANDLER, uid, int(target["credentialId"] or 0), target["siteId"], best, target["domainName"], False)
+            cert_fp = ""
+            try:
+                cert_fp = str(best["fingerprintSha256"] or "") if "fingerprintSha256" in best.keys() else ""
+            except Exception:
+                cert_fp = ""
+            _upsert_accel_cert_binding(
+                uid, int(target["credentialId"] or 0), target["siteId"], target["domainName"],
+                str(best["provider"] or ""), str(best["remoteCertId"] or ""),
+                bound, cert_fp, str(best["notAfter"] or ""),
+                status="synced", error="", provider=str(target["provider"] or "edgeone"),
+            )
+            item.update({"action": "repaired", "edgeCertId": bound})
+            summary["repaired"] += 1
+            summary["totalRepaired"] += 1
+            _write_ssl_task_log(
+                uid, "deployment", None, target["domainName"],
+                "letsencrypt" if str(best["provider"] or "") == "acme" else "tencent",
+                "success", message=f"加速证书已修复（{reason}）→ {best['remoteCertId']}",
+            )
+        except Exception as ex:
+            item.update({"action": "failed", "error": str(ex)[:300]})
+            summary["errors"].append({"domain": target["domainName"], "error": str(ex)[:300]})
+            _upsert_accel_cert_binding(
+                uid, int(target["credentialId"] or 0), target["siteId"], target["domainName"],
+                str(best["provider"] or ""), str(best["remoteCertId"] or ""),
+                "", "", str(best["notAfter"] or ""),
+                status="failed", error=str(ex)[:400], provider=str(target["provider"] or "edgeone"),
+            )
+            _write_ssl_task_log(
+                uid, "deployment", None, target["domainName"], "edgeone", "failed",
+                message=f"加速证书修复失败：{str(ex)[:300]}",
+            )
+        summary["results"].append(item)
+    if summary["totalRepaired"]:
+        try:
+            cache_delete_pattern(f"ssl:certs:all:user:{uid}:*")
+            cache_delete_pattern(f"acceleration:domain-status:*")
+        except Exception:
+            pass
+    return summary
+
+
+
+
+
+
+def _refresh_ssl_rows_from_cloud(uid: int) -> Dict[str, Any]:
+    """Mirror every Tencent SSL account's certificates into ssl_certificates.
+
+    The certificate list endpoint merges live cloud results with the local
+    table, so the table can be empty while the UI shows plenty of rows. Every
+    maintenance pass (dedup, acceleration repair, renewal coverage) needs the
+    same authoritative set, so this refreshes it once, credential by credential.
+    Never raises.
+    """
+    summary: Dict[str, Any] = {"credentials": 0, "synced": 0, "errors": []}
+    with _ssl_conn() as c:
+        cred_rows = c.execute(
+            "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ?",
+            (uid,),
+        ).fetchall()
+    for cred in cred_rows:
+        try:
+            secrets = _SSL_MAINTENANCE_HANDLER._credential_secrets(cred)
+            sid = str(secrets.get("secretId") or "").strip()
+            skey = str(secrets.get("secretKey") or "").strip()
+            if not sid or not skey:
+                continue
+            api = TencentSslApi(sid, skey)
+            fetched: list = []
+            offset = 0
+            complete = False
+            while offset <= 1000:
+                page = api.list_certificates(offset=offset, limit=100)
+                batch = page.get("certificates") or []
+                fetched.extend(batch)
+                total = int(page.get("totalCount") or len(fetched))
+                if len(batch) < 100 or len(fetched) >= total:
+                    complete = True
+                    break
+                offset += 100
+            outcome = _sync_cloud_rows(uid, int(cred["id"]), fetched, prune_missing=complete)
+            summary["credentials"] += 1
+            summary["synced"] += int(outcome.get("inserted", 0)) + int(outcome.get("updated", 0))
+        except Exception as ex:
+            summary["errors"].append({"credential": str(cred["name"] or ""), "error": str(ex)[:200]})
+    if summary["synced"]:
+        _ssl_cache_bust(f"ssl:certs:all:user:{uid}:*")
+    return summary
+
+
+def _sync_cloud_rows(uid: int, cred_id: int, certs: list, prune_missing: bool = False) -> Dict[str, int]:
+    """Upsert cloud certificate rows into ssl_certificates (module-level twin
+    of the handler's nested _sync_to_db, usable without an HTTP handler)."""
+    ts = now_iso()
+    inserted = updated = removed = 0
+    seen: set = set()
+    with _ssl_conn() as c:
+        for cert in certs or []:
+            remote_id = str(cert.get("remoteCertId") or "").strip()
+            if not remote_id:
+                continue
+            seen.add(remote_id)
+            status = str(cert.get("status") or "") or "issued"
+            if status == "issued" and certificate_is_expired(cert.get("notAfter") or ""):
+                status = "expired"
+            san = cert.get("san")
+            san_json = json.dumps(san, ensure_ascii=False) if isinstance(san, list) else str(san or "")
+            existing = c.execute(
+                "SELECT id, autoRenew FROM ssl_certificates WHERE userId = ? AND provider = 'tencent_ssl' AND remoteCertId = ?",
+                (uid, remote_id),
+            ).fetchone()
+            if existing is not None:
+                c.execute(
+                    """UPDATE ssl_certificates SET
+                         credentialId = ?, domain = ?, san = ?, certType = ?, productName = ?,
+                         status = ?, issuer = ?, notBefore = ?, notAfter = ?, isUploaded = ?,
+                         autoRenew = ?, syncedAt = ?, updatedAt = ?
+                       WHERE id = ?""",
+                    (
+                        cred_id, cert.get("domain", ""), san_json, cert.get("certType", ""),
+                        cert.get("productName", ""), status, cert.get("issuer", ""),
+                        cert.get("notBefore", ""), cert.get("notAfter", ""),
+                        1 if cert.get("isUploaded") else 0,
+                        1 if cert.get("autoRenew") else int(existing["autoRenew"] or 0),
+                        ts, ts, existing["id"],
+                    ),
+                )
+                updated += 1
+            else:
+                c.execute(
+                    """INSERT INTO ssl_certificates
+                         (userId, credentialId, provider, remoteCertId, domain, san,
+                          certType, productName, status, statusMsg, issuer, notBefore,
+                          notAfter, isUploaded, autoRenew, syncedAt, createdAt, updatedAt)
+                       VALUES (?, ?, 'tencent_ssl', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        uid, cred_id, remote_id, cert.get("domain", ""), san_json,
+                        cert.get("certType", ""), cert.get("productName", ""), status,
+                        cert.get("statusMsg", ""), cert.get("issuer", ""),
+                        cert.get("notBefore", ""), cert.get("notAfter", ""),
+                        1 if cert.get("isUploaded") else 0,
+                        1 if cert.get("autoRenew") else 0,
+                        ts, ts, ts,
+                    ),
+                )
+                inserted += 1
+        if prune_missing and seen:
+            placeholders = ",".join("?" for _ in seen)
+            removed = c.execute(
+                f"""DELETE FROM ssl_certificates
+                    WHERE userId = ? AND credentialId = ? AND provider = 'tencent_ssl'
+                      AND remoteCertId NOT IN ({placeholders})""",
+                (uid, cred_id, *sorted(seen)),
+            ).rowcount or 0
+        c.commit()
+    return {"inserted": inserted, "updated": updated, "removed": int(removed)}
+
+def _sync_issued_certs_to_acceleration(uid: int, dry_run: bool = False) -> Dict[str, Any]:
+    """Sweep: bind the BEST valid certificate to every accelerated host.
+
+    Complements _repair_acceleration_certificates (which reacts to a broken edge
+    binding): this pass makes sure no accelerated host is left unbound at all,
+    always preferring an exact root-domain certificate over a wildcard and never
+    picking an expired one.
+    """
+    summary: Dict[str, Any] = {"targets": 0, "synced": 0, "skipped": 0, "errors": []}
+    targets = _acceleration_repair_targets(uid)
+    best_by_host: Dict[tuple, Any] = {}
+    rows = _ssl_candidate_rows(uid)
+    for target in targets:
+        summary["targets"] += 1
+        row = _effective_cert_for_host(uid, target["domainName"], rows)
+        if row is None or certificate_is_expired(row["notAfter"] or ""):
+            summary["skipped"] += 1
+            continue
+        best_by_host[(target["provider"], int(target["credentialId"] or 0), target["siteId"], target["domainName"])] = row
+    if dry_run:
+        summary["synced"] = len(best_by_host)
+        summary["hosts"] = [k[3] for k in best_by_host]
+        return summary
+    handled: set = set()
+    for target in targets:
+        key = (target["provider"], int(target["credentialId"] or 0), target["siteId"], target["domainName"])
+        if key in handled:
+            continue
+        handled.add(key)
+        row = best_by_host.get(key)
+        if row is None:
+            continue
+        try:
+            outcome = _sync_cert_to_edgeone(_SSL_MAINTENANCE_HANDLER, uid, row)
+            summary["synced"] += int(outcome.get("synced") or 0)
+        except Exception as ex:
+            summary["errors"].append({"domain": target["domainName"], "error": str(ex)[:200]})
+    return summary
+
+def _SSL_MAINTENANCE_HANDLER_ACCEL(uid: int, credential_id: int) -> Dict[str, Any]:
+    """Resolve an acceleration credential without an HTTP handler instance."""
+    row = _SSL_MAINTENANCE_HANDLER._get_credential_row(uid, credential_id)
+    if row is None:
+        raise ValueError("加速凭证不存在或无权访问")
+    provider = str(row["provider"] or "").strip().lower()
+    secrets = _SSL_MAINTENANCE_HANDLER._credential_secrets(row)
+    from modules.acceleration_registry import build_acceleration_plugin
+    api = build_acceleration_plugin(provider, secrets)
+    return {"provider": provider, "credential": row, "secrets": secrets, "api": api}
+
 def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     u = self._auth()
     if not u:
@@ -7267,7 +8678,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
 
     # Expected BaoTa plugin version. Bump together with baota-ssl-plugin's
     # info.json so deployed plugins can detect that an update is available.
-    PLUGIN_EXPECTED_VERSION = "1.9.0"
+    PLUGIN_EXPECTED_VERSION = "2.1.0"
 
     def _require_api_scope(required: str) -> bool:
         if not u.get("_api_token"):
@@ -7288,9 +8699,17 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             required = None
             if sub in ("/certificates/issue-acme", "/certificates/apply"):
                 required = "ssl:issue"
-            elif sub in ("/auto-renew", "/auto-renew/", "/certificates/renew-expired", "/certificates/prune-superseded", "/certificates/reconcile", "/certificates/clean-expired", "/certificates/check-expiry", "/certificates/batch-deploy", "/certificates/batch-auto-renew", "/certificates/sync-edgeone") or sub.endswith("/auto-renew"):
+            elif sub in ("/auto-renew", "/auto-renew/", "/certificates/renew-expired", "/certificates/prune-superseded", "/certificates/reconcile", "/certificates/clean-expired", "/certificates/check-expiry", "/certificates/batch-deploy", "/certificates/batch-auto-renew", "/certificates/sync-edgeone", "/certificates/repair-acceleration", "/certificates/dedup") or sub.endswith("/auto-renew"):
                 required = "ssl:renew"
-            elif sub == "/certificates/sync" or sub.startswith("/deployment-events"):
+            elif sub in ("/certificates/sync", "/certificates/reconcile-edge"):
+                required = "ssl:deploy"
+            elif sub.startswith("/deployment-events"):
+                required = "ssl:deploy"
+            elif sub == "/site-bindings/report":
+                # 宝塔插件回传「域名 → 站点 / 反代 IP」清单。
+                required = "ssl:deploy"
+            elif sub == "/platform-deployments" or sub.startswith("/platform-deployments/") \
+                    or sub == "/platform-credentials" or sub.startswith("/platform-credentials/"):
                 required = "ssl:deploy"
             if required and not _require_api_scope(required):
                 return
@@ -7632,6 +9051,14 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             ).fetchall()
             for row in rows:
                 if certificate_is_expired(row["notAfter"] or ""):
+                    # 过期证书不允许部署：只保留“删除/续费”两条路。已经排队的
+                    # 事件同样作废，否则插件领取后仍会把过期证书推给站点。
+                    c.execute(
+                        """UPDATE ssl_deployment_events
+                           SET status = 'skipped', error = ?, updatedAt = ?
+                           WHERE userId = ? AND remoteCertId = ? AND status IN ('queued', 'running', 'failed')""",
+                        ("证书已过期，禁止部署（请续期或删除）", ts, uid, row["remoteCertId"]),
+                    )
                     continue
                 source = "letsencrypt" if row["provider"] == "acme" else "tencent"
                 c.execute(
@@ -7645,6 +9072,24 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                        WHERE userId = ? AND provider = ? AND remoteCertId = ?""",
                     (row["credentialId"], row["domain"], source, uid, row["provider"], row["remoteCertId"]),
                 )
+            c.commit()
+
+    def _ensure_site_bindings() -> None:
+        """宝塔插件上报的「域名 → 站点 / 反代目标」快照表（幂等建表）。"""
+        with conn() as c:
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS ssl_site_bindings (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     userId INTEGER NOT NULL,
+                     domain TEXT NOT NULL,
+                     siteNames TEXT NOT NULL DEFAULT '[]',
+                     proxyTargets TEXT NOT NULL DEFAULT '[]',
+                     serverIps TEXT NOT NULL DEFAULT '[]',
+                     reportedAt DATETIME,
+                     UNIQUE(userId, domain)
+                   )"""
+            )
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ssl_site_bindings_user ON ssl_site_bindings(userId, domain)")
             c.commit()
 
     try:
@@ -7723,7 +9168,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 {
                     "expectedVersion": PLUGIN_EXPECTED_VERSION,
                     "minVersion": PLUGIN_EXPECTED_VERSION,
-                    "releaseNotes": "新增加速证书检测页（EdgeOne/CDN 边缘证书状态与漂移一目了然）；修复加速证书标签点击无响应；修复腾讯云/Let's Encrypt 证书互串账号列；证书表格支持横向滚动；证书检测与加速同步更稳定",
+                    "releaseNotes": "v2.1.0：同步时自动上报「域名 → 宝塔站点 / 反代 IP」清单，面板 SSL 页可查询当前域名绑定在哪个站点、被哪一个 IP 反代；修复若干问题。请升级插件后点「立即同步」生成快照",
                 },
                 "获取插件版本要求成功",
             )
@@ -7915,6 +9360,32 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 if row is None:
                     c.commit()
                     self._ok(None, "暂无待部署证书")
+                    return
+                # 过期证书不允许部署：只能删除或续费。事件可能是过期前入队的，
+                # 领取时再校验一次，避免部署已失效的证书。
+                row_cert = c.execute(
+                    "SELECT notAfter, status FROM ssl_certificates WHERE userId = ? AND remoteCertId = ? LIMIT 1",
+                    (uid, row["remoteCertId"]),
+                ).fetchone()
+                if row_cert is not None and (
+                    certificate_is_expired(row_cert["notAfter"] or "")
+                    or str(row_cert["status"] or "") not in ("issued",)
+                ):
+                    c.execute(
+                        """UPDATE ssl_deployment_events SET status = 'skipped', error = ?, updatedAt = ?
+                           WHERE id = ?""",
+                        (
+                            "证书已过期或不可用，已拒绝部署（请续期或删除）",
+                            now_iso(),
+                            row["id"],
+                        ),
+                    )
+                    c.commit()
+                    _write_ssl_task_log(
+                        uid, "deployment", row["id"], row["domain"], row["source"], "skipped",
+                        message="证书已过期，跳过部署",
+                    )
+                    self._ok(None, "该证书已过期，已跳过部署（请续期或删除）")
                     return
                 c.execute(
                     """UPDATE ssl_deployment_events SET status = 'running', attempts = attempts + 1,
@@ -8256,6 +9727,13 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         edgeone_sync = _sync_cert_to_edgeone(self, uid, fresh)
                 except Exception:
                     edgeone_sync = None
+                # 新证书同步到已部署过的第三方平台（七牛云/又拍云）。Best-effort。
+                platform_sync = None
+                try:
+                    if fresh is not None:
+                        platform_sync = _sync_cert_to_platforms(self, uid, fresh)
+                except Exception:
+                    platform_sync = None
                 # External success-event push (opt-in webhook).
                 try:
                     _push_ssl_success_event(
@@ -8266,9 +9744,12 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     )
                 except Exception:
                     pass
+                sync_note = ""
+                if platform_sync and platform_sync.get("synced"):
+                    sync_note = f"，已重传平台证书 {platform_sync['synced']} 个"
                 self._ok(
-                    {"jobId": job["id"], "certificateId": job["certificateId"], "edgeoneSync": edgeone_sync},
-                    "ACME 任务处理成功" + (f"（已同步加速证书 {edgeone_sync['synced']} 个）" if edgeone_sync and edgeone_sync.get("synced") else ""),
+                    {"jobId": job["id"], "certificateId": job["certificateId"], "edgeoneSync": edgeone_sync, "platformSync": platform_sync},
+                    "ACME 任务处理成功" + (f"（已同步加速证书 {edgeone_sync['synced']} 个）" if edgeone_sync and edgeone_sync.get("synced") else "") + sync_note,
                 )
                 return
             except Exception as ex:
@@ -9399,21 +10880,95 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             return
 
         # POST /api/ssl/certificates/upload — upload third-party cert
+        #
+        # Guarded: the SAME certificate is never stored twice (重复只保留一个),
+        # and a replacement for a name set that already has a usable certificate
+        # is only accepted inside the last REPLACE_UPLOAD_WINDOW_DAYS days of
+        # that certificate's life (or once it has expired), and only when the
+        # uploaded PEM is a genuinely NEW issuance (newer NotBefore).
         if self.command == "POST" and sub == "/certificates/upload":
             cred_id_raw = _get_cred_id()
             pub_key = str(body.get("publicKey") or "").strip()
             priv_key = str(body.get("privateKey") or "").strip()
             alias = str(body.get("alias") or "").strip() or None
+            force = bool(body.get("force"))
+            # When API tokens are used, a write may omit credentialId and let
+            # the panel pick the only available SSL account. The UI already
+            # resolves the visible account; this fallback keeps direct API and
+            # older clients working instead of failing with a false "missing
+            # credential" error before the upload is even attempted.
+            if not cred_id_raw:
+                with conn() as c:
+                    candidates = c.execute(
+                        """SELECT id FROM dns_credentials
+                           WHERE userId = ? AND provider IN ('tencent_ssl', 'dnspod')
+                           ORDER BY isDefault DESC, createdAt ASC""",
+                        (uid,),
+                    ).fetchall()
+                if len(candidates) == 1:
+                    cred_id_raw = str(candidates[0]["id"])
             if not cred_id_raw:
                 self._err("缺少 credentialId 参数", 400)
                 return
             if not pub_key or not priv_key:
                 self._err("缺少证书公钥或私钥", 400)
                 return
+            try:
+                parsed_status = acme_api.parse_cert_pem(pub_key)
+            except Exception as ex:
+                self._err(f"无法解析证书内容：{ex}", 400)
+                return
+            incoming_names = [
+                _norm_host(x) for x in ((parsed_status.get("san") or []) + [parsed_status.get("subjectCN") or ""])
+                if _norm_host(x)
+            ]
+            seen_names: set = set()
+            incoming_names = [n for n in incoming_names if not (n in seen_names or seen_names.add(n))]
+            verdict = _needs_replacement_upload(uid, {
+                "names": incoming_names,
+                "notBefore": parsed_status.get("notBefore"),
+                "notAfter": parsed_status.get("notAfter"),
+            })
+            if not verdict.get("allowed") and not force:
+                self._err(verdict.get("reason") or "该证书不允许上传", 409)
+                return
             cred_row, api = _ssl_api(cred_id_raw)
             result = api.upload_certificate(pub_key, priv_key, alias)
             _invalidate(int(cred_row["id"]))
-            self._ok(result, "证书上传成功", 201)
+            # The upload replaced the previous certificate for these names: drop
+            # the superseded copies so the panel keeps exactly one usable cert.
+            cleanup: Dict[str, Any] = {"removed": [], "errors": []}
+            cert_id = str(result.get("CertificateId") or result.get("CertId") or "").strip()
+            if cert_id:
+                try:
+                    _sync_uploaded_cert_row(uid, cred_row, result, parsed_status, alias)
+                except Exception:
+                    pass
+                try:
+                    with conn() as c:
+                        new_row = c.execute(
+                            """SELECT * FROM ssl_certificates
+                               WHERE userId = ? AND credentialId = ? AND remoteCertId = ? LIMIT 1""",
+                            (uid, int(cred_row["id"]), cert_id),
+                        ).fetchone()
+                    if new_row is not None:
+                        cleanup = _prune_superseded_rows(uid, new_row, delete_cloud=True)
+                        # 手动上传替换的新证书同步到已部署过的第三方平台。
+                        try:
+                            _sync_cert_to_platforms(self, uid, new_row)
+                        except Exception:
+                            pass
+                except Exception:
+                    cleanup = {"removed": [], "errors": []}
+            # A recovery upload also retires cloud-side dead certs for the names
+            # it just covered, so the account does not accumulate stale copies.
+            message = "证书上传成功"
+            if verdict.get("mode") == "renewal":
+                message += "（续期证书已替换原证书）"
+            removed_n = len(cleanup.get("removed") or [])
+            if removed_n:
+                message += f"，已清理重复证书 {removed_n} 张"
+            self._ok({**result, "uploadCheck": verdict, "cleanup": cleanup}, message, 201)
             return
 
         # DELETE /api/ssl/certificates/<id> — delete
@@ -9708,6 +11263,19 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         # Skip if not expired / not expiring within threshold.
                         if not_after_dt > threshold_dt and status == "issued":
                             continue
+                        # Never create a SECOND certificate for a name set that is
+                        # already covered by a live certificate (重复只保留一个).
+                        # Only an already-expired certificate bypasses this —
+                        # reviving it is the whole point of the run.
+                        if _coverage_allows(domain, certificate_days_remaining(not_after, now_dt)):
+                            pass
+                        else:
+                            skipped.append({
+                                "domain": domain, "credential": cr["name"],
+                                "reason": "已被有效证书覆盖，跳过申请以避免重复证书",
+                                "source": "tencent",
+                            })
+                            continue
                         # Covered by a healthy Let's Encrypt cert → no cloud re-issue.
                         if _acme_covers(domain):
                             skipped.append({"domain": domain, "credential": cr["name"], "reason": "已被有效的 Let's Encrypt 证书覆盖，跳过腾讯云续期", "source": "tencent"})
@@ -9803,6 +11371,89 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 except Exception as ex:
                     failed.append({"domain": "*", "credential": cr["name"], "error": str(ex)})
 
+            # ── Cloud-side certificate inventory (shared with the ACME pass) ──
+            # The ACME renewal pass below MUST NOT queue a new Let's Encrypt
+            # certificate while a cloud copy covering the same domain still has
+            # plenty of life left — that is exactly how duplicate wildcard
+            # certificates were created on every daily run. One inventory,
+            # both passes.
+            tencent_coverage: list = []
+            for _cr in cred_rows:
+                try:
+                    _sec = self._credential_secrets(_cr)
+                    _sid = str(_sec.get("secretId") or "").strip()
+                    _skey = str(_sec.get("secretKey") or "").strip()
+                    if not _sid or not _skey:
+                        continue
+                    _inv_api = TencentSslApi(_sid, _skey)
+                    _off = 0
+                    while _off <= 1000:
+                        _page = _inv_api.list_certificates(offset=_off, limit=100)
+                        _batch = _page.get("certificates") or []
+                        for _cert in _batch:
+                            if str(_cert.get("status") or "") not in ("issued", ""):
+                                continue
+                            _names = [_norm_host(_cert.get("domain"))]
+                            for _alt in (_cert.get("subjectAltName") or []):
+                                _names.append(_norm_host(_alt))
+                            _names = [n for n in _names if n]
+                            if not _names:
+                                continue
+                            _remaining = certificate_days_remaining(_cert.get("notAfter") or "", now_dt)
+                            if _remaining is None or _remaining <= 0:
+                                continue
+                            tencent_coverage.append({"names": _names, "days": int(_remaining)})
+                        if len(_batch) < 100:
+                            break
+                        _off += 100
+                except Exception:
+                    continue
+
+            def _tencent_covers(check_domain: str, min_days: int) -> bool:
+                """Whether a live Tencent certificate already covers `check_domain`.
+
+                Only certificates with MORE than `min_days` of life count, so a
+                hand-uploaded replacement inside the pre-expiry window never
+                blocks the renewal it was meant to perform.
+                """
+                raw = _norm_host(check_domain)
+                if not raw:
+                    return False
+                is_wildcard = raw.startswith("*.")
+                host = raw[2:] if is_wildcard else raw
+                if not host:
+                    return False
+                for item in tencent_coverage:
+                    if int(item.get("days") or 0) <= max(0, int(min_days)):
+                        continue
+                    for name in item["names"]:
+                        if is_wildcard:
+                            if name == raw:
+                                return True
+                            continue
+                        if name.startswith("*."):
+                            bare = name[2:]
+                            if host.endswith("." + bare) and host.count(".") == bare.count(".") + 1:
+                                return True
+                        elif host == name:
+                            return True
+                return False
+
+            def _coverage_allows(domain: str, days_left: Any) -> bool:
+                """Whether a renewal / re-issue for `domain` is still needed.
+
+                An ALREADY EXPIRED certificate must always be re-issued: Tencent
+                refuses OldCertificateId once it lapsed and acme.sh cannot re-use
+                a dead profile, so a fresh application is the only way back —
+                even when a replacement was uploaded but not deployed yet.
+                """
+                try:
+                    if days_left is not None and int(days_left) < 0:
+                        return True
+                except Exception:
+                    pass
+                return not _tencent_covers(domain, RENEWAL_TRIGGER_DAYS)
+
             # ── acme.sh certificates: queue renewals ──
             # DNS-01 renewal can take several minutes. Never execute acme.sh in
             # the request thread: persist a renew job and let the same durable
@@ -9827,6 +11478,20 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         failed.append({"domain": domain, "credential": ar["dnsName"] or "acme", "error": f"证书到期时间无法解析: {not_after}", "source": "letsencrypt"})
                         continue
                     if not_after_dt > threshold_dt:
+                        # Still comfortable: Let's Encrypt certificates are only
+                        # renewed inside the renewal window (RENEWAL_TRIGGER_DAYS,
+                        # 30 days by default), never earlier — that is what kept
+                        # minting fresh duplicates on every daily run.
+                        continue
+                    acme_days_left = certificate_days_remaining(not_after, now_dt)
+                    if _coverage_allows(domain, acme_days_left):
+                        pass
+                    else:
+                        skipped.append({
+                            "domain": domain, "credential": ar["dnsName"] or "acme",
+                            "reason": "已被有效证书覆盖，跳过续期以避免重复证书",
+                            "source": "letsencrypt",
+                        })
                         continue
                     if not ar["dnsProvider"]:
                         failed.append({"domain": domain, "credential": "acme", "error": "关联的 DNS 凭证已不存在，无法续期", "source": "letsencrypt"})
@@ -9907,12 +11572,17 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             if cred_id_raw and cred_id_raw != "all":
                 targets = []
                 row = self._get_credential_row(uid, cred_id_raw)
-                if row is not None and str(row["provider"] or "") == "tencent_ssl":
+                if row is not None:
                     targets = [row]
             else:
+                # Any credential that carries Tencent SecretId/SecretKey owns
+                # certificates — a DNSPod/DNS credential is routinely also the
+                # SSL account, and restricting this to provider='tencent_ssl'
+                # silently skipped those accounts (their certificates never made
+                # it into the local table, so dedup/renewal saw nothing).
                 with conn() as c:
                     targets = c.execute(
-                        "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ? AND provider = 'tencent_ssl'",
+                        "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ?",
                         (uid,),
                     ).fetchall()
             results = []
@@ -10082,6 +11752,128 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             )
             return
 
+        # POST /api/ssl/certificates/repair-acceleration — re-point every
+        # accelerated host whose edge certificate is missing / stale / expired
+        # at the best VALID certificate for that domain (exact root domain
+        # first, wildcard second). Also driven by the daily worker.
+        if self.command == "POST" and sub == "/certificates/repair-acceleration":
+            dry_run_flag = bool(body.get("dryRun"))
+            outcome = _repair_acceleration_certificates(uid, dry_run=dry_run_flag)
+            self._ok(
+                outcome,
+                ("预览：" if dry_run_flag else "")
+                + "加速证书检测完成：检查 " + str(outcome["checked"]) + " 个加速域名，"
+                + ("可修复 " if dry_run_flag else "已修复 ") + str(outcome["totalRepaired"]) + " 个"
+                + ("，" + str(len(outcome["errors"])) + " 个失败" if outcome.get("errors") else ""),
+            )
+            return
+
+        # POST /api/ssl/certificates/dedup — collapse duplicate certificate rows
+        # (identical copies / already-replaced renewals) down to ONE per domain.
+        if self.command == "POST" and sub == "/certificates/dedup":
+            dry_run_flag = bool(body.get("dryRun"))
+            outcome = _dedup_certificates(uid, delete_cloud=not bool(body.get("keepCloud")), dry_run=dry_run_flag)
+            self._ok(
+                outcome,
+                ("预览：" if dry_run_flag else "")
+                + "找到 " + str(outcome["groups"]) + " 组重复证书，"
+                + ("可清理 " if dry_run_flag else "已清理 ") + str(outcome["removedCount"]) + " 张",
+            )
+            return
+
+        # GET /api/ssl/acceleration-certificates — edge certificate state for every
+        # accelerated host. This is what the BaoTa plugin reads for its
+        # 加速证书检测 tab (previously it queried a per-provider endpoint that
+        # needed a siteId, so it always came back empty).
+        if self.command == "GET" and sub == "/acceleration-certificates":
+            raw_domains = first_or_none(q, "domains") or ""
+            wanted = [_norm_host(x) for x in str(raw_domains).split(",") if _norm_host(x)]
+            items: List[Dict[str, Any]] = []
+            try:
+                _refresh_ssl_rows_from_cloud(uid)
+            except Exception:
+                pass
+            panel_rows = _ssl_candidate_rows(uid)
+            for target in _acceleration_repair_targets(uid):
+                if wanted and not any(
+                    w == target["domainName"]
+                    or _wildcard_covers(target["domainName"], w)
+                    or _wildcard_covers(w, target["domainName"])
+                    for w in wanted
+                ):
+                    continue
+                entry: Dict[str, Any] = {
+                    "host": target["domainName"],
+                    "domainName": target["domainName"],
+                    "names": [target["domainName"]],
+                    "provider": target["provider"],
+                    "credentialId": target["credentialId"],
+                    "siteId": target["siteId"],
+                    "cname": "",
+                    "supported": True,
+                    "bindable": False,
+                    "certId": "",
+                    "panelDomain": "",
+                    "panelExpireTime": "",
+                    "panelIssuer": "",
+                    "panelFingerprint": "",
+                    "accelCertificateId": "",
+                    "accelStatus": "",
+                    "accelExpireTime": "",
+                    "accelIssuer": "",
+                    "accelEffectiveTime": "",
+                    "accelFingerprint": "",
+                    "accelDaysRemaining": None,
+                    "message": "",
+                }
+                try:
+                    accel_ctx = _SSL_MAINTENANCE_HANDLER_ACCEL(uid, int(target["credentialId"] or 0))
+                    api = accel_ctx.get("api") if isinstance(accel_ctx, dict) else None
+                except Exception as ex:
+                    api = None
+                    entry["supported"] = False
+                    entry["message"] = str(ex)[:200]
+                if api is not None and not hasattr(api, "modify_hosts_certificate"):
+                    entry["supported"] = False
+                    entry["message"] = "当前加速插件不支持证书绑定"
+                edge = _acceleration_edge_state(self, uid, api, target) if api is not None else {}
+                # Which certificate SHOULD serve this host is decided from the
+                # panel's own certificate inventory (exact root domain first,
+                # wildcard second) and stays available even when the acceleration
+                # credential is temporarily unusable.
+                best = _effective_cert_for_host(uid, target["domainName"], panel_rows)
+                if best is not None:
+                    entry["certId"] = str(best["remoteCertId"] or "")
+                    entry["certDomain"] = str(best["domain"] or "")
+                    entry["panelDomain"] = str(best["domain"] or "")
+                    entry["panelExpireTime"] = str(best["notAfter"] or "")
+                    entry["panelIssuer"] = str(best["issuer"] or "")
+                    entry["bindable"] = not certificate_is_expired(best["notAfter"] or "")
+                entry["accelCertificateId"] = edge.get("certificateId") or ""
+                entry["accelStatus"] = edge.get("status") or ""
+                entry["accelExpireTime"] = edge.get("expireTime") or ""
+                entry["accelDaysRemaining"] = edge.get("daysRemaining")
+                if not entry["accelCertificateId"]:
+                    entry["status"] = "missing"
+                elif isinstance(entry["accelDaysRemaining"], int) and entry["accelDaysRemaining"] < 0:
+                    entry["status"] = "expired"
+                elif isinstance(entry["accelDaysRemaining"], int) and entry["accelDaysRemaining"] <= PRE_EXPIRY_DEPLOY_DAYS:
+                    entry["status"] = "expiring"
+                else:
+                    entry["status"] = "ok"
+                if best is not None:
+                    entry["upToDate"] = bool(
+                        entry["accelCertificateId"]
+                        and entry["status"] == "ok"
+                        and str(best["remoteCertId"] or "") == str(entry["accelCertificateId"] or "")
+                    )
+                items.append(entry)
+            self._ok(
+                {"items": items, "total": len(items), "domains": wanted},
+                "获取加速证书检测结果 " + str(len(items)) + " 条",
+            )
+            return
+
         # POST /api/ssl/certificates/sync-edgeone — manually bind a panel
         # certificate to its matching EdgeOne acceleration domain(s). Accepts a
         # single certId, or a list, or "all" to reconcile every issued cert
@@ -10136,6 +11928,121 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             )
             return
 
+        # POST /api/ssl/certificates/reconcile-edge — ensure every accelerated
+        # host ends up bound to the best VALID panel certificate it can get
+        # (exact root domain first, wildcard second), and drop binding rows whose
+        # acceleration no longer exists. Shared by the daily worker and the
+        # BaoTa plugin sync, so "续期完成后 EdgeOne 还是旧证书" cannot happen.
+        if self.command == "POST" and sub == "/certificates/reconcile-edge":
+            dry_run_flag = bool(body.get("dryRun"))
+            repair = _repair_acceleration_certificates(uid, dry_run=dry_run_flag)
+            sweep = _sync_issued_certs_to_acceleration(uid, dry_run=dry_run_flag)
+            self._ok(
+                {"repair": repair, "sweep": sweep, "dryRun": dry_run_flag},
+                ("预览：" if dry_run_flag else "")
+                + "加速证书校验完成：修复 " + str(repair["totalRepaired"]) + " 个，续绑 " + str(sweep.get("synced") or 0) + " 个",
+            )
+            return
+
+        # GET /api/ssl/acceleration-bindings — SHARED view for the BaoTa plugin:
+        # every accelerated host this panel knows about together with the edge
+        # certificate state and the certificate that should be bound to it.
+        # (The plugin previously queried /api/accelerations/certificates, which
+        # requires a siteId, so its 加速证书检测 tab always came back empty.)
+        if self.command == "GET" and sub == "/acceleration-bindings":
+            # Hosts are cheap; the certificate side is what needs the cloud mirror
+            # so "应绑定证书" matches the certificate page exactly.
+            try:
+                _refresh_ssl_rows_from_cloud(uid)
+            except Exception:
+                pass
+            raw_domains = first_or_none(q, "domains") or ""
+            wanted = [_norm_host(x) for x in str(raw_domains).split(",") if _norm_host(x)]
+            items: List[Dict[str, Any]] = []
+            panel_rows = _ssl_candidate_rows(uid)
+            for target in _acceleration_repair_targets(uid):
+                if wanted and not any(
+                    w == target["domainName"]
+                    or _wildcard_covers(target["domainName"], w)
+                    or _wildcard_covers(w, target["domainName"])
+                    for w in wanted
+                ):
+                    continue
+                entry: Dict[str, Any] = {
+                    "host": target["domainName"],
+                    "domainName": target["domainName"],
+                    "names": [target["domainName"]],
+                    "provider": target["provider"],
+                    "credentialId": target["credentialId"],
+                    "siteId": target["siteId"],
+                    "cname": "",
+                    "supported": True,
+                    "bindable": False,
+                    "certId": "",
+                    "panelDomain": "",
+                    "panelExpireTime": "",
+                    "panelIssuer": "",
+                    "panelFingerprint": "",
+                    "accelCertificateId": "",
+                    "accelStatus": "",
+                    "accelExpireTime": "",
+                    "accelIssuer": "",
+                    "accelEffectiveTime": "",
+                    "accelFingerprint": "",
+                    "accelDaysRemaining": None,
+                    "status": "",
+                    "message": "",
+                    "upToDate": None,
+                }
+                try:
+                    accel_ctx = _SSL_MAINTENANCE_HANDLER_ACCEL(uid, int(target["credentialId"] or 0))
+                    api = accel_ctx.get("api") if isinstance(accel_ctx, dict) else None
+                except Exception as ex:
+                    api = None
+                    entry["supported"] = False
+                    entry["message"] = str(ex)[:200]
+                if api is not None and not hasattr(api, "modify_hosts_certificate"):
+                    entry["supported"] = False
+                    entry["message"] = "当前加速插件不支持证书绑定"
+                edge = _acceleration_edge_state(self, uid, api, target) if api is not None else {}
+                best = _effective_cert_for_host(uid, target["domainName"], panel_rows)
+                if best is not None:
+                    entry["certId"] = str(best["remoteCertId"] or "")
+                    entry["certDomain"] = str(best["domain"] or "")
+                    entry["panelDomain"] = str(best["domain"] or "")
+                    entry["panelExpireTime"] = str(best["notAfter"] or "")
+                    entry["panelIssuer"] = str(best["issuer"] or "")
+                    entry["bindable"] = not certificate_is_expired(best["notAfter"] or "")
+                entry["accelCertificateId"] = edge.get("certificateId") or ""
+                entry["accelStatus"] = edge.get("status") or ""
+                entry["accelExpireTime"] = edge.get("expireTime") or ""
+                entry["accelDaysRemaining"] = edge.get("daysRemaining")
+                edge_days = edge.get("daysRemaining")
+                if not entry["accelCertificateId"]:
+                    entry["status"] = "missing"
+                elif isinstance(edge_days, int) and edge_days < 0:
+                    entry["status"] = "expired"
+                elif isinstance(edge_days, int) and edge_days <= PRE_EXPIRY_DEPLOY_DAYS:
+                    entry["status"] = "expiring"
+                else:
+                    entry["status"] = "ok"
+                if best is not None:
+                    entry["upToDate"] = bool(
+                        entry["accelCertificateId"]
+                        and (entry["status"] == "ok")
+                        and str(best["remoteCertId"] or "") == str(entry["accelCertificateId"] or "")
+                    )
+                items.append(entry)
+            with conn() as c:
+                bindings = c.execute(
+                    "SELECT * FROM acceleration_cert_bindings WHERE userId = ? ORDER BY updatedAt DESC LIMIT 500",
+                    (uid,),
+                ).fetchall()
+            self._ok(
+                {"items": items, "bindings": [dict(row) for row in bindings], "total": len(items)},
+                "获取加速证书绑定 " + str(len(items)) + " 条",
+            )
+            return
         # GET /api/ssl/edgeone-bindings — list tracked acceleration certificate
         # bindings with drift info (whether the bound fingerprint still matches
         # the current panel certificate).
@@ -10173,8 +12080,10 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             dead_statuses = ("expired", "revoked", "failed", "cancelled")
 
             with conn() as c:
+                # Every credential holding Tencent keys owns certificates (see
+                # the reconcile note) — a DNS credential is often the SSL account.
                 cred_rows = c.execute(
-                    "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ? AND provider = 'tencent_ssl'",
+                    "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ?",
                     (uid,),
                 ).fetchall()
 
@@ -10468,6 +12377,781 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 {"pruned": pruned, "kept": kept, "validationCleaned": validation_cleaned, "dryRun": dry_run},
                 verb + f"{ok_count} 个过期证书，{val_total} 条验证记录",
             )
+            return
+
+        # ── Third-party platform (七牛云 / 又拍云) certificate deployment ──
+
+        # GET /api/ssl/platform-credentials — qiniu/upyun credentials
+        if self.command == "GET" and sub in ("/platform-credentials", "/platform-credentials/"):
+            placeholders = ",".join("?" for _ in SUPPORTED_CERT_UPLOAD_PROVIDER_TYPES)
+            with conn() as c:
+                rows = c.execute(
+                    f"SELECT id, name, provider, createdAt FROM dns_credentials WHERE userId = ? AND provider IN ({placeholders}, 'tencent_ssl', 'dnspod') ORDER BY createdAt ASC",
+                    (uid, *SUPPORTED_CERT_UPLOAD_PROVIDER_TYPES),
+                ).fetchall()
+            items = []
+            for r in rows:
+                item = dict(r)
+                # 腾讯云平台复用 tencent_ssl / dnspod 凭证，统一归一化为 'tencent'。
+                if str(item.get("provider") or "") in TENCENT_PLATFORM_SOURCE_PROVIDERS:
+                    item["provider"] = "tencent"
+                items.append(item)
+            self._ok({"credentials": items}, "获取平台凭证成功")
+            return
+
+        # POST /api/ssl/platform-credentials/test — connectivity check WITHOUT saving
+        if self.command == "POST" and sub == "/platform-credentials/test":
+            provider = str(body.get("provider") or "").strip().lower()
+            if provider not in PLATFORM_UPLOAD_PROVIDERS:
+                self._err("不支持的平台，仅支持 qiniu / upyun / tencent", 400)
+                return
+            if provider == "tencent":
+                try:
+                    _, _, secrets = _platform_credential_row(self, uid, body.get("credentialId"))
+                except ValueError as exc:
+                    self._err(str(exc), 400)
+                    return
+                test_api = _build_platform_api(provider, secrets)
+                try:
+                    total = test_api.test_connection()
+                    self._ok({"ok": True, "certCount": total}, "腾讯云连接成功（SecretId/SecretKey 有效）")
+                except Exception as exc:
+                    self._err(f"连接失败: {exc}", 400)
+                return
+            secrets = body.get("secrets") if isinstance(body.get("secrets"), dict) else {}
+            clean: Dict[str, str] = {}
+            if provider == "qiniu":
+                clean["accessKey"] = str(secrets.get("accessKey") or "").strip()
+                clean["secretKey"] = str(secrets.get("secretKey") or "").strip()
+                if not clean["accessKey"] or not clean["secretKey"]:
+                    self._err("请填写 AccessKey / SecretKey", 400)
+                    return
+            else:
+                clean["username"] = str(secrets.get("username") or "").strip()
+                clean["password"] = str(secrets.get("password") or "").strip()
+                if not clean["username"] or not clean["password"]:
+                    self._err("请填写登录账号 / 密码", 400)
+                    return
+            try:
+                api = _build_platform_api(provider, clean)
+                if provider == "qiniu":
+                    certs = api.list_certs(limit=1)
+                    self._ok({"ok": True, "certCount": len(certs or [])}, "七牛云连接成功（证书 API 可用）")
+                else:
+                    # UpyunConsoleApi(auto_login) 构造时即完成登录校验。
+                    self._ok({"ok": True}, "又拍云登录成功")
+            except (QiniuApiError, UpyunConsoleError) as exc:
+                self._err(f"连接失败: {exc}", int(getattr(exc, "status", 400) or 400))
+            except Exception as exc:
+                self._err(f"连接失败: {exc}", 400)
+            return
+
+        # POST /api/ssl/platform-credentials — add qiniu/upyun credential
+        if self.command == "POST" and sub in ("/platform-credentials", "/platform-credentials/"):
+            name = str(body.get("name") or "").strip()
+            provider = str(body.get("provider") or "").strip().lower()
+            secrets = body.get("secrets") if isinstance(body.get("secrets"), dict) else {}
+            if not name:
+                self._err("缺少凭证名称", 400)
+                return
+            if provider not in ("qiniu", "upyun"):
+                self._err("不支持的平台，仅支持 qiniu / upyun（腾讯云直接复用已有腾讯云凭证，无需创建）", 400)
+                return
+            clean: Dict[str, str] = {}
+            if provider == "qiniu":
+                clean["accessKey"] = str(secrets.get("accessKey") or "").strip()
+                clean["secretKey"] = str(secrets.get("secretKey") or "").strip()
+                if not clean["accessKey"] or not clean["secretKey"]:
+                    self._err("七牛云凭证需要 AccessKey / SecretKey", 400)
+                    return
+            else:
+                clean["username"] = str(secrets.get("username") or "").strip()
+                clean["password"] = str(secrets.get("password") or "").strip()
+                if not clean["username"] or not clean["password"]:
+                    self._err("又拍云凭证需要登录账号 / 密码", 400)
+                    return
+            # 建凭证前先做一次连通性校验（又拍云为登录，七牛为列证书）。
+            try:
+                _build_platform_api(provider, clean)
+                if provider == "qiniu":
+                    QiniuCdnApi(clean["accessKey"], clean["secretKey"]).list_certs(limit=1)
+                else:
+                    UpyunConsoleApi(clean["username"], clean["password"])
+            except (QiniuApiError, UpyunConsoleError) as exc:
+                self._err(f"凭证校验失败: {exc}", 400)
+                return
+            except Exception as exc:
+                self._err(f"凭证校验失败: {exc}", 400)
+                return
+            encrypted = encrypt_text(json.dumps(clean, ensure_ascii=False))
+            with conn() as c:
+                c.execute(
+                    "INSERT INTO dns_credentials (userId, name, provider, secrets, isDefault, createdAt, updatedAt) VALUES (?, ?, ?, ?, 0, ?, ?)",
+                    (uid, name, provider, encrypted, now_iso(), now_iso()),
+                )
+                c.commit()
+                new_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            self._ok({"id": new_id}, "平台凭证已创建", 201)
+            return
+
+        # DELETE /api/ssl/platform-credentials/<id>
+        m_pc = re.fullmatch(r"/platform-credentials/(\d+)", sub)
+        if self.command == "DELETE" and m_pc:
+            cred_id = int(m_pc.group(1))
+            row = self._get_credential_row(uid, cred_id)
+            if not row or str(row["provider"] or "").lower() not in PLATFORM_UPLOAD_PROVIDERS:
+                self._err("平台凭证不存在", 404)
+                return
+            with conn() as c:
+                c.execute("DELETE FROM ssl_platform_deployments WHERE userId = ? AND credentialId = ?", (uid, cred_id))
+                c.execute("DELETE FROM dns_credentials WHERE id = ? AND userId = ?", (cred_id, uid))
+                c.commit()
+            self._ok(None, "平台凭证及其部署记录已删除")
+            return
+
+        # GET /api/ssl/platform-credentials/<id>/secrets — 查看已保存的
+        # 七牛云 / 又拍云平台凭证明文密钥（AccessKey/SecretKey 或 账号/密码）。
+        m_pc_secret = re.fullmatch(r"/platform-credentials/(\d+)/secrets", sub)
+        if self.command == "GET" and m_pc_secret:
+            try:
+                row, provider, secrets = _platform_credential_row(self, uid, m_pc_secret.group(1))
+            except ValueError as exc:
+                self._err(str(exc), 400)
+                return
+            if provider == "qiniu":
+                clean = {
+                    "accessKey": str(secrets.get("accessKey") or ""),
+                    "secretKey": str(secrets.get("secretKey") or ""),
+                }
+            elif provider == "upyun":
+                clean = {
+                    "username": str(secrets.get("username") or ""),
+                    "password": str(secrets.get("password") or ""),
+                }
+            else:
+                self._err("腾讯云凭证请在 SSL 凭证管理中查看", 400)
+                return
+            self._ok({"id": row["id"], "name": row["name"], "provider": provider, "secrets": clean}, "获取平台凭证密钥成功")
+            return
+
+        # ── 宝塔站点绑定快照（插件上报） ─────────────────────────
+        # GET /api/ssl/site-bindings — 前端查询：当前域名绑定了哪个站点、
+        # 在哪一个 IP 反代。数据由宝塔插件在同步时上报。
+        if self.command == "GET" and sub in ("/site-bindings", "/site-bindings/"):
+            _ensure_site_bindings()
+            domain_filter = str(first_or_none(q, "domain") or "").strip().lower()
+            with conn() as c:
+                if domain_filter:
+                    rows = c.execute(
+                        "SELECT * FROM ssl_site_bindings WHERE userId = ? AND domain LIKE ? ORDER BY domain ASC LIMIT 500",
+                        (uid, f"%{domain_filter}%"),
+                    ).fetchall()
+                else:
+                    rows = c.execute(
+                        "SELECT * FROM ssl_site_bindings WHERE userId = ? ORDER BY domain ASC LIMIT 500",
+                        (uid,),
+                    ).fetchall()
+            items = []
+            for r in rows:
+                try:
+                    site_names = json.loads(r["siteNames"] or "[]")
+                except Exception:
+                    site_names = []
+                try:
+                    proxy_targets = json.loads(r["proxyTargets"] or "[]")
+                except Exception:
+                    proxy_targets = []
+                try:
+                    server_ips = json.loads(r["serverIps"] or "[]")
+                except Exception:
+                    server_ips = []
+                items.append({
+                    "id": r["id"],
+                    "domain": r["domain"],
+                    "siteNames": site_names if isinstance(site_names, list) else [],
+                    "proxyTargets": proxy_targets if isinstance(proxy_targets, list) else [],
+                    "serverIps": server_ips if isinstance(server_ips, list) else [],
+                    "reportedAt": r["reportedAt"],
+                })
+            self._ok({"bindings": items, "reportedAt": max((i["reportedAt"] or "" for i in items), default="")}, "获取宝塔站点绑定成功")
+            return
+
+        # POST /api/ssl/site-bindings/report — 宝塔插件上报站点绑定快照。
+        # 全量替换该用户的快照（每次同步上报完整清单，天然自愈）。
+        if self.command == "POST" and sub == "/site-bindings/report":
+            _ensure_site_bindings()
+            raw_bindings = body.get("bindings") if isinstance(body.get("bindings"), list) else []
+            server_ips_in = body.get("serverIps") if isinstance(body.get("serverIps"), list) else []
+            clean_server_ips = []
+            for ip in server_ips_in[:10]:
+                text = str(ip or "").strip()
+                if text and text not in clean_server_ips:
+                    clean_server_ips.append(text[:64])
+            grouped: Dict[str, Dict[str, Any]] = {}
+            for entry in raw_bindings[:500]:
+                if not isinstance(entry, dict):
+                    continue
+                domain = _norm_host(entry.get("domain"))
+                if not domain:
+                    continue
+                site_name = str(entry.get("siteName") or "").strip()[:200]
+                if not site_name:
+                    continue
+                targets_in = entry.get("proxyTargets") if isinstance(entry.get("proxyTargets"), list) else []
+                clean_targets: List[str] = []
+                for t in targets_in[:20]:
+                    text = str(t or "").strip()[:500]
+                    if text and text not in clean_targets:
+                        clean_targets.append(text)
+                bucket = grouped.setdefault(domain, {"siteNames": [], "proxyTargets": []})
+                if site_name not in bucket["siteNames"]:
+                    bucket["siteNames"].append(site_name)
+                for t in clean_targets:
+                    if t not in bucket["proxyTargets"]:
+                        bucket["proxyTargets"].append(t)
+            ts = now_iso()
+            with conn() as c:
+                c.execute("DELETE FROM ssl_site_bindings WHERE userId = ?", (uid,))
+                for domain, info in grouped.items():
+                    c.execute(
+                        """INSERT INTO ssl_site_bindings
+                             (userId, domain, siteNames, proxyTargets, serverIps, reportedAt)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            uid, domain,
+                            json.dumps(info["siteNames"][:10], ensure_ascii=False),
+                            json.dumps(info["proxyTargets"][:20], ensure_ascii=False),
+                            json.dumps(clean_server_ips, ensure_ascii=False),
+                            ts,
+                        ),
+                    )
+                c.commit()
+            _write_ssl_task_log(
+                uid, "site-bindings", None, "", "baota", "success",
+                message=f"宝塔插件上报站点绑定：{len(grouped)} 个域名，{len(clean_server_ips)} 个服务器 IP",
+            )
+            self._ok({"domains": len(grouped)}, "站点绑定已上报")
+            return
+
+        # POST /api/ssl/platform-deployments — upload a panel cert to
+        # 七牛云/又拍云 and bind the given CDN domains.
+        if self.command == "POST" and sub in ("/platform-deployments", "/platform-deployments/"):
+            provider = str(body.get("provider") or "").strip().lower()
+            if provider not in PLATFORM_UPLOAD_PROVIDERS:
+                self._err("不支持的平台，仅支持 qiniu / upyun / tencent", 400)
+                return
+            domains_raw = body.get("domains")
+            if isinstance(domains_raw, str):
+                domains = [_norm_host(x) for x in domains_raw.replace("，", ",").split(",")]
+            elif isinstance(domains_raw, list):
+                domains = [_norm_host(x) for x in domains_raw]
+            else:
+                domains = []
+            domains = [d for d in domains if d]
+            # 又拍云域名只能绑定账号下已接入的 CDN 域名；未填时自动发现全部域名。
+            auto_discovered = False
+            if not domains and provider == "upyun":
+                try:
+                    cred_row_probe, _, secrets_probe = _platform_credential_row(self, uid, body.get("credentialId"))
+                    api_probe = _build_platform_api(provider, secrets_probe)
+                    discovered = api_probe.list_account_domains()
+                    domains = sorted({item["domain"] for item in discovered if item.get("domain")})
+                    auto_discovered = True
+                except Exception:
+                    pass
+            if not domains:
+                self._err("缺少要绑定的域名（又拍云只能绑定账号下已接入的域名，请先在又拍云控制台绑定域名）", 400)
+                return
+            cert_row_id = body.get("certRowId")
+            cert_remote_id = str(body.get("certId") or "").strip()
+            with conn() as c:
+                if cert_row_id:
+                    cert_row = c.execute(
+                        "SELECT * FROM ssl_certificates WHERE userId = ? AND id = ? LIMIT 1",
+                        (uid, int(cert_row_id)),
+                    ).fetchone()
+                elif cert_remote_id:
+                    cert_row = c.execute(
+                        "SELECT * FROM ssl_certificates WHERE userId = ? AND remoteCertId = ? ORDER BY id DESC LIMIT 1",
+                        (uid, cert_remote_id),
+                    ).fetchone()
+                else:
+                    cert_row = None
+            if cert_row is None:
+                self._err("未找到面板证书（需先在面板签发/上传证书）", 404)
+                return
+            if str(cert_row["status"] or "") != "issued":
+                self._err("只有已签发（issued）的证书才能上传平台", 400)
+                return
+            if certificate_is_expired(cert_row["notAfter"] or "") and not body.get("force"):
+                self._err("证书已过期，请先续期再上传", 409)
+                return
+            cert_names = _cert_all_names(cert_row)
+            invalid = [d for d in domains if d not in cert_names]
+            if invalid:
+                hint = "（又拍云域名必须同时满足：已接入你的又拍云账号 + 在证书覆盖范围内）" if provider == "upyun" else ""
+                self._err(f"以下域名不在证书覆盖范围内: {', '.join(invalid)} {hint}", 400)
+                return
+            cred_row, cred_provider, secrets = _platform_credential_row(self, uid, body.get("credentialId"))
+            if cred_provider != provider:
+                self._err("凭证与所选平台不匹配", 400)
+                return
+            try:
+                pem = _panel_cert_pem(self, uid, cert_row)
+                result = _deploy_pem_to_platform(self, uid, provider, cred_row, secrets, cert_row, pem, domains)
+            except (QiniuApiError, UpyunConsoleError) as exc:
+                self._err(str(exc), int(getattr(exc, "status", 400) or 400))
+                return
+            except ValueError as exc:
+                self._err(str(exc), 400)
+                return
+            ok_n = len([r for r in result["results"] if r.get("ok")])
+            message = f"已上传到{PLATFORM_PROVIDER_LABELS.get(provider, provider)}"
+            if ok_n < len(domains):
+                failed = [r for r in result["results"] if not r.get("ok")]
+                message += f"，{ok_n}/{len(domains)} 个域名绑定成功"
+                if failed:
+                    message += "：" + failed[0].get("error", "")
+            else:
+                message += f"并绑定 {ok_n} 个域名"
+            self._ok(result, message, 201)
+            return
+
+        # GET /api/ssl/platform-deployments — deployment records for visualization
+        if self.command == "GET" and sub in ("/platform-deployments", "/platform-deployments/"):
+            with conn() as c:
+                rows = c.execute(
+                    """SELECT d.*, cr.name AS credentialName, cr.provider AS credProvider,
+                              s.domain AS certDomain, s.san AS certSan, s.status AS certStatus
+                         FROM ssl_platform_deployments d
+                         LEFT JOIN dns_credentials cr ON cr.id = d.credentialId
+                         LEFT JOIN ssl_certificates s ON s.id = d.certRowId
+                        WHERE d.userId = ?
+                        ORDER BY d.updatedAt DESC, d.id DESC""",
+                    (uid,),
+                ).fetchall()
+            items: List[Dict[str, Any]] = []
+            for r in rows:
+                item = dict(r)
+                item["daysRemaining"] = certificate_days_remaining(item.get("notAfter") or "")
+                item["isExpired"] = certificate_is_expired(item.get("notAfter") or "")
+                item["providerLabel"] = PLATFORM_PROVIDER_LABELS.get(str(item.get("provider") or ""), item.get("provider"))
+                try:
+                    san_val = json.loads(item.get("certSan") or "[]") if item.get("certSan") else []
+                except Exception:
+                    san_val = []
+                item["certSan"] = san_val if isinstance(san_val, list) else []
+                items.append(item)
+            # 概览聚合：按平台统计 + 即将过期 + 失败数。
+            overview: Dict[str, Any] = {
+                "total": len(items),
+                "byProvider": {},
+                "expiringSoon": 0,
+                "failed": 0,
+                "expired": 0,
+            }
+            for it in items:
+                p = str(it.get("provider") or "")
+                bucket = overview["byProvider"].setdefault(p, {"total": 0, "failed": 0, "expiringSoon": 0, "expired": 0, "domains": []})
+                bucket["total"] += 1
+                bucket["domains"].append({"domain": it.get("domain"), "notAfter": it.get("notAfter"), "status": it.get("status")})
+                days = it.get("daysRemaining")
+                if it.get("status") == "failed":
+                    overview["failed"] += 1
+                    bucket["failed"] += 1
+                if isinstance(days, int) and 0 <= days <= 30:
+                    overview["expiringSoon"] += 1
+                    bucket["expiringSoon"] += 1
+                if it.get("isExpired"):
+                    overview["expired"] += 1
+                    bucket["expired"] += 1
+            # 又拍云：附带账号下的域名清单（供前端绑定域快选）。
+            # covered 标志预计算好通配符匹配，前端不用自己展开 *.domain。
+            upyun_domains: List[Dict[str, Any]] = []
+            try:
+                upyun_cred = next((r for r in rows if str(r["provider"] or "").lower() == "upyun"), None)
+                if upyun_cred is not None:
+                    cred_row_d, _, secrets_d = _platform_credential_row(self, uid, upyun_cred["credentialId"])
+                    upyun_domains = _build_platform_api("upyun", secrets_d).list_account_domains()
+                    # 用所有已签发证书的名字集合判断覆盖。
+                    with conn() as _c3:
+                        issued_rows_d = _c3.execute(
+                            "SELECT domain, san FROM ssl_certificates WHERE userId = ? AND status = 'issued'",
+                            (uid,),
+                        ).fetchall()
+                    all_names_d: set = set()
+                    for ir in issued_rows_d:
+                        try:
+                            san_val = json.loads(ir["san"] or "[]") if ir["san"] else []
+                        except Exception:
+                            san_val = []
+                        if isinstance(san_val, list):
+                            for s in san_val:
+                                all_names_d.add(_norm_host(s))
+                        all_names_d.add(_norm_host(ir["domain"]))
+                    for ud in upyun_domains:
+                        dn = _norm_host(ud.get("domain") or "")
+                        covered = any(_wildcard_covers(n, dn) for n in all_names_d if n)
+                        ud["covered"] = covered
+            except Exception:
+                upyun_domains = []
+            # EdgeOne 加速绑定并入同一视图（provider=edgeone）。
+            # 绑定状态以 EdgeOne API 实时读取为准（acceleration_cert_bindings
+            # 会被证书去重/清理任务维护，不可靠），所以这里直接扫描账号下
+            # 所有 EdgeOne 凭证的站点/域名，匹配证书 ID 生成实时条目。
+            edgeone_items: List[Dict[str, Any]] = []
+            eo_seen_domains: set = set()
+            try:
+                with conn() as c:
+                    eo_cred_rows = c.execute(
+                        "SELECT id, name, secrets FROM dns_credentials WHERE userId = ?",
+                        (uid,),
+                    ).fetchall()
+                for eo_cred in eo_cred_rows:
+                    try:
+                        eo_secrets = self._credential_secrets(eo_cred)
+                        eo_sid = str(eo_secrets.get("secretId") or "").strip()
+                        eo_skey = str(eo_secrets.get("secretKey") or "").strip()
+                        if not eo_sid or not eo_skey:
+                            continue
+                        from modules.tencent_edgeone_api import TencentEdgeOneApi as _EoApi
+                        eo_api = _EoApi(eo_sid, eo_skey)
+                        for zone in (eo_api.list_zones(offset=0, limit=100).get("zones") or []):
+                            zone_id = str(zone.get("zoneId") or zone.get("id") or "").strip()
+                            if not zone_id:
+                                continue
+                            try:
+                                listing = eo_api.list_acceleration_domains(zone_id)
+                            except Exception:
+                                continue
+                            for entry in (listing.get("items") or []):
+                                domain_name = str(entry.get("domainName") or "").strip().strip(".").lower()
+                                cert_id = str(entry.get("certificateId") or "").strip()
+                                if not domain_name or not cert_id or domain_name in eo_seen_domains:
+                                    continue
+                                eo_seen_domains.add(domain_name)
+                                # 找面板证书行（同账号 remoteCertId 匹配）。
+                                cert_row_eo = None
+                                try:
+                                    with conn() as _c2:
+                                        cert_row_eo = _c2.execute(
+                                            "SELECT remoteCertId, notAfter FROM ssl_certificates WHERE userId = ? AND remoteCertId = ? LIMIT 1",
+                                            (uid, cert_id),
+                                        ).fetchone()
+                                except Exception:
+                                    cert_row_eo = None
+                                edgeone_items.append({
+                                    "id": -len(edgeone_items) - 1,
+                                    "provider": "edgeone",
+                                    "providerLabel": "腾讯云 EdgeOne",
+                                    "credentialId": int(eo_cred["id"]),
+                                    "credentialName": str(eo_cred["name"] or "EdgeOne"),
+                                    "certRemoteId": cert_id,
+                                    "domain": domain_name,
+                                    "platformCertId": cert_id,
+                                    "platformCertName": "",
+                                    "notBefore": "",
+                                    "notAfter": str(entry.get("certificateExpireTime") or (cert_row_eo["notAfter"] if cert_row_eo else "") or ""),
+                                    "status": "synced" if str(entry.get("certificateStatus") or "") == "deployed" else str(entry.get("certificateStatus") or "unknown"),
+                                    "lastError": "",
+                                    "uploadedAt": "",
+                                    "syncedAt": "",
+                                    "updatedAt": now_iso(),
+                                    "isEdgeOne": True,
+                                })
+                    except Exception:
+                        continue
+            except Exception:
+                edgeone_items = []
+            # 保留 acceleration_cert_bindings 里 EdgeOne 也认到的（补充实时未覆盖的）。
+            try:
+                with conn() as c:
+                    eo_rows = c.execute(
+                        "SELECT * FROM acceleration_cert_bindings WHERE userId = ? AND provider = 'edgeone' ORDER BY updatedAt DESC LIMIT 500",
+                        (uid,),
+                    ).fetchall()
+                for row in eo_rows:
+                    edgeone_items.append({
+                        "id": -int(row["id"] or 0),
+                        "provider": "edgeone",
+                        "providerLabel": "腾讯云 EdgeOne",
+                        "credentialId": int(row["accelerationCredentialId"] or 0),
+                        "credentialName": "EdgeOne 加速",
+                        "certRemoteId": str(row["certRemoteId"] or ""),
+                        "domain": str(row["domainName"] or ""),
+                        "platformCertId": str(row["edgeCertId"] or ""),
+                        "notBefore": "",
+                        "notAfter": str(row["notAfter"] or ""),
+                        "status": str(row["status"] or ""),
+                        "lastError": str(row["lastError"] or ""),
+                        "uploadedAt": str(row["syncedAt"] or ""),
+                        "syncedAt": str(row["syncedAt"] or ""),
+                        "updatedAt": str(row["updatedAt"] or ""),
+                        "isEdgeOne": True,
+                    })
+            except Exception:
+                edgeone_items = []
+            for it in edgeone_items:
+                it["daysRemaining"] = certificate_days_remaining(it.get("notAfter") or "")
+                it["isExpired"] = certificate_is_expired(it.get("notAfter") or "")
+            items = items + edgeone_items
+            # 概览聚合包含 EdgeOne。
+            for it in edgeone_items:
+                p = "edgeone"
+                bucket = overview["byProvider"].setdefault(p, {"total": 0, "failed": 0, "expiringSoon": 0, "expired": 0, "domains": []})
+                bucket["total"] += 1
+                bucket["domains"].append({"domain": it.get("domain"), "notAfter": it.get("notAfter"), "status": it.get("status")})
+                days = it.get("daysRemaining")
+                if it.get("status") == "failed":
+                    overview["failed"] += 1
+                    bucket["failed"] += 1
+                if isinstance(days, int) and 0 <= days <= 30:
+                    overview["expiringSoon"] += 1
+                    bucket["expiringSoon"] += 1
+                if it.get("isExpired"):
+                    overview["expired"] += 1
+                    bucket["expired"] += 1
+            overview["total"] = len(items)
+            PLATFORM_PROVIDER_LABELS.setdefault("edgeone", "腾讯云 EdgeOne")
+            self._ok({
+                "deployments": items,
+                "overview": overview,
+                "upyunDomains": upyun_domains,
+            }, "获取平台部署记录成功")
+            return
+
+        # POST /api/ssl/platform-deployments/check — live binding status check
+        #
+        # Queries each platform for the CURRENT binding of every recorded
+        # domain and compares it with the panel's deployment record, so the
+        # user can see: uploaded? bound? which cert? when does it expire? and
+        # whether the platform side drifted (someone swapped the cert there).
+        if self.command == "POST" and sub == "/platform-deployments/check":
+            checks: List[Dict[str, Any]] = []
+            # ── EdgeOne 加速绑定（腾讯云 EdgeOne）也纳入检查 ──
+            # 实时扫描 EdgeOne 站点域名（绑定状态以 API 为准）。
+            eo_checks: List[Dict[str, Any]] = []
+            try:
+                with conn() as c:
+                    eo_cred_rows_c = c.execute(
+                        "SELECT id, name, secrets FROM dns_credentials WHERE userId = ?",
+                        (uid,),
+                    ).fetchall()
+                for eo_cred in eo_cred_rows_c:
+                    try:
+                        eo_secrets = self._credential_secrets(eo_cred)
+                        eo_sid = str(eo_secrets.get("secretId") or "").strip()
+                        eo_skey = str(eo_secrets.get("secretKey") or "").strip()
+                        if not eo_sid or not eo_skey:
+                            continue
+                        from modules.tencent_edgeone_api import TencentEdgeOneApi as _EoApi
+                        eo_api = _EoApi(eo_sid, eo_skey)
+                        for zone in (eo_api.list_zones(offset=0, limit=100).get("zones") or []):
+                            zone_id = str(zone.get("zoneId") or zone.get("id") or "").strip()
+                            if not zone_id:
+                                continue
+                            try:
+                                listing = eo_api.list_acceleration_domains(zone_id)
+                            except Exception:
+                                continue
+                            for entry in (listing.get("items") or []):
+                                domain_name = str(entry.get("domainName") or "").strip().strip(".").lower()
+                                cert_id = str(entry.get("certificateId") or "").strip()
+                                if not domain_name or not cert_id:
+                                    continue
+                                live_eo = {
+                                    "bound": True,
+                                    "certificateId": cert_id,
+                                    "https": str(entry.get("certificateMode") or "") == "sslcert",
+                                    "notAfter": str(entry.get("certificateExpireTime") or ""),
+                                    "domainStatus": str(entry.get("domainStatus") or ""),
+                                    "cnameStatus": str(entry.get("cnameStatus") or ""),
+                                }
+                                item_eo: Dict[str, Any] = {
+                                    "deploymentId": -len(eo_checks) - 1,
+                                    "provider": "edgeone",
+                                    "providerLabel": "腾讯云 EdgeOne",
+                                    "domain": domain_name,
+                                    "credentialName": str(eo_cred["name"] or "EdgeOne"),
+                                    "platformCertId": cert_id,
+                                    "recordedNotAfter": live_eo["notAfter"],
+                                    "recordedStatus": "synced" if str(entry.get("certificateStatus") or "") == "deployed" else str(entry.get("certificateStatus") or "unknown"),
+                                    "checked": True,
+                                    "live": live_eo,
+                                    "drift": False,
+                                    "isEdgeOne": True,
+                                }
+                                if live_eo["notAfter"]:
+                                    item_eo["liveNotAfter"] = live_eo["notAfter"]
+                                    item_eo["liveDaysRemaining"] = certificate_days_remaining(live_eo["notAfter"])
+                                eo_checks.append(item_eo)
+                    except Exception:
+                        continue
+            except Exception:
+                eo_checks = []
+            for item_eo in eo_checks:
+                checks.append(item_eo)
+            try:
+                with conn() as c:
+                    eo_rows = c.execute(
+                        "SELECT * FROM acceleration_cert_bindings WHERE userId = ? ORDER BY updatedAt DESC LIMIT 500",
+                        (uid,),
+                    ).fetchall()
+            except Exception:
+                eo_rows = []
+            for row in eo_rows:
+                provider = str(row["provider"] or "edgeone").strip().lower()
+                if provider != "edgeone":
+                    continue
+                domain = str(row["domainName"] or "").strip().strip(".")
+                edge_cert_id = str(row["edgeCertId"] or "").strip()
+                # 实时扫描已覆盖的域名跳过。
+                if any(c3.get("domain") == domain.lower() and c3.get("provider") == "edgeone" for c3 in checks):
+                    continue
+                item: Dict[str, Any] = {
+                    "deploymentId": -int(row["id"] or 0),  # 负数 id 区分 EdgeOne 绑定
+                    "provider": "edgeone",
+                    "providerLabel": "腾讯云 EdgeOne",
+                    "domain": domain,
+                    "credentialName": "EdgeOne 加速",
+                    "platformCertId": edge_cert_id,
+                    "recordedNotAfter": row["notAfter"],
+                    "recordedStatus": row["status"],
+                    "checked": False,
+                    "isEdgeOne": True,
+                }
+                try:
+                    accel_cred_id = int(row["accelerationCredentialId"] or 0)
+                    accel_ctx = self._acceleration_auth(uid, accel_cred_id)
+                    accel_api = accel_ctx.get("api")
+                    site_id = str(row["siteId"] or "").strip()
+                    live: Dict[str, Any] = {}
+                    if accel_api is not None and hasattr(accel_api, "list_acceleration_domains"):
+                        try:
+                            listing = accel_api.list_acceleration_domains(site_id)
+                            for entry in (listing.get("items") or []):
+                                if str(entry.get("domainName") or "").strip().strip(".").lower() == domain.lower():
+                                    live = {
+                                        "bound": bool(entry.get("certificateId")),
+                                        "certificateId": str(entry.get("certificateId") or ""),
+                                        "https": str(entry.get("certificateMode") or "") == "sslcert",
+                                        "notAfter": str(entry.get("certificateExpireTime") or ""),
+                                        "domainStatus": str(entry.get("domainStatus") or ""),
+                                        "cnameStatus": str(entry.get("cnameStatus") or ""),
+                                    }
+                                    break
+                        except Exception as exc:
+                            live = {"error": str(exc)[:200]}
+                    item["checked"] = True
+                    item["live"] = live
+                    live_cert_id = str(live.get("certificateId") or "").strip()
+                    item["drift"] = bool(live_cert_id and edge_cert_id and live_cert_id != edge_cert_id)
+                    if live.get("notAfter"):
+                        item["liveNotAfter"] = live["notAfter"]
+                        item["liveDaysRemaining"] = certificate_days_remaining(live["notAfter"])
+                except Exception as exc:
+                    item["checked"] = False
+                    item["error"] = str(exc)[:300]
+                checks.append(item)
+            with conn() as c:
+                rows = c.execute(
+                    """SELECT d.*, cr.name AS credentialName, cr.provider AS credProvider
+                         FROM ssl_platform_deployments d
+                         LEFT JOIN dns_credentials cr ON cr.id = d.credentialId
+                        WHERE d.userId = ?
+                        ORDER BY d.provider ASC, d.domain ASC""",
+                    (uid,),
+                ).fetchall()
+            grouped: Dict[tuple, list] = {}
+            for row in rows:
+                grouped.setdefault(
+                    (str(row["provider"] or "").lower(), int(row["credentialId"] or 0)), []
+                ).append(row)
+            for (provider, cred_id), group in grouped.items():
+                try:
+                    cred_row = self._get_credential_row(uid, cred_id)
+                    if cred_row is None:
+                        raise ValueError("平台凭证已删除")
+                    secrets = self._credential_secrets(cred_row)
+                    api = _build_platform_api(provider, secrets)
+                except Exception as exc:
+                    for row in group:
+                        checks.append({
+                            "deploymentId": row["id"], "provider": provider,
+                            "domain": row["domain"], "checked": False,
+                            "error": str(exc)[:200],
+                        })
+                    continue
+                for row in group:
+                    domain = str(row["domain"] or "").strip().strip(".")
+                    item: Dict[str, Any] = {
+                        "deploymentId": row["id"],
+                        "provider": provider,
+                        "providerLabel": PLATFORM_PROVIDER_LABELS.get(provider, provider),
+                        "domain": domain,
+                        "credentialName": row["credentialName"],
+                        "platformCertId": row["platformCertId"],
+                        "platformCertName": row["platformCertName"],
+                        "recordedNotAfter": row["notAfter"],
+                        "recordedStatus": row["status"],
+                        "checked": False,
+                    }
+                    try:
+                        if provider == "upyun":
+                            status = api.get_binding_status(domain)
+                        elif provider == "qiniu":
+                            status = api.get_binding_status(domain)
+                        elif provider == "tencent":
+                            status = api.get_binding_status(domain)
+                        else:
+                            status = {"bound": None, "error": "不支持的平台"}
+                        item["checked"] = True
+                        item["live"] = status
+                        # 与面板记录比对：平台当前绑定的证书 ID 与记录不一致 → 漂移。
+                        live_cert_id = str((status or {}).get("certificateId") or "").strip()
+                        recorded_cert_id = str(row["platformCertId"] or "").strip()
+                        if live_cert_id and recorded_cert_id and live_cert_id != recorded_cert_id:
+                            item["drift"] = True
+                        else:
+                            item["drift"] = False
+                        # 平台返回的实际到期时间。
+                        live_not_after = str((status or {}).get("notAfter") or "")
+                        if live_not_after:
+                            item["liveNotAfter"] = live_not_after
+                            item["liveDaysRemaining"] = certificate_days_remaining(live_not_after)
+                    except Exception as exc:
+                        item["checked"] = False
+                        item["error"] = str(exc)[:300]
+                    checks.append(item)
+            ok_count = len([c2 for c2 in checks if c2.get("checked")])
+            drift_count = len([c2 for c2 in checks if c2.get("drift")])
+            message = f"检查完成：{ok_count}/{len(checks)} 个域名状态已核实"
+            if drift_count:
+                message += f"，发现 {drift_count} 个漂移（平台绑定的证书与面板记录不一致）"
+            self._ok({"checks": checks, "checked": ok_count, "total": len(checks), "drift": drift_count}, message)
+            return
+
+        # DELETE /api/ssl/platform-deployments/<id> — remove record (best-effort unbind for upyun)
+        m_pd = re.fullmatch(r"/platform-deployments/(\d+)", sub)
+        if self.command == "DELETE" and m_pd:
+            dep_id = int(m_pd.group(1))
+            with conn() as c:
+                row = c.execute("SELECT * FROM ssl_platform_deployments WHERE id = ? AND userId = ? LIMIT 1", (dep_id, uid)).fetchone()
+            if row is None:
+                self._err("部署记录不存在", 404)
+                return
+            unbind_note = ""
+            if str(row["provider"] or "").lower() == "upyun":
+                try:
+                    cred_row, _, secrets = _platform_credential_row(self, uid, row["credentialId"])
+                    UpyunConsoleApi(secrets.get("username") or "", secrets.get("password") or "").unbind_domain(str(row["domain"] or ""))
+                    unbind_note = "（已关闭该域名 HTTPS）"
+                except Exception as exc:
+                    unbind_note = f"（解除绑定失败：{str(exc)[:120]}，仅删除了记录）"
+            with conn() as c:
+                c.execute("DELETE FROM ssl_platform_deployments WHERE id = ? AND userId = ?", (dep_id, uid))
+                c.commit()
+            self._ok(None, "部署记录已删除" + unbind_note)
             return
 
         self._err("接口不存在", 404)

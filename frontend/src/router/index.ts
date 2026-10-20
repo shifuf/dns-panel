@@ -1,6 +1,7 @@
-import { createRouter, createWebHistory } from 'vue-router';
+﻿import { createRouter, createWebHistory } from 'vue-router';
 import type { RouteRecordRaw } from 'vue-router';
-import { getSetupStatus, isAuthenticated } from '@/services/auth';
+import { getSetupStatus, isAuthenticated, getCurrentUser } from '@/services/auth';
+import { onUnauthorized } from '@/services/api';
 import { logPageAccess } from '@/services/logs';
 
 const routes: RouteRecordRaw[] = [
@@ -64,6 +65,11 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/pages/SSLCertificatesPage.vue'),
       },
       {
+        path: 'platform-deployments',
+        name: 'PlatformDeployments',
+        component: () => import('@/pages/PlatformDeploymentsPage.vue'),
+      },
+      {
         // Legacy deep-link: Let's Encrypt is a channel tab inside the SSL page now.
         path: 'letsencrypt',
         redirect: (to) => ({ path: '/ssl', query: { ...to.query, channel: 'letsencrypt' } }),
@@ -86,6 +92,56 @@ const router = createRouter({
   routes,
 });
 
+// ── 唯一跳转方 ───────────────────────────────────────────────────────────
+// axios 拦截器只负责清理会话并广播事件，跳转统一由路由完成。以前拦截器也会
+// window.location.href = '/login'，与守卫互相弹跳：token 失效时 '/' 返回 401
+// → 跳 /login → 守卫又放行 '/' → 再 401 …… 表现为页面无限刷新、一直白屏。
+let loggingOut = false;
+onUnauthorized(() => {
+  if (loggingOut) return;
+  const current = router.currentRoute.value;
+  const name = String(current.name || '');
+  if (name === 'Login' || name === 'Setup' || name === 'Register') return;
+  loggingOut = true;
+  const query = current.fullPath && current.fullPath !== '/' ? { redirect: current.fullPath } : {};
+  router.replace({ name: 'Login', query }).finally(() => {
+    window.setTimeout(() => {
+      loggingOut = false;
+    }, 300);
+  });
+});
+
+// localStorage 里有 token 不等于会话有效（可能来自旧/别的数据库或已过期）。
+// 每个会话只校验一次，避免守卫在 '/' 与 '/login' 之间来回弹跳。
+let sessionVerified: boolean | null = null;
+let sessionProbe: Promise<boolean> | null = null;
+async function hasValidSession(): Promise<boolean> {
+  if (!isAuthenticated()) {
+    sessionVerified = false;
+    return false;
+  }
+  if (sessionVerified === true) return true;
+  if (!sessionProbe) {
+    sessionProbe = getCurrentUser()
+      .then(() => {
+        sessionVerified = true;
+        return true;
+      })
+      .catch(() => {
+        sessionVerified = false;
+        return false;
+      })
+      .finally(() => {
+        sessionProbe = null;
+      });
+  }
+  return sessionProbe;
+}
+
+export function resetSessionCache() {
+  sessionVerified = null;
+}
+
 router.beforeEach(async (to) => {
   try {
     const status = (await getSetupStatus()).data;
@@ -93,15 +149,21 @@ router.beforeEach(async (to) => {
       return { name: 'Setup' };
     }
     if (status?.setupComplete && to.name === 'Setup') {
-      return isAuthenticated() ? { path: '/', query: { scope: 'all' } } : { name: 'Login' };
+      return (await hasValidSession()) ? { path: '/', query: { scope: 'all' } } : { name: 'Login' };
     }
   } catch {
     if (to.name === 'Setup') return true;
   }
 
-  if (to.meta.public) return true;
-  if (!isAuthenticated()) {
-    return { name: 'Login', query: { redirect: to.fullPath } };
+  if (to.meta.public) {
+    if (to.name === 'Login' && (await hasValidSession())) {
+      return { path: '/', query: { scope: 'all' } };
+    }
+    return true;
+  }
+  if (!(await hasValidSession())) {
+    const query = to.fullPath && to.fullPath !== '/' ? { redirect: to.fullPath } : {};
+    return { name: 'Login', query };
   }
   return true;
 });

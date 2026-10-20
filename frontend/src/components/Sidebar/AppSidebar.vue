@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { useDialog } from 'naive-ui';
 import {
-  Globe2, LayoutDashboard, History, Settings, LogOut, ShieldCheck, Moon, Sun, Rocket,
+  Globe2, Globe, LayoutDashboard, History, Settings, LogOut, ShieldCheck, Moon, Sun, Rocket,
 } from 'lucide-vue-next';
 import { useTheme } from '@/composables/useTheme';
 import { useProviderStore } from '@/stores/provider';
@@ -186,6 +186,11 @@ function goToEdgeOne() {
   navigate('/edgeone');
 }
 
+function goToPlatformDeployments() {
+  providerStore.selectProvider(null);
+  navigate('/platform-deployments');
+}
+
 
 function confirmLogout() {
   dialog.info({
@@ -224,17 +229,22 @@ async function navigate(path: string) {
     </header>
 
     <button class="nav-btn" :class="{ active: route.path === '/' }" @click="goToDashboard">
-      <LayoutDashboard :size="18" />
+      <span class="nav-icon"><LayoutDashboard :size="17" /></span>
       总览仪表盘
     </button>
 
     <button class="nav-btn" :class="{ active: route.path === '/ssl' || route.path === '/letsencrypt' }" @click="goToSsl">
-      <ShieldCheck :size="18" />
-      SSL 证书管理
+      <span class="nav-icon"><ShieldCheck :size="17" /></span>
+      证书与部署
+    </button>
+
+    <button class="nav-btn" :class="{ active: route.path === '/platform-deployments' }" @click="goToPlatformDeployments">
+      <span class="nav-icon"><Globe :size="17" /></span>
+      平台部署
     </button>
 
     <button class="nav-btn" :class="{ active: route.path === '/edgeone' }" @click="goToEdgeOne">
-      <Rocket :size="18" />
+      <span class="nav-icon"><Rocket :size="17" /></span>
       EdgeOne 加速
     </button>
 
@@ -295,6 +305,21 @@ async function navigate(path: string) {
 </template>
 
 <style scoped>
+.nav-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  background: rgba(0, 82, 255, 0.07);
+  flex-shrink: 0;
+}
+
+.nav-btn.active .nav-icon {
+  background: rgba(0, 82, 255, 0.14);
+}
+
 .sidebar-skeleton {
   height: 44px;
   border-radius: 12px;

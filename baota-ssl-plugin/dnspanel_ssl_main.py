@@ -43,7 +43,7 @@ import public
 
 __plugin_path = "/www/server/panel/plugin/dnspanel_ssl/"
 __config = None
-PLUGIN_VERSION = "1.9.0"
+PLUGIN_VERSION = "2.1.0"
 PLUGIN_LOG_TAG = "DNS panel SSL sync"
 
 # ---------------------------------------------------------------------
@@ -1172,6 +1172,158 @@ def _match_sites_for_domain(domain, sites):
     return matched
 
 
+_PROXY_CONF_DIRS = (
+    "/www/server/panel/vhost/nginx/proxy",
+    "/www/server/panel/vhost/openresty/proxy",
+    "/www/server/panel/vhost/apache/proxy",
+)
+
+
+def _site_proxy_conf_texts(site_name):
+    """Every reverse-proxy config text BaoTa wrote for this site.
+
+    BaoTa stores per-site reverse proxies under vhost/<webserver>/proxy/<site>/
+    *.conf; manually configured proxy_pass may also live inline in the site
+    vhost itself, so the site vhost texts are merged in as well.
+    """
+    import glob
+    name = _as_text(site_name).strip()
+    if not name:
+        return []
+    texts = []
+    seen_paths = set()
+    for base in _PROXY_CONF_DIRS:
+        try:
+            candidates = glob.glob(base + "/*/*.conf") or []
+        except Exception:
+            candidates = []
+        for path in candidates:
+            try:
+                if os.path.basename(os.path.dirname(path)) != name:
+                    continue
+            except Exception:
+                continue
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            text = _config_text(path, name)
+            if text:
+                texts.append(text)
+    for conf_path in _site_vhost_conf_paths(name):
+        if conf_path in seen_paths:
+            continue
+        seen_paths.add(conf_path)
+        text = _config_text(conf_path, name)
+        if text:
+            texts.append(text)
+    return texts
+
+
+_PROXY_PASS_RE = re.compile(r"(?m)^\s*proxy_pass\s+([^;\s]+)\s*;")
+_APACHE_PROXYPASS_RE = re.compile(r'(?mi)^\s*ProxyPass\s+(?:[/~][^\s]*\s+)?(https?://[^\s"\']+)')
+
+
+def _site_proxy_targets(site_name):
+    """Reverse-proxy target URLs (http://1.2.3.4:8080/...) for a site."""
+    targets = []
+    for text in _site_proxy_conf_texts(site_name):
+        for match in _PROXY_PASS_RE.finditer(text):
+            value = _as_text(match.group(1)).strip(_QUOTES).rstrip("/")
+            if value and value not in targets:
+                targets.append(value)
+        for match in _APACHE_PROXYPASS_RE.finditer(text):
+            value = _as_text(match.group(1)).strip(_QUOTES).rstrip("/")
+            if value and value not in targets:
+                targets.append(value)
+    return targets[:20]
+
+
+def _server_ips():
+    """Non-loopback IPv4 addresses of this BaoTa server (best effort)."""
+    import socket
+    ips = []
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0)
+        try:
+            sock.connect(("8.8.8.8", 53))
+            ip = sock.getsockname()[0]
+            if ip:
+                ips.append(ip)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    return [ip for ip in ips if ip and not ip.startswith("127.")][:10]
+
+
+def _collect_site_bindings():
+    """Domain → site / reverse-proxy inventory for the whole BaoTa panel.
+
+    Returns (bindings, serverIps) where bindings is a list of
+    {domain, siteName, proxyTargets} entries (one per site-domain pair; the
+    panel groups duplicates per domain).
+    """
+    bindings = []
+    server_ips = _server_ips()
+    for site in _list_bt_sites():
+        site_name = _as_text(site.get("name")).strip()
+        if not site_name or site_name in _SKIP_SITE_NAMES:
+            continue
+        targets = _site_proxy_targets(site_name)
+        hosts = [site_name] + [_as_text(d).strip() for d in (site.get("domains") or []) if _as_text(d).strip()]
+        seen_hosts = set()
+        for host in hosts:
+            host = host.strip().lower().lstrip("*.")
+            if not host or host in seen_hosts:
+                continue
+            seen_hosts.add(host)
+            bindings.append({
+                "domain": host,
+                "siteName": site_name,
+                "proxyTargets": targets,
+            })
+    return bindings, server_ips
+
+
+def _report_site_bindings():
+    """Best-effort: push the site-binding snapshot to the DNS panel.
+
+    The panel cannot reach into the BaoTa server, so the plugin reports the
+    full inventory on every sync; the panel stores the latest snapshot and
+    answers frontend queries from it.
+    """
+    cfg = _get_config() or {}
+    if not cfg.get("serverUrl") or not cfg.get("apiToken"):
+        return None
+    try:
+        bindings, server_ips = _collect_site_bindings()
+        result = _panel_post(
+            "/ssl/site-bindings/report",
+            {"serverIps": server_ips, "bindings": bindings},
+            timeout=30,
+        )
+        if result.get("success"):
+            return result.get("data") or {}
+        _write_log("站点绑定上报被面板拒绝: " + _as_text(result.get("message"))[:200])
+    except Exception as e:
+        _write_log("站点绑定上报失败: " + str(e)[:200])
+    return None
+
+
 def _site_vhost_conf_paths(site_name):
     """
     Candidate vhost config paths for a BaoTa site, nginx/OpenResty first.
@@ -1834,7 +1986,19 @@ _ACCEL_CERT_SHARED_PREFIXES = ("www", "cdn", "static", "assets", "img", "api", "
 # certificate is also pushed to the accelerated copy (bypassing the CDN origin
 # pull, so no cache purge is needed) and the page reports both copies.
 
-ACCEL_PANEL_PATH = "/acceleration/certificates"
+# Panel endpoints for acceleration certificate state.
+#
+# ACCEL_PANEL_PATH is the SHARED panel endpoint: it lists every accelerated host
+# the panel knows about (from dns_record_acceleration_states +
+# acceleration_cert_bindings) together with the edge certificate state and the
+# certificate that should be bound. The old per-provider route
+# (/acceleration/certificates) needs a siteId, so a plugin sync that only has
+# hostnames always got nothing back — the "加速证书检测" tab showed empty even
+# though EdgeOne was accelerated and the panel supported certificate uploads.
+ACCEL_PANEL_PATH = "/ssl/acceleration-bindings"
+ACCEL_REBIND_PATH = "/ssl/certificates/reconcile-edge"
+# Legacy path, still probed first on very old panels.
+ACCEL_LEGACY_PANEL_PATH = "/acceleration/certificates"
 ACCEL_PAGES = 20
 ACCEL_PAGE_LIMIT = 200
 ACCEL_ID_LIMIT = 400
@@ -1959,10 +2123,12 @@ def _validate_pem_pair(public_key, private_key, hostnames=None):
 # ── Panel-side acceleration certificate lookup (CDN copy tracking) ───
 
 def _accel_panel_items():
-    """Every acceleration certificate row the panel exposes for these domains.
+    """Every acceleration certificate row the panel exposes.
 
-    Paged so a large account is covered completely; an older panel without the
-    endpoint simply returns nothing and every accelerated host is then reported
+    Reads the panel's shared acceleration-binding view, which answers with one
+    row per accelerated host (edge certificate state + the certificate that
+    should serve it). Paged so a large account is covered completely; a panel
+    without the endpoint returns nothing and every accelerated host is reported
     as 面板不支持/未纳入 instead of silently looking fine.
     """
     items = []
@@ -1970,7 +2136,41 @@ def _accel_panel_items():
     while page <= ACCEL_PAGES:
         try:
             data = _panel_get(
-                ACCEL_PANEL_PATH + "?page=" + str(page) + "&limit=" + str(ACCEL_PAGE_LIMIT) + "&status=all",
+                ACCEL_PANEL_PATH + "?page=" + str(page) + "&limit=" + str(ACCEL_PAGE_LIMIT),
+                timeout=30,
+            )
+        except Exception:
+            break
+        if not isinstance(data, dict) or not data.get("success"):
+            break
+        payload = data.get("data")
+        batch = payload.get("items") if isinstance(payload, dict) else payload
+        if batch is None:
+            batch = data.get("items")
+        if not isinstance(batch, list):
+            break
+        items.extend([item for item in batch if isinstance(item, dict)])
+        try:
+            total = int((data.get("pagination") or {}).get("total") or (payload or {}).get("total") or data.get("total") or 0)
+        except Exception:
+            total = 0
+        if len(batch) < ACCEL_PAGE_LIMIT or (total and len(items) >= total):
+            break
+        page += 1
+    if items:
+        return items
+    # Legacy panels: fall back to the per-provider listing.
+    return _accel_panel_items_legacy()
+
+
+def _accel_panel_items_legacy():
+    """Pre-2.0 panels: per-provider acceleration certificate listing."""
+    items = []
+    page = 1
+    while page <= ACCEL_PAGES:
+        try:
+            data = _panel_get(
+                ACCEL_LEGACY_PANEL_PATH + "?page=" + str(page) + "&limit=" + str(ACCEL_PAGE_LIMIT) + "&status=all",
                 timeout=30,
             )
         except Exception:
@@ -2164,31 +2364,50 @@ class dnspanel_ssl_main:
         if not wanted:
             return []
 
+        def _rows_from(payload):
+            if not isinstance(payload, dict) or not payload.get("success"):
+                return []
+            body = payload.get("data")
+            rows = body.get("items") if isinstance(body, dict) else body
+            if rows is None:
+                rows = payload.get("items")
+            return [row for row in (rows or []) if isinstance(row, dict)]
+
+        # 1) Preferred: the panel's shared acceleration-binding view. It answers
+        #    with one row per accelerated host — including hosts whose DNS record
+        #    lives outside the panel — plus the edge certificate state, which is
+        #    exactly what this page renders.
+        query = "?limit=" + str(ACCEL_PAGE_LIMIT)
+        if wanted:
+            query += "&domains=" + ",".join(wanted)
+        try:
+            rows = _rows_from(_panel_get(ACCEL_PANEL_PATH + query, timeout=30))
+        except Exception:
+            rows = []
+        if rows:
+            return rows
+
+        # 2) Legacy panels: per-provider endpoint. It needs a siteId, so it is
+        #    only useful when the caller already knows one; try it without one
+        #    for backwards compatibility.
         def fetch(ids):
-            query = "?status=all&limit=" + str(ACCEL_PAGE_LIMIT)
+            legacy_query = "?status=all&limit=" + str(ACCEL_PAGE_LIMIT)
             if ids:
-                query += "&domains=" + ",".join(ids)
+                legacy_query += "&domains=" + ",".join(ids)
             else:
-                query += "&domains=" + ",".join(wanted)
+                legacy_query += "&domains=" + ",".join(wanted)
             try:
-                data = _panel_get(ACCEL_PANEL_PATH + query, timeout=30)
+                return _rows_from(_panel_get(ACCEL_LEGACY_PANEL_PATH + legacy_query, timeout=30))
             except Exception:
                 return []
-            if not isinstance(data, dict) or not data.get("success"):
-                return []
-            payload = data.get("data")
-            rows = payload.get("items") if isinstance(payload, dict) else payload
-            if rows is None:
-                rows = data.get("items")
-            return [row for row in (rows or []) if isinstance(row, dict)]
 
         rows = fetch(wanted)
         if rows:
             return rows
         if len(wanted) > ACCEL_ID_LIMIT:
             return []
-        # The panel may only match IDs (no hostnames), so search by certificate
-        # ID as well before giving up on a domain.
+        # The legacy route may only match certificate IDs (no hostnames), so
+        # search by certificate ID as well before giving up on a domain.
         ids = []
         try:
             cert_data = _panel_get("/ssl/certificates?credentialId=all&page=1&limit=500", timeout=30)
@@ -2315,25 +2534,51 @@ class dnspanel_ssl_main:
 
     @staticmethod
     def _accel_bind(entry, hostnames, cert_id):
-        """Bind one panel certificate to the accelerated hosts via the panel API."""
-        payload = {
-            "domains": hostnames,
-            "certId": _as_text(cert_id),
-            "mode": "panel",
-        }
-        credential_id = (entry or {}).get("credentialId")
-        if credential_id not in (None, ""):
-            try:
-                payload["credentialId"] = int(credential_id)
-            except Exception:
-                pass
-        if (entry or {}).get("provider"):
-            payload["provider"] = entry.get("provider")
-        response = _panel_post(ACCEL_PANEL_PATH + "/bind", payload, timeout=120)
+        """Bind one panel certificate to the accelerated hosts via the panel API.
+
+        Uses the panel's own certificate-sync endpoint, which resolves the
+        EdgeOne-usable certificate id itself (uploading the PEM into the
+        acceleration account when the certificate lives in another account) and
+        records the binding so drift stays visible afterwards.
+        """
+        cert_id = _as_text(cert_id).strip()
+        if not cert_id:
+            return False, "缺少证书 ID，无法同步加速证书", {}
+        payload = {"certId": cert_id}
+        response = _panel_post("/ssl/certificates/sync-edgeone", payload, timeout=180)
         if not isinstance(response, dict) or not response.get("success"):
-            message = _as_text((response or {}).get("message")) or "面板加速证书绑定失败"
-            return False, message, {}
-        return True, _as_text(response.get("message")) or "加速证书已同步", (response.get("data") or {})
+            # Older panels expose the provider-level bind route instead.
+            legacy = {
+                "domains": hostnames,
+                "certId": cert_id,
+                "mode": "panel",
+            }
+            credential_id = (entry or {}).get("credentialId")
+            if credential_id not in (None, ""):
+                try:
+                    legacy["credentialId"] = int(credential_id)
+                except Exception:
+                    pass
+            if (entry or {}).get("provider"):
+                legacy["provider"] = entry.get("provider")
+            legacy_response = _panel_post(ACCEL_LEGACY_PANEL_PATH + "/bind", legacy, timeout=120)
+            if not isinstance(legacy_response, dict) or not legacy_response.get("success"):
+                message = _as_text((legacy_response or {}).get("message")) or _as_text((response or {}).get("message")) or "面板加速证书绑定失败"
+                return False, message, {}
+            return True, _as_text(legacy_response.get("message")) or "加速证书已同步", (legacy_response.get("data") or {})
+        data = response.get("data") or {}
+        synced = int(data.get("totalSynced") or 0)
+        results = data.get("results") or []
+        for item in results:
+            for detail in (item.get("results") or []):
+                if _as_text(detail.get("domain")).strip().lower() in [_as_text(h).strip().lower() for h in (hostnames or [])]:
+                    if not detail.get("ok"):
+                        return False, _as_text(detail.get("error")) or "加速证书同步失败", data
+        if synced <= 0 and results:
+            first = results[0]
+            message = _as_text(first.get("skipped") or first.get("error")) or "该域名没有已启用的加速"
+            return False, message, data
+        return True, _as_text(response.get("message")) or "加速证书已同步", data
 
     def _accel_sync_one(self, site_name, hosts, local_cert, panel_certs, local_certs, state, dry_run=False):
         """Sync the CDN certificate of one accelerated host with the deployed one.
@@ -2809,61 +3054,133 @@ class dnspanel_ssl_main:
         cfg = _get_config() or {}
         if not cfg.get("serverUrl") or not cfg.get("apiToken"):
             return public.ReturnMsg(False, "请先配置连接信息")
-        result = _panel_get("/ssl/edgeone-bindings", timeout=60)
+        # The panel's shared acceleration-binding view is authoritative: it lists
+        # every accelerated host (edge state + the certificate that should serve
+        # it). The old per-provider route needed a siteId, so this page always
+        # came back empty even when EdgeOne was accelerated.
+        result = _panel_get(ACCEL_PANEL_PATH, timeout=60)
         if not isinstance(result, dict) or not result.get("success"):
             return public.ReturnMsg(False, _as_text((result or {}).get("message")) or "获取加速证书绑定失败")
 
-        bindings = [b for b in (result.get("data") or []) if isinstance(b, dict)]
+        data = result.get("data")
+        rows = data.get("items") if isinstance(data, dict) else data
+        if rows is None:
+            rows = result.get("items")
+        rows = [row for row in (rows or []) if isinstance(row, dict)]
+        rows = rows or _accel_panel_items()
+
         items = []
-        for b in bindings:
-            not_after = _as_text(b.get("notAfter") or b.get("currentNotAfter")).strip()
-            days = _days_until(_parse_expiry(not_after))
+        for b in rows:
+            # Two row shapes are supported: the shared binding view
+            # (accelCertificateId / certId / accelDaysRemaining) and the legacy
+            # /ssl/edgeone-bindings row (edgeCertId / certRemoteId / notAfter).
+            shared_view = ("accelCertificateId" in b) or ("certId" in b) or ("domainName" in b and "certRemoteId" not in b)
+            live_id = _as_text(b.get("accelCertificateId") or b.get("edgeCertId")).strip()
+            expected_id = _as_text(b.get("certId") or b.get("certRemoteId") or b.get("currentCertRemoteId")).strip()
+            edge_expiry = _as_text(b.get("accelExpireTime") or b.get("notAfter") or b.get("currentNotAfter")).strip()
+            panel_expiry = _as_text(b.get("panelExpireTime")).strip()
+            days = b.get("accelDaysRemaining")
+            if not isinstance(days, int):
+                days = _days_until(_parse_expiry(edge_expiry))
             status = _as_text(b.get("status")).strip().lower()
+            supported = b.get("supported", True) is not False
             up_to_date = b.get("upToDate")
-            edge_cert_id = _as_text(b.get("edgeCertId")).strip()
-            # Classify: a failed sync wins; otherwise drift (edge ≠ current
-            # panel cert) is a warning; an expired edge cert is an error.
-            if status == "failed":
-                state, action = "failed", "加速同步失败：" + (_as_text(b.get("lastError")).strip()[:120] or "请在面板重新同步")
-            elif up_to_date is False:
-                state, action = "stale", "加速边缘为旧证书，请在面板「SSL → 同步加速」重新同步"
+            if up_to_date is None and shared_view and live_id and expected_id:
+                up_to_date = live_id == expected_id
+            if not supported:
+                state = "unsupported"
+                action = _as_text(b.get("message")).strip() or "面板不支持该加速服务商的证书推送"
+            elif status in ("failed", "error"):
+                state = "failed"
+                action = _as_text(b.get("message") or b.get("lastError")).strip()[:160] or "加速同步失败，请在面板重新同步"
+            elif shared_view and not live_id:
+                state = "missing"
+                action = "加速域名尚未绑定证书" + ("，面板可自动绑定：" + expected_id if expected_id else "")
             elif isinstance(days, int) and days < 0:
-                state, action = "expired", "加速证书已过期，请续期并重新同步"
+                state = "expired"
+                action = "加速证书已过期" + ("，面板将改绑有效证书 " + expected_id if expected_id else "，请先申请/上传有效证书")
             elif isinstance(days, int) and days <= ACCEL_EXPIRING_DAYS:
-                state, action = "expiring", "加速证书将于 " + str(days) + " 天后到期"
+                state = "expiring"
+                action = "加速证书将于 " + str(days) + " 天后到期"
+            elif up_to_date is False:
+                state = "stale"
+                action = "加速边缘为旧证书，可在面板「SSL → 检测并修复」自动改绑 " + (expected_id or "")
             elif up_to_date is True:
-                state, action = "synced", "加速证书已与面板一致"
+                state = "synced"
+                action = "加速证书已与面板一致"
             else:
-                state, action = "unknown", "无法确定加速证书状态"
+                state = "unknown"
+                action = "无法确定加速证书状态"
             items.append({
-                "domainName": _as_text(b.get("domainName")).strip(),
+                "domainName": _as_text(b.get("domainName") or b.get("host")).strip(),
                 "provider": _as_text(b.get("provider")).strip() or "edgeone",
                 "source": _as_text(b.get("source")).strip(),
-                "sourceLabel": "Let's Encrypt" if _as_text(b.get("source")).strip().lower() in ("acme", "letsencrypt") else "腾讯云",
-                "certRemoteId": _as_text(b.get("certRemoteId")).strip(),
-                "edgeCertId": edge_cert_id,
-                "currentCertRemoteId": _as_text(b.get("currentCertRemoteId")).strip(),
-                "notAfter": not_after,
+                "sourceLabel": _as_text(b.get("panelIssuer")).strip() or ("腾讯云 / EdgeOne"),
+                "certRemoteId": expected_id,
+                "edgeCertId": live_id,
+                "currentCertRemoteId": expected_id,
+                "notAfter": edge_expiry or panel_expiry,
+                "panelExpireTime": panel_expiry,
                 "daysRemaining": days,
                 "state": state,
                 "action": action,
+                "supported": supported,
+                "bindable": bool(b.get("bindable")),
                 "syncedAt": _as_text(b.get("syncedAt")).strip(),
                 "updatedAt": _as_text(b.get("updatedAt")).strip(),
             })
         # Sort worst-first so problems surface at the top of the table.
-        order = {"failed": 0, "expired": 1, "stale": 2, "expiring": 3, "unknown": 4, "synced": 5}
+        order = {"failed": 0, "expired": 1, "missing": 2, "stale": 3, "expiring": 4, "unknown": 5, "unsupported": 6, "synced": 7}
         items.sort(key=lambda x: (order.get(x.get("state"), 9), _as_text(x.get("domainName"))))
         summary = {
             "total": len(items),
             "synced": sum(1 for x in items if x.get("state") == "synced"),
             "stale": sum(1 for x in items if x.get("state") == "stale"),
+            "missing": sum(1 for x in items if x.get("state") == "missing"),
             "expiring": sum(1 for x in items if x.get("state") == "expiring"),
             "expired": sum(1 for x in items if x.get("state") == "expired"),
             "failed": sum(1 for x in items if x.get("state") == "failed"),
+            "unsupported": sum(1 for x in items if x.get("state") == "unsupported"),
         }
         _set_config("lastAccelCheckAt", time.strftime("%Y-%m-%d %H:%M:%S"))
         _set_config("lastAccelCheckResult", json.dumps(summary, ensure_ascii=False))
         return {"success": True, "message": "加速证书检测完成", "data": {"summary": summary, "items": items}}
+
+    def accel_repair(self, args):
+        """Ask the panel to re-point every accelerated host whose edge
+        certificate is missing / stale / expired at the best VALID certificate
+        for that domain (exact root domain first, wildcard second).
+
+        The panel performs the work (it owns the cloud credentials and the
+        certificate inventory); this simply triggers it and reports the outcome.
+        """
+        cfg = _get_config() or {}
+        if not cfg.get("serverUrl") or not cfg.get("apiToken"):
+            return public.ReturnMsg(False, "请先配置连接信息")
+        dry_run_raw = getattr(args, "dryRun", None)
+        dry_run = bool(dry_run_raw) and str(dry_run_raw) not in ("false", "0", "")
+        payload = {"dryRun": dry_run}
+        result = _panel_post(ACCEL_REBIND_PATH, payload, timeout=300)
+        if not isinstance(result, dict) or not result.get("success"):
+            message = _as_text((result or {}).get("message")) or "加速证书修复失败"
+            _write_log("加速证书修复失败：" + _redact_secret_url(message)[:200])
+            return public.ReturnMsg(False, message)
+        data = result.get("data") or {}
+        repair = data.get("repair") or {}
+        repaired = int(repair.get("totalRepaired") or 0)
+        _set_config("lastAccelRepairAt", time.strftime("%Y-%m-%d %H:%M:%S"))
+        _set_config("lastAccelRepairResult", json.dumps({
+            "dryRun": dry_run,
+            "checked": repair.get("checked"),
+            "repaired": repaired,
+            "errors": len(repair.get("errors") or []),
+        }, ensure_ascii=False))
+        _write_log(("加速证书修复预览：" if dry_run else "加速证书修复：") + "检查 " + str(repair.get("checked") or 0) + "，处理 " + str(repaired) + " 个")
+        return {
+            "success": True,
+            "message": _as_text(result.get("message")) or ("已修复 " + str(repaired) + " 个加速证书"),
+            "data": data,
+        }
 
     def _site_certificate_report(self, site, deployable, allowed_sources, renew_days):
         """Per-site report row; a single bad site never breaks the whole check."""
@@ -3133,6 +3450,18 @@ class dnspanel_ssl_main:
         allowed_sites = set(str(x) for x in (cfg.get("allowedSites") or []) if str(x))
         if allowed_sites and site_name not in allowed_sites:
             return public.ReturnMsg(False, "目标站点不在部署白名单")
+
+        # Fetch certificate metadata first so an expired certificate is
+        # rejected before any file is written or web server is reloaded.
+        detail_path = "/ssl/certificates/" + cert_id + "?credentialId=" + credential_id
+        detail_raw = _http_request(_panel_api(detail_path), headers=_panel_headers())
+        try:
+            detail = json.loads(detail_raw)
+        except Exception:
+            detail = {}
+        detail_row = detail.get("data") if isinstance(detail, dict) else None
+        if isinstance(detail_row, dict) and _certificate_health(detail_row, 0)["state"] == "expired":
+            return public.ReturnMsg(False, "证书已过期，禁止部署（请续期或删除）")
 
         # Fetch PEM content
         pem_path = "/ssl/certificates/" + cert_id + "/pem?credentialId=" + credential_id
@@ -3546,6 +3875,16 @@ class dnspanel_ssl_main:
         return public.ReturnMsg(False, "未知的签发渠道：" + channel)
 
     # ── Manual sync trigger ──────────────────────────────────────
+    def report_bindings(self, args):
+        """手动上报「域名 → 站点 / 反代IP」清单（同步时也会自动上报）。"""
+        cfg = _get_config() or {}
+        if not cfg.get("serverUrl") or not cfg.get("apiToken"):
+            return public.ReturnMsg(False, "请先配置连接信息")
+        data = _report_site_bindings()
+        if data is None:
+            return public.ReturnMsg(False, "上报失败，请检查面板连接")
+        return public.ReturnMsg(True, "站点绑定已上报：" + str(data.get("domains") or 0) + " 个域名")
+
     def sync_now(self, args):
         cfg = _get_config() or {}
         if not cfg.get("serverUrl") or not cfg.get("apiToken"):
@@ -3587,6 +3926,24 @@ class dnspanel_ssl_main:
                 failures = []
                 deferred = []
                 fingerprints = {}
+                # Defense in depth: even if a stale/queued event reaches the
+                # plugin, never deploy an already-expired certificate to a
+                # live site. The panel blocks this at queue time; this guard
+                # protects older panels and events created before that change.
+                certificate = _panel_get(
+                    "/ssl/certificates/" + str(event.get("remoteCertId", "")) + "?credentialId=" + str(event.get("credentialId", "")),
+                    timeout=30,
+                )
+                certificate_row = certificate.get("data") if isinstance(certificate, dict) else None
+                if isinstance(certificate_row, dict) and _certificate_health(certificate_row, 0)["state"] == "expired":
+                    result_payload = {
+                        "status": "skipped",
+                        "targetName": ", ".join(matched_names),
+                        "error": "证书已过期，禁止部署（请续期或删除）",
+                    }
+                    _panel_post("/ssl/deployment-events/" + str(event_id) + "/result", result_payload, timeout=30)
+                    event_skipped += 1
+                    continue
                 for site in allowed_matches:
                     matched = str(site.get("name") or "")
                     try:
@@ -3635,6 +3992,8 @@ class dnspanel_ssl_main:
             _panel_post("/ssl/deployment-events/" + str(event_id) + "/result", result_payload, timeout=30)
 
         if event_mode:
+            # Keep the panel's 域名→站点/反代IP snapshot fresh on every sync.
+            _report_site_bindings()
             _set_config("lastSyncAt", time.strftime("%Y-%m-%d %H:%M:%S"))
             public.WriteLog("DNS面板SSL同步", "增量同步完成：部署 " + str(event_deployed) + "，失败 " + str(event_failed) + "，跳过 " + str(event_skipped))
             return public.ReturnMsg(True, "增量同步完成：部署 " + str(event_deployed) + " 个，失败 " + str(event_failed) + " 个，跳过 " + str(event_skipped) + " 个")
@@ -3737,6 +4096,8 @@ class dnspanel_ssl_main:
             except Exception:
                 pass
 
+        # Keep the panel's 域名→站点/反代IP snapshot fresh on every sync.
+        _report_site_bindings()
         _set_config("lastSyncAt", time.strftime("%Y-%m-%d %H:%M:%S"))
         public.WriteLog("DNS面板SSL同步", "手动同步完成：部署 " + str(deployed) + "，跳过 " + str(skipped) + "，清理 " + str(pruned))
         msg = "同步完成：部署 " + str(deployed) + " 个，跳过 " + str(skipped) + " 个"
