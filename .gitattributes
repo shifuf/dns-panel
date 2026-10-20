@@ -1,0 +1,3 @@
+# Shell 脚本强制 LF 换行，防止 Windows 检出/传输产生 CRLF 导致
+# Linux 上报错 /bin/bash^M: bad interpreter
+*.sh text eol=lf
