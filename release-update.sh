@@ -54,10 +54,47 @@ BASE_URL="https://github.com/shifuf/dns-panel/releases/download/${RELEASE_TAG}"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-# ── 0. compose 文件存在性检查 ──
+# ── 0. compose 文件存在性检查 + YAML 重复键自检 ──
 if [ ! -f docker-compose.yml ]; then
     echo "未找到 docker-compose.yml，请在部署目录执行" >&2
     exit 1
+fi
+# backend 段如果出现两个 environment: 块（旧版 bug），自动删除第二个
+if python3 - <<'PYEOF' 2>/dev/null
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(2)
+data = yaml.safe_load(open('docker-compose.yml', encoding='utf-8'))
+sys.exit(0)
+PYEOF
+then
+    : # yaml 可解析，无问题
+else
+    RC=$?
+    if [ "$RC" = "1" ]; then
+        warn "docker-compose.yml 存在 YAML 错误（重复 environment 键），自动修复..."
+        python3 - <<'PYEOF'
+lines = open('docker-compose.yml', encoding='utf-8').read().split('\n')
+out, env_count, in_second_env, skip = [], 0, False, 0
+for line in lines:
+    if line == '    environment:':
+        env_count += 1
+        if env_count == 2:
+            in_second_env = True
+            continue
+    if in_second_env:
+        if line.startswith('      - ') and skip < 10:
+            skip += 1
+            continue
+        else:
+            in_second_env = False
+    out.append(line)
+open('docker-compose.yml', 'w', encoding='utf-8').write('\n'.join(out))
+PYEOF
+        ok "compose 重复键已修复"
+    fi
 fi
 
 # ── 1. 备份数据库（compose 在线备份优先，失败退回文件拷贝） ──
