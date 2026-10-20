@@ -19,12 +19,32 @@ log()  { echo -e "${CYAN}[$(date '+%H:%M:%S')]${NC} $*"; }
 ok()   { echo -e "${GREEN}[$(date '+%H:%M:%S')] OK${NC} $*"; }
 warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] !${NC} $*"; }
 
+# 国内服务器直连 github.com / raw.githubusercontent.com 经常超时。
+# 优先走镜像加速，失败自动回退直连；可用环境变量 GH_PROXY 覆盖。
+GH_PROXY="${GH_PROXY:-https://gh-proxy.com/}"
+GH_HOSTS=("https://gh-proxy.com/" "https://ghproxy.net/" "https://ghfast.top/" "")
+
+fetch() {
+    # fetch <github-url> <output-path> — 依次尝试镜像与直连
+    local url="$1" out="$2" prefix host
+    for host in "${GH_HOSTS[@]}"; do
+        prefix="${host}"
+        if curl -fSL --retry 2 --connect-timeout 10 --max-time 180             -H 'User-Agent: dns-panel-updater'             -o "$out" "${prefix}${url}" 2>/dev/null; then
+            [ -s "$out" ] && return 0
+        fi
+    done
+    return 1
+}
+
 RELEASE_TAG="${1:-}"
 if [ -z "$RELEASE_TAG" ]; then
-    log "获取 GitHub 最新 Release..."
-    RELEASE_TAG="$(curl -fsSL -H 'User-Agent: dns-panel-updater' https://api.github.com/repos/shifuf/dns-panel/releases/latest | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"tag_name": *"//;s/"//')"
+    log "获取 GitHub 最新 Release（镜像加速）..."
+    for host in "${GH_HOSTS[@]}"; do
+        RELEASE_TAG="$(curl -fsSL --connect-timeout 10 --max-time 30 -H 'User-Agent: dns-panel-updater'             "${host}https://api.github.com/repos/shifuf/dns-panel/releases/latest" 2>/dev/null             | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"tag_name": *"//;s/"//')" || true
+        [ -n "$RELEASE_TAG" ] && break
+    done
     if [ -z "$RELEASE_TAG" ]; then
-        echo "无法获取最新 Release，请检查网络（也可手动指定：bash release-update.sh v0.30）" >&2
+        echo "无法获取最新 Release，请检查网络（也可手动指定版本：bash release-update.sh v0.31）" >&2
         exit 1
     fi
 fi
@@ -64,9 +84,12 @@ print('online backup ok')
 }
 
 # ── 2. 下载并解压 Release 产物 ──
-log "下载 backend-build.zip / frontend-build.zip ..."
-curl -fSL --retry 3 -o "$TMP_DIR/backend.zip"  "$BASE_URL/backend-build.zip"
-curl -fSL --retry 3 -o "$TMP_DIR/frontend.zip" "$BASE_URL/frontend-build.zip"
+log "下载 backend-build.zip / frontend-build.zip（镜像加速，约 1MB）..."
+fetch "$BASE_URL/backend-build.zip"  "$TMP_DIR/backend.zip"  || { echo "下载 backend-build.zip 失败" >&2; exit 1; }
+fetch "$BASE_URL/frontend-build.zip" "$TMP_DIR/frontend.zip" || { echo "下载 frontend-build.zip 失败" >&2; exit 1; }
+ok "Release 产物下载完成"
+python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).testzip()" "$TMP_DIR/backend.zip" >/dev/null 2>&1 || { echo "backend-build.zip 损坏（可能下载到了 HTML 错误页），请重试" >&2; exit 1; }
+python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).testzip()" "$TMP_DIR/frontend.zip" >/dev/null 2>&1 || { echo "frontend-build.zip 损坏（可能下载到了 HTML 错误页），请重试" >&2; exit 1; }
 rm -rf "$TMP_DIR/backend" "$TMP_DIR/frontend"
 mkdir -p "$TMP_DIR/backend" "$TMP_DIR/frontend"
 python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$TMP_DIR/backend.zip"  "$TMP_DIR/backend"  || unzip -qo "$TMP_DIR/backend.zip"  -d "$TMP_DIR/backend"
@@ -103,8 +126,8 @@ cp -a "$TMP_DIR/frontend/." frontend/dist/
 ok "frontend 静态文件已替换（旧文件备份在 frontend/dist.old/）"
 
 # ── 6. 滚动重建容器 ──
-log "拉取最新镜像并滚动重建..."
-docker compose pull backend frontend >/dev/null 2>&1 || true
+log "尝试拉取最新镜像（国内可能较慢/失败，不影响本次更新，可跳过）..."
+docker compose pull backend frontend >/dev/null 2>&1 || warn "镜像拉取失败/超时，继续用现有镜像 + 挂载代码更新"
 docker compose up -d --no-deps --force-recreate backend
 log "等待 backend 健康..."
 for i in $(seq 1 30); do
