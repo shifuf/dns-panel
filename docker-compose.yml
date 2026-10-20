@@ -37,6 +37,8 @@ services:
       - JWT_EXPIRES_IN=7d
       - LOG_RETENTION_DAYS=90
       - REDIS_URL=redis://redis:6379/0
+      # Release 更新模式：backend 托管宿主机 frontend/dist（由 release-update.sh 更新）
+      - FRONTEND_DIST=/app/frontend_dist
     volumes:
       - ./backend/db:/app/db
       # Release 更新模式：宿主机代码目录覆盖镜像内代码（release-update.sh 维护）
@@ -47,8 +49,6 @@ services:
       - ./backend/modules:/app/modules:ro
       - ./backend/start.py:/app/start.py:ro
       - ./frontend/dist:/app/frontend_dist:ro
-    environment:
-      - FRONTEND_DIST=/app/frontend_dist
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4001/health')"]
       interval: 10s
