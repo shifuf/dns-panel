@@ -103,8 +103,8 @@ cp -a "$TMP_DIR/frontend/." frontend/dist/
 ok "frontend 静态文件已替换（旧文件备份在 frontend/dist.old/）"
 
 # ── 6. 滚动重建容器 ──
-log "拉取最新基础镜像并重建容器..."
-docker compose pull backend >/dev/null 2>&1 || true
+log "拉取最新镜像并滚动重建..."
+docker compose pull backend frontend >/dev/null 2>&1 || true
 docker compose up -d --no-deps --force-recreate backend
 log "等待 backend 健康..."
 for i in $(seq 1 30); do
@@ -115,7 +115,8 @@ for i in $(seq 1 30); do
     [ "$i" = "30" ] && { echo "backend 健康检查超时" >&2; exit 1; }
     sleep 2
 done
-docker compose up -d frontend redis 2>/dev/null || docker compose up -d
+docker compose up -d --force-recreate frontend
+docker compose up -d redis
 
 ok "release 更新完成: $RELEASE_TAG"
 log "验证方式: curl http://127.0.0.1:4001/health"
