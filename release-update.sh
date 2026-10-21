@@ -163,8 +163,14 @@ cp -a "$TMP_DIR/frontend/." frontend/dist/
 ok "frontend 静态文件已替换（旧文件备份在 frontend/dist.old/）"
 
 # ── 6. 滚动重建容器 ──
-log "尝试拉取最新镜像（国内可能较慢/失败，不影响本次更新，可跳过）..."
-docker compose pull backend frontend >/dev/null 2>&1 || warn "镜像拉取失败/超时，继续用现有镜像 + 挂载代码更新"
+# 国内访问 ghcr.io 经常完全不通且 docker pull 无超时 —— 默认直接跳过拉镜像。
+# 代码通过宿主机挂载进容器，不需要新镜像；如需更新镜像设 PULL_IMAGES=1。
+if [ "${PULL_IMAGES:-0}" = "1" ]; then
+    log "PULL_IMAGES=1：拉取最新镜像（国内建议先给 docker 配 ghcr 镜像源）..."
+    timeout 300 docker compose pull backend frontend >/dev/null 2>&1 || warn "镜像拉取失败/超时，继续用现有镜像 + 挂载代码更新"
+else
+    log "跳过镜像拉取（PULL_IMAGES=1 可启用；代码由宿主机挂载提供）"
+fi
 docker compose up -d --no-deps --force-recreate backend
 log "等待 backend 健康..."
 for i in $(seq 1 30); do
@@ -175,6 +181,7 @@ for i in $(seq 1 30); do
     [ "$i" = "30" ] && { echo "backend 健康检查超时" >&2; exit 1; }
     sleep 2
 done
+# frontend 容器挂载宿主机 dist（compose 已配置），重建即生效
 docker compose up -d --force-recreate frontend
 docker compose up -d redis
 

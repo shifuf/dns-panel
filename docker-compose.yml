@@ -66,6 +66,9 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    volumes:
+      # Release 更新模式：宿主机 frontend/dist 直接挂进 nginx（release-update.sh 维护）
+      - ./frontend/dist:/usr/share/nginx/html:ro
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
       interval: 10s
