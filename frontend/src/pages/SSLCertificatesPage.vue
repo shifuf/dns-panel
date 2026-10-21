@@ -24,18 +24,18 @@ import {
   getSslAcmeCas, getSslDeploymentsBySite,
   getSslEdgeOneBindings, syncSslCertToEdgeOne,
   dedupeSslCertificates, repairAccelerationCertificates, getAccelerationCertBindings,
-  getPlatformDeployments, deployCertToPlatform, deletePlatformDeployment,
-  getPlatformCredentials, createPlatformCredential, testPlatformCredential, getSslCertificatePem,
+  getPlatformDeployments, deletePlatformDeployment, getSslCertificatePem,
   checkPlatformDeployments, getSiteBindings,
 } from '@/services/ssl';
 import type {
   SslCaOption, SiteDeploymentOverview, EdgeOneCertBinding,
-  PlatformCredential, PlatformDeployment, PlatformDeploymentsResponse, UpyunAccountDomain,
+  PlatformDeployment, PlatformDeploymentsResponse,
   PlatformBindingCheck, SiteBinding,
 } from '@/services/ssl';
 import { getDnsCredentials } from '@/services/dnsCredentials';
 import { getDomains } from '@/services/domains';
 import AddZoneDialog from '@/components/Dashboard/AddZoneDialog.vue';
+import PlatformDeployModal from '@/components/SSL/PlatformDeployModal.vue';
 import type { SslCredential, RenewResult, SslAcmeJob, SslDeploymentEvent, SslNotificationSettings } from '@/services/ssl';
 import { useResponsive } from '@/composables/useResponsive';
 import { TABLE_PAGE_SIZE } from '@/utils/constants';
@@ -1329,7 +1329,6 @@ const { data: platformDeploymentsData, isFetching: platformDeployFetching } = us
     return res.data;
   },
 });
-const upyunAccountDomains = computed<UpyunAccountDomain[]>(() => platformDeploymentsData.value?.upyunDomains || []);
 // 实时绑定状态检查结果（点「检查部署状态」后填充）。
 const platformChecks = ref<PlatformBindingCheck[]>([]);
 const platformCheckFetching = ref(false);
@@ -1354,16 +1353,6 @@ const platformDeploymentsFor = (cert: SslCertificate | null | undefined): Platfo
   if (cert.id) return platformDeployments.value.filter(d => d.certRowId === cert.id);
   return [];
 };
-
-const { data: platformCredentials } = useQuery({
-  queryKey: ['ssl-platform-credentials'],
-  queryFn: async (): Promise<PlatformCredential[]> => {
-    const res = await getPlatformCredentials();
-    const payload = res.data as unknown as { credentials?: PlatformCredential[] } | PlatformCredential[] | undefined;
-    const list = Array.isArray(payload) ? payload : (payload?.credentials || []);
-    return list as PlatformCredential[];
-  },
-});
 
 // ── 宝塔站点绑定（插件上报：域名 → 站点 / 反代 IP） ──
 const { data: siteBindingsData, isFetching: siteBindingsFetching } = useQuery({
@@ -1396,158 +1385,21 @@ const proxyHostOf = (target: string): string => {
 const PLATFORM_LABELS: Record<string, string> = { qiniu: '七牛云', upyun: '又拍云', tencent: '腾讯云', edgeone: '腾讯云 EdgeOne' };
 
 const showPlatformDeploy = ref(false);
-const pdCertId = ref<string | null>(null);
-const pdProvider = ref<'qiniu' | 'upyun' | 'tencent'>('qiniu');
-const pdCredId = ref<number | null>(null);
-const pdDomains = ref('');
-// 快捷添加平台凭证
-const showPdQuickAdd = ref(false);
-const pdQuickName = ref('');
-const pdQuickKey1 = ref('');
-const pdQuickKey2 = ref('');
+// 从证书行点「部署到平台」时带上该证书；弹窗内预选并填入主域名
+const platformDeployInitialCertId = ref<string | null>(null);
 
-// 弹窗打开时跨账号拉取全部已签发证书（当前页可能不含目标证书）。
-const { data: allIssuedCerts } = useQuery({
-  queryKey: ['ssl-all-issued-certs'],
-  queryFn: async (): Promise<SslCertificate[]> => {
-    const res = await getSslCertificates('all', { page: 1, limit: 200 });
-    return (res.data || []).filter(c => c.status === 'issued');
-  },
-  enabled: computed(() => showPlatformDeploy.value),
-  staleTime: 30_000,
-});
-const pdCertOptions = computed(() =>
-  (allIssuedCerts.value || certificates.value)
-    .filter(c => c.status === 'issued' && c.remoteCertId)
-    .map(c => {
-      const deployed = platformsForCertId(c.remoteCertId);
-      const label = `${c.domain}${c.notAfter ? '（到期 ' + formatDate(c.notAfter) + '）' : ''}${deployed ? ' · 已部署: ' + deployed : ''}`;
-      return { label, value: c.remoteCertId };
-    })
-    .filter(o => o.value),
-);
-
-const pdCredentialOptions = computed(() =>
-  (platformCredentials.value || [])
-    .filter(c => c.provider === pdProvider.value)
-    .map(c => ({ label: c.name, value: c.id })),
-);
-
-// 选择证书下拉里显示该证书已部署到哪些平台。
-const platformsForCertId = (certId?: string | null): string => {
-  if (!certId) return '';
-  const names = new Set<string>();
-  for (const d of platformDeployments.value) {
-    if (d.certRemoteId === certId) names.add(PLATFORM_LABELS[d.provider] || d.provider);
-  }
-  return [...names].join('、');
-};
-
-const pdCertNames = computed(() => {
-  const cert = (allIssuedCerts.value || certificates.value).find(c => c.remoteCertId === pdCertId.value);
-  if (!cert) return [] as string[];
-  const names: string[] = [cert.domain];
-  if (Array.isArray(cert.san)) names.push(...cert.san);
-  else if (typeof cert.san === 'string' && cert.san) names.push(cert.san);
-  return names.filter(Boolean);
-});
-
-watch(pdProvider, () => { pdCredId.value = null; });
 
 function openPlatformDeploy(cert?: SslCertificate) {
-  if (cert) {
-    if (cert.status !== 'issued') { message.error('只有已签发的证书才能上传到平台'); return; }
-    pdCertId.value = cert.remoteCertId || null;
-  } else {
-    pdCertId.value = pdCertOptions.value[0]?.value ?? null;
-  }
-  pdProvider.value = 'qiniu';
-  pdCredId.value = null;
-  const target = (allIssuedCerts.value || certificates.value).find(c => c.remoteCertId === pdCertId.value);
-  pdDomains.value = target?.domain || '';
-  showPdQuickAdd.value = false;
-  pdTestResult.value = null;
+  if (cert && cert.status !== 'issued') { message.error('只有已签发的证书才能上传到平台'); return; }
+  platformDeployInitialCertId.value = cert?.remoteCertId || null;
   showPlatformDeploy.value = true;
 }
 
-function addPdDomain(domain: string) {
-  const current = pdDomains.value.split(/[,,\s]+/).map(s => s.trim()).filter(Boolean);
-  if (!current.includes(domain)) current.push(domain);
-  pdDomains.value = current.join(', ');
+function onPlatformDeployed() {
+  queryClient.invalidateQueries({ queryKey: ['ssl-platform-deployments'] });
+  // 上传成功后立即做一次实时状态检查，让用户马上看到绑定结果。
+  runPlatformCheck().catch(() => {});
 }
-
-const pdDeployMutation = useMutation({
-  mutationFn: () => {
-    if (!pdCertId.value) throw new Error('请选择要上传的面板证书');
-    if (!pdCredId.value) throw new Error('请选择平台凭证');
-    const domains = pdDomains.value.split(/[,,\s]+/).map(s => s.trim()).filter(Boolean);
-    if (!domains.length) throw new Error('请填写要绑定的 CDN 域名');
-    return deployCertToPlatform({
-      provider: pdProvider.value,
-      credentialId: pdCredId.value,
-      certId: pdCertId.value,
-      domains,
-    });
-  },
-  onSuccess: async (res: any) => {
-    message.success(res?.message || '上传成功');
-    showPlatformDeploy.value = false;
-    queryClient.invalidateQueries({ queryKey: ['ssl-platform-deployments'] });
-    // 上传成功后立即做一次实时状态检查，让用户马上看到绑定结果。
-    try { await runPlatformCheck(); } catch { /* ignore */ }
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-const pdQuickAddMutation = useMutation({
-  mutationFn: () => {
-    if (!pdQuickName.value.trim()) throw new Error('请填写凭证名称');
-    const provider = pdProvider.value as 'qiniu' | 'upyun';
-    const secrets: Record<string, string> = provider === 'qiniu'
-      ? { accessKey: pdQuickKey1.value.trim(), secretKey: pdQuickKey2.value.trim() }
-      : { username: pdQuickKey1.value.trim(), password: pdQuickKey2.value.trim() };
-    if (provider === 'qiniu' && !secrets.accessKey) throw new Error('请填写 AccessKey');
-    if (provider === 'upyun' && !secrets.username) throw new Error('请填写登录账号');
-    return createPlatformCredential({ name: pdQuickName.value.trim(), provider, secrets });
-  },
-  onSuccess: (res: any) => {
-    message.success(res?.message || '平台凭证已添加');
-    pdTestResult.value = null;
-    queryClient.invalidateQueries({ queryKey: ['ssl-platform-credentials'] });
-    showPdQuickAdd.value = false;
-    pdQuickName.value = ''; pdQuickKey1.value = ''; pdQuickKey2.value = '';
-    // 新凭证创建后自动选中。
-    setTimeout(() => {
-      const list = (platformCredentials.value || []).filter(c => c.provider === pdProvider.value);
-      if (list.length) pdCredId.value = list[list.length - 1].id;
-    }, 300);
-  },
-  onError: (err: any) => message.error(String(err)),
-});
-
-// 又拍云/七牛云凭证：先测试连接，成功后再保存。
-const pdTestResult = ref<{ ok: boolean; message: string } | null>(null);
-const pdTestMutation = useMutation({
-  mutationFn: () => {
-    const provider = pdProvider.value;
-    if (provider === 'tencent') {
-      if (!pdCredId.value) throw new Error('请选择腾讯云凭证');
-      return testPlatformCredential({ provider, credentialId: pdCredId.value });
-    }
-    const secrets: Record<string, string> = provider === 'qiniu'
-      ? { accessKey: pdQuickKey1.value.trim(), secretKey: pdQuickKey2.value.trim() }
-      : { username: pdQuickKey1.value.trim(), password: pdQuickKey2.value.trim() };
-    return testPlatformCredential({ provider, secrets });
-  },
-  onSuccess: (res: any) => {
-    pdTestResult.value = { ok: true, message: res?.message || '连接成功' };
-    message.success(res?.message || '连接成功');
-  },
-  onError: (err: any) => {
-    pdTestResult.value = { ok: false, message: String(err) };
-    message.error(String(err));
-  },
-});
 
 async function runPlatformCheck() {
   platformCheckFetching.value = true;
@@ -2413,7 +2265,6 @@ const tableScrollX = computed(() =>
         <NButton
           size="small"
           secondary
-          :disabled="pdCertOptions.length === 0"
           :title="'把面板证书上传到七牛云 / 又拍云并绑定 CDN 域名'"
           @click="openPlatformDeploy()"
         >
@@ -3057,124 +2908,12 @@ const tableScrollX = computed(() =>
       :initial-domains-text="addZoneInitialText"
     />
 
-    <!-- Platform Deploy Modal (七牛云 / 又拍云) -->
-    <NModal v-model:show="showPlatformDeploy" preset="dialog" title="上传证书到平台" :mask-closable="false" style="max-width: 560px;">
-      <div class="space-y-4 pt-2">
-        <NAlert type="info" :bordered="false">
-          读取面板已签发的证书（Let's Encrypt / 腾讯云）上传到七牛云或又拍云，并自动绑定到指定 CDN 域名。
-          acme.sh 自动续期成功后会自动重新上传新证书并替换。
-        </NAlert>
-        <NFormItem label="选择证书" required>
-          <NSelect v-model:value="pdCertId" :options="pdCertOptions" filterable placeholder="选择面板中已签发的证书" />
-        </NFormItem>
-        <NFormItem label="目标平台" required>
-          <NSelect
-            v-model:value="pdProvider"
-            :options="[
-              { label: '七牛云（官方 API · AccessKey）', value: 'qiniu' },
-              { label: '又拍云（模拟登录 · 账号密码）', value: 'upyun' },
-              { label: '腾讯云（SSL 证书库 + CDN 域名绑定）', value: 'tencent' },
-            ]"
-          />
-        </NFormItem>
-        <NFormItem label="平台凭证" required>
-          <div class="w-full space-y-2">
-            <NSelect
-              v-model:value="pdCredId"
-              :options="pdCredentialOptions"
-              :placeholder="pdProvider === 'qiniu' ? '选择七牛云 AccessKey 凭证' : pdProvider === 'upyun' ? '选择又拍云账号凭证' : '选择腾讯云凭证（SSL 专属或 DNS 共用）'"
-            />
-            <div class="flex items-center gap-2">
-              <NButton
-                v-if="pdProvider !== 'tencent'"
-                size="tiny" quaternary type="primary"
-                @click="showPdQuickAdd = !showPdQuickAdd"
-              >
-                <template #icon><Plus :size="12" /></template>
-                {{ showPdQuickAdd ? '收起' : '快速添加凭证' }}
-              </NButton>
-              <span v-if="pdProvider === 'tencent'" class="text-xs text-slate-400">
-                腾讯云复用「腾讯云 SSL / DNSPod」凭证，无需单独创建
-              </span>
-              <span v-else-if="pdCredentialOptions.length === 0" class="text-xs text-amber-600">
-                还没有{{ PLATFORM_LABELS[pdProvider] }}凭证，请先添加
-              </span>
-            </div>
-            <div v-if="showPdQuickAdd" class="space-y-2 rounded-xl border border-panel-border bg-panel-bg p-3">
-              <NInput v-model:value="pdQuickName" size="small" placeholder="凭证名称，如：七牛云主账号" />
-              <NInput v-model:value="pdQuickKey1" size="small" :placeholder="pdProvider === 'qiniu' ? 'AccessKey' : '登录账号'" />
-              <NInput
-                v-model:value="pdQuickKey2"
-                size="small"
-                type="password"
-                show-password-on="click"
-                :placeholder="pdProvider === 'qiniu' ? 'SecretKey' : '登录密码'"
-              />
-              <p v-if="pdProvider === 'upyun'" class="text-xs text-amber-600">
-                又拍云没有官方证书 API，将使用账号密码模拟登录控制台；若账号开启验证码/两步验证会失败，需手动到控制台更新。
-              </p>
-              <div class="flex items-center gap-2">
-                <NButton size="tiny" secondary :loading="pdTestMutation.isPending.value" @click="pdTestMutation.mutate()">
-                  测试连接
-                </NButton>
-                <NButton
-                  size="tiny" type="primary"
-                  :loading="pdQuickAddMutation.isPending.value"
-                  :disabled="!pdTestResult?.ok"
-                  :title="pdTestResult?.ok ? '连接已验证，保存凭证' : '请先点击「测试连接」，成功后才能保存'"
-                  @click="pdQuickAddMutation.mutate()"
-                >
-                  保存
-                </NButton>
-                <NTag v-if="pdTestResult" size="tiny" :bordered="false" :type="pdTestResult.ok ? 'success' : 'error'">
-                  {{ pdTestResult.ok ? '连接成功' : '连接失败' }}
-                </NTag>
-              </div>
-              <p v-if="pdTestResult && !pdTestResult.ok" class="break-all text-xs text-red-500">{{ pdTestResult.message }}</p>
-            </div>
-          </div>
-        </NFormItem>
-        <NFormItem label="绑定域名" required>
-          <NInput
-            v-model:value="pdDomains"
-            type="textarea"
-            :rows="2"
-            :placeholder="(pdCertNames[0] || 'cdn.example.com') + '，多个域名用逗号分隔'"
-          />
-          <p class="mt-1 text-xs text-slate-400">
-            证书覆盖：{{ pdCertNames.join('、') || '-' }}；只能绑定证书覆盖范围内的域名
-          </p>
-          <div v-if="pdProvider === 'upyun'" class="mt-2 w-full">
-            <p class="mb-1 text-xs text-slate-500">
-              你又拍云账号下已接入的域名（点击快选）：
-              <span v-if="upyunAccountDomains.length === 0" class="text-amber-600">加载中/暂无</span>
-            </p>
-            <div class="flex flex-wrap gap-1">
-              <NTag
-                v-for="d in upyunAccountDomains"
-                :key="d.domain"
-                size="tiny"
-                :bordered="false"
-                :type="pdCertNames.includes(d.domain) ? 'success' : 'default'"
-                :class="pdCertNames.includes(d.domain) ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'"
-                @click="pdCertNames.includes(d.domain) && addPdDomain(d.domain)"
-              >{{ d.domain }}（{{ d.bucket }}）</NTag>
-            </div>
-          </div>
-        </NFormItem>
-      </div>
-      <template #action>
-        <NButton @click="showPlatformDeploy = false">取消</NButton>
-        <NButton
-          type="primary"
-          :loading="pdDeployMutation.isPending.value"
-          :disabled="!pdCertId || !pdCredId || !pdDomains.trim()"
-          @click="pdDeployMutation.mutate()"
-        >
-          上传并绑定
-        </NButton>
-      </template>
-    </NModal>
+    <!-- Platform Deploy Modal (七牛云 / 又拍云 · 与平台部署页共用同一组件) -->
+    <PlatformDeployModal
+      v-model:show="showPlatformDeploy"
+      :initial-cert-id="platformDeployInitialCertId"
+      @deployed="onPlatformDeployed"
+    />
 
     <!-- Upload Modal -->
     <NModal v-model:show="showUpload" preset="dialog" title="上传第三方证书" :mask-closable="false" style="max-width: 560px;">

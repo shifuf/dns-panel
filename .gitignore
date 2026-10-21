@@ -47,3 +47,6 @@ _ins_app.py
 
 # Local runtime database & backups (never commit)
 backend/db/
+
+# Local backup snapshots
+backend/backups/

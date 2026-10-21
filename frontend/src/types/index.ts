@@ -254,6 +254,14 @@ export interface SystemSettings {
   backupFilePrefix?: string;
   backupWriteServerCopy?: boolean;
   databasePath?: string;
+  backupWebdavEnabled?: boolean;
+  backupWebdavUrl?: string;
+  backupWebdavUsername?: string;
+  backupWebdavHasPassword?: boolean;
+  backupWebdavAuto?: boolean;
+  backupWebdavAutoHour?: number;
+  backupWebdavKeep?: number;
+  backupWebdavLastResult?: { at: string; trigger?: string; ok?: boolean; message?: string; users?: Array<{ userId: number; username: string; ok: boolean; filename?: string; error?: string }> } | null;
 }
 
 export interface BackupPayload {

@@ -186,4 +186,17 @@ docker compose up -d --force-recreate frontend
 docker compose up -d redis
 
 ok "release 更新完成: $RELEASE_TAG"
-log "验证方式: curl http://127.0.0.1:4001/health"
+# 探测本机对外 IP（公网优先，失败回退内网 IP），方便直接复制验证命令
+detect_ip() {
+    local pub lan
+    for svc in "https://api.ipify.org" "https://ifconfig.me" "https://ip.3322.net" "https://myip.ipip.net"; do
+        pub="$(curl -fsSL --connect-timeout 4 --max-time 8 "$svc" 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)" && [ -n "$pub" ] && { echo "$pub"; return 0; }
+    done
+    lan="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [ -n "$lan" ] && { echo "$lan"; return 0; }
+    echo "127.0.0.1"
+}
+SERVER_IP="$(detect_ip)"
+log "验证方式: curl http://${SERVER_IP}:4001/health"
+log "面板地址: http://${SERVER_IP}:8080"
+[ "${SERVER_IP}" != "127.0.0.1" ] || log "（未能探测到公网/内网 IP，请用服务器实际 IP 替换 127.0.0.1）"

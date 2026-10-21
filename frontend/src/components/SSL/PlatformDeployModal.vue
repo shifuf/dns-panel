@@ -124,7 +124,8 @@
           <div v-if="pdProvider === 'upyun'" class="pt-1">
             <p class="mb-1 text-xs text-slate-500">
               你又拍云账号下已接入的域名（点击快选）：
-              <span v-if="upyunDomains.length === 0" class="text-amber-600">加载中/暂无</span>
+              <span v-if="upyunError" class="text-red-500">加载失败：{{ upyunError }}</span>
+              <span v-else-if="upyunDomains.length === 0" class="text-amber-600">暂无（保存凭证后会自动重新获取）</span>
             </p>
             <div class="flex flex-wrap gap-1">
               <NTag
@@ -169,7 +170,7 @@ import {
 import type { PlatformCredential, PlatformDeploymentsResponse, UpyunAccountDomain, PlatformDeployment } from '@/services/ssl';
 import type { SslCertificate } from '@/types/ssl';
 
-const props = defineProps<{ show: boolean }>();
+const props = defineProps<{ show: boolean; initialCertId?: string | null }>();
 const emit = defineEmits<{ (e: 'update:show', v: boolean): void; (e: 'deployed'): void }>();
 const message = useMessage();
 const queryClient = useQueryClient();
@@ -196,12 +197,16 @@ const { data: allIssuedCerts } = useQuery({
   staleTime: 30_000,
 });
 
-const { data: platformDeploymentsData } = useQuery({
+const { data: platformDeploymentsData, refetch: refetchDeployments } = useQuery({
   queryKey: ['ssl-platform-deployments'],
   queryFn: async (): Promise<PlatformDeploymentsResponse | undefined> => {
     const res = await getPlatformDeployments();
     return res.data;
   },
+  // 弹窗打开时重新拉取：刚保存的又拍云凭证要立刻渲染出已接入域名
+  enabled: computed(() => props.show),
+  staleTime: 0,
+  refetchOnMount: 'always',
 });
 const platformDeployments = computed<PlatformDeployment[]>(() => {
   const payload = platformDeploymentsData.value as unknown as { deployments?: PlatformDeployment[] } | PlatformDeployment[] | undefined;
@@ -209,6 +214,7 @@ const platformDeployments = computed<PlatformDeployment[]>(() => {
   return payload?.deployments || [];
 });
 const upyunDomains = computed<UpyunAccountDomain[]>(() => platformDeploymentsData.value?.upyunDomains || []);
+const upyunError = computed(() => platformDeploymentsData.value?.upyunError || '');
 
 const { data: platformCredentials } = useQuery({
   queryKey: ['ssl-platform-credentials'],
@@ -260,6 +266,12 @@ watch(() => props.show, (visible) => {
   if (visible) {
     testResult.value = null;
     showQuickAdd.value = false;
+    // 从证书列表页带着具体证书进来时，预选该证书并填入其主域名
+    if (props.initialCertId) {
+      pdCertId.value = props.initialCertId;
+      const cert = (allIssuedCerts.value || []).find(c => c.remoteCertId === props.initialCertId);
+      pdDomains.value = cert?.domain || '';
+    }
   }
 });
 
@@ -346,6 +358,7 @@ const quickAddMutation = useMutation({
     message.success(res?.message || '平台凭证已添加');
     testResult.value = null;
     queryClient.invalidateQueries({ queryKey: ['ssl-platform-credentials'] });
+    queryClient.invalidateQueries({ queryKey: ['ssl-platform-deployments'] });
     showQuickAdd.value = false;
     qName.value = ''; qKey1.value = ''; qKey2.value = '';
     setTimeout(() => {

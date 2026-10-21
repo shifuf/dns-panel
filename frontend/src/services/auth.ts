@@ -196,6 +196,13 @@ export const updateSystemSettings = async (params: {
   backupSnapshotDir?: string;
   backupFilePrefix?: string;
   backupWriteServerCopy?: boolean;
+  backupWebdavEnabled?: boolean;
+  backupWebdavUrl?: string;
+  backupWebdavUsername?: string;
+  backupWebdavPassword?: string;
+  backupWebdavAuto?: boolean;
+  backupWebdavAutoHour?: number;
+  backupWebdavKeep?: number;
 }): Promise<ApiResponse> => {
   return api.put('/auth/system-settings', params);
 };
@@ -212,4 +219,39 @@ export const restoreBackup = async (params: {
   overwrite?: boolean;
 }): Promise<ApiResponse<{ restored: Record<string, number> }>> => {
   return api.post('/auth/backup/restore', params);
+};
+
+// ── WebDAV 远端备份 ─────────────────────────────────────────────
+export interface WebdavBackupFile {
+  name: string;
+  size?: number | null;
+  lastModified?: string;
+}
+
+export interface WebdavBackupResult {
+  at: string;
+  trigger?: string;
+  ok?: boolean;
+  message?: string;
+  users?: Array<{ userId: number; username: string; ok: boolean; filename?: string; error?: string; scopes?: string[] }>;
+}
+
+export const testWebdav = async (params: { url: string; username?: string; password?: string }): Promise<ApiResponse<{ ok: boolean }>> => {
+  return api.post('/auth/backup/webdav/test', params);
+};
+
+export const syncWebdavBackup = async (): Promise<ApiResponse<WebdavBackupResult>> => {
+  return api.post('/auth/backup/webdav/sync', {});
+};
+
+export const listWebdavBackups = async (): Promise<ApiResponse<{ backups: WebdavBackupFile[] }>> => {
+  return api.get('/auth/backup/webdav/list');
+};
+
+export const restoreWebdavBackup = async (params: { filename: string }): Promise<ApiResponse<{ restored: Record<string, number> }>> => {
+  return api.post('/auth/backup/webdav/restore', params);
+};
+
+export const getWebdavStatus = async (): Promise<ApiResponse<{ lastResult: WebdavBackupResult | null; lastDate: string }>> => {
+  return api.get('/auth/backup/webdav/status');
 };

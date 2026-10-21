@@ -447,6 +447,21 @@ def _auth_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             set_system_setting("backup_file_prefix", sanitize_backup_file_prefix(str(body.get("backupFilePrefix") or "")))
         if "backupWriteServerCopy" in body:
             set_system_setting("backup_write_server_copy", "1" if bool(body.get("backupWriteServerCopy")) else "0")
+        if "backupWebdavEnabled" in body:
+            set_system_setting("backup_webdav_enabled", "1" if bool(body.get("backupWebdavEnabled")) else "0")
+        if "backupWebdavUrl" in body:
+            set_system_setting("backup_webdav_url", str(body.get("backupWebdavUrl") or "").strip().rstrip("/"))
+        if "backupWebdavUsername" in body:
+            set_system_setting("backup_webdav_username", str(body.get("backupWebdavUsername") or "").strip())
+        if body.get("backupWebdavPassword"):
+            # 密码加密存储；空字符串表示保持原密码不变
+            set_system_setting("backup_webdav_password", encrypt_text(str(body.get("backupWebdavPassword"))))
+        if "backupWebdavAuto" in body:
+            set_system_setting("backup_webdav_auto", "1" if bool(body.get("backupWebdavAuto")) else "0")
+        if "backupWebdavAutoHour" in body:
+            set_system_setting("backup_webdav_auto_hour", str(p_int(body.get("backupWebdavAutoHour"), 3, 23)))
+        if "backupWebdavKeep" in body:
+            set_system_setting("backup_webdav_keep", str(p_int(body.get("backupWebdavKeep"), 30, 3650)))
         if "registrationOpen" in body:
             set_system_setting("registration_open", "1" if bool(body.get("registrationOpen")) else "0")
         self._ok(None, "系统设置已更新")
@@ -488,6 +503,15 @@ def _auth_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             payload["snapshotPath"] = snapshot_path
         if snapshot_error:
             payload["snapshotError"] = snapshot_error
+        # WebDAV 已启用时同步上传这份备份到远端。
+        try:
+            webdav_settings = get_backup_webdav_settings()
+            if webdav_settings["enabled"] and webdav_settings["url"]:
+                upload_backup_to_webdav(backup, filename)
+                payload["webdavUploaded"] = True
+        except Exception as exc:
+            payload["webdavUploaded"] = False
+            payload["webdavError"] = str(exc)[:300]
         self._ok(payload, "备份已生成")
         return
 
@@ -525,6 +549,129 @@ def _auth_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         except Exception:
             pass
         self._ok({"restored": restored}, "恢复完成")
+        return
+
+    # ── WebDAV 远端备份 ─────────────────────────────────────────
+    # POST /api/auth/backup/webdav/test — 测试 WebDAV 连接
+    if self.command == "POST" and sub == "/backup/webdav/test":
+        if not is_admin_user_id(uid):
+            self._err("需要管理员权限", 403)
+            return
+        url = str(body.get("url") or "").strip().rstrip("/")
+        username = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "")
+        if not url.startswith(("http://", "https://")):
+            self._err("WebDAV 地址需以 http:// 或 https:// 开头", 400)
+            return
+        # 临时用表单值测试（密码留空则用已保存密码）
+        saved = get_backup_webdav_settings()
+        test_settings = dict(saved)
+        test_settings["url"] = url
+        test_settings["username"] = username
+        if password:
+            test_settings["password"] = password
+        def _test_request(method: str, target: str, *, content=None, headers=None, timeout=20):
+            req = urllib.request.Request(target, method=method, data=content)
+            if test_settings.get("username"):
+                token = base64.b64encode(f"{test_settings['username']}:{test_settings['password']}".encode("utf-8")).decode("ascii")
+                req.add_header("Authorization", "Basic " + token)
+            for k, v in (headers or {}).items():
+                req.add_header(k, v)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as exc:
+                return exc.code, b""
+            except Exception as exc:
+                raise ValueError(str(exc))
+        try:
+            status, _ = _test_request("PROPFIND", url + "/", headers={"Depth": "0"})
+            if status in (200, 207):
+                self._ok({"ok": True}, "WebDAV 连接成功")
+                return
+            if status in (401, 403):
+                self._err("WebDAV 认证失败（用户名或密码错误）", 400)
+                return
+            self._err(f"WebDAV 连接失败（HTTP {status}），请检查地址是否为目录 URL", 400)
+            return
+        except ValueError as exc:
+            self._err(f"WebDAV 连接失败: {exc}", 400)
+            return
+        except Exception as exc:
+            self._err(f"WebDAV 连接失败: {exc}", 400)
+            return
+
+    # POST /api/auth/backup/webdav/sync — 立即执行全量备份并上传 WebDAV
+    if self.command == "POST" and sub == "/backup/webdav/sync":
+        if not is_admin_user_id(uid):
+            self._err("需要管理员权限", 403)
+            return
+        result = run_webdav_full_backup(trigger="manual")
+        if result.get("ok"):
+            self._ok(result, result.get("message") or "全量备份已上传")
+        else:
+            self._err(result.get("message") or "备份上传失败", 500)
+        return
+
+    # GET /api/auth/backup/webdav/list — 列出远端备份文件
+    if self.command == "GET" and sub in ("/backup/webdav/list", "/backup/webdav/list/"):
+        if not is_admin_user_id(uid):
+            self._err("需要管理员权限", 403)
+            return
+        try:
+            items = list_webdav_backups()
+        except ValueError as exc:
+            self._err(str(exc), 400)
+            return
+        except Exception as exc:
+            self._err(f"WebDAV 列表获取失败: {exc}", 400)
+            return
+        self._ok({"backups": items}, f"获取 {len(items)} 个远端备份")
+        return
+
+    # POST /api/auth/backup/webdav/restore — 从远端备份恢复
+    if self.command == "POST" and sub == "/backup/webdav/restore":
+        if not is_admin_user_id(uid):
+            self._err("需要管理员权限", 403)
+            return
+        filename = str(body.get("filename") or "").strip()
+        try:
+            payload = fetch_webdav_backup(filename)
+        except ValueError as exc:
+            self._err(str(exc), 400)
+            return
+        except Exception as exc:
+            self._err(f"备份下载失败: {exc}", 400)
+            return
+        try:
+            restored = restore_backup_payload(uid, payload, ["dns", "ssl"], True)
+        except ValueError as e:
+            self._err(str(e), 400)
+            return
+        try:
+            create_log(
+                user_id=uid,
+                action="RESTORE",
+                resource_type="BACKUP",
+                status="SUCCESS",
+                record_name=f"webdav_restore:{filename[:80]}",
+                ip_address=ip,
+                new_value=json.dumps({"restored": restored}, ensure_ascii=False),
+            )
+        except Exception:
+            pass
+        self._ok({"restored": restored}, f"已从 {filename} 恢复")
+        return
+
+    # GET /api/auth/backup/webdav/status — 最近一次自动/手动备份结果
+    if self.command == "GET" and sub in ("/backup/webdav/status", "/backup/webdav/status/"):
+        if not is_admin_user_id(uid):
+            self._err("需要管理员权限", 403)
+            return
+        self._ok({
+            "lastResult": safe_json_loads(get_system_setting("backup_webdav_last_result", "")) or None,
+            "lastDate": get_system_setting("backup_webdav_last_date", ""),
+        }, "获取 WebDAV 备份状态成功")
         return
 
     if self.command == "GET" and sub == "/2fa/status":
@@ -12768,10 +12915,17 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             # 又拍云：附带账号下的域名清单（供前端绑定域快选）。
             # covered 标志预计算好通配符匹配，前端不用自己展开 *.domain。
             upyun_domains: List[Dict[str, Any]] = []
+            upyun_error = ""
             try:
-                upyun_cred = next((r for r in rows if str(r["provider"] or "").lower() == "upyun"), None)
-                if upyun_cred is not None:
-                    cred_row_d, _, secrets_d = _platform_credential_row(self, uid, upyun_cred["credentialId"])
+                # 凭证直接从 dns_credentials 找：刚保存账号还没有部署记录时，
+                # 之前的实现从部署行里找凭证，导致域名列表永远拿不到。
+                with conn() as _c_up:
+                    upyun_cred_row = _c_up.execute(
+                        "SELECT id FROM dns_credentials WHERE userId = ? AND provider = 'upyun' ORDER BY createdAt ASC LIMIT 1",
+                        (uid,),
+                    ).fetchone()
+                if upyun_cred_row is not None:
+                    cred_row_d, _, secrets_d = _platform_credential_row(self, uid, upyun_cred_row["id"])
                     upyun_domains = _build_platform_api("upyun", secrets_d).list_account_domains()
                     # 用所有已签发证书的名字集合判断覆盖。
                     with conn() as _c3:
@@ -12793,8 +12947,10 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         dn = _norm_host(ud.get("domain") or "")
                         covered = any(_wildcard_covers(n, dn) for n in all_names_d if n)
                         ud["covered"] = covered
-            except Exception:
+            except Exception as exc:
                 upyun_domains = []
+                # 把真实原因告诉前端，避免「加载中」死循环猜不出来。
+                upyun_error = str(exc)[:200]
             # EdgeOne 加速绑定并入同一视图（provider=edgeone）。
             # 绑定状态以 EdgeOne API 实时读取为准（acceleration_cert_bindings
             # 会被证书去重/清理任务维护，不可靠），所以这里直接扫描账号下
@@ -12917,6 +13073,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 "deployments": items,
                 "overview": overview,
                 "upyunDomains": upyun_domains,
+        "upyunError": upyun_error,
             }, "获取平台部署记录成功")
             return
 

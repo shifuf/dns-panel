@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue';
-import { NCheckbox, NInput, NButton, NSwitch, NRadioGroup, NRadio, useMessage, NTabs, NTab } from 'naive-ui';
-import { Save, Info, Download, Upload, Database, RefreshCw } from 'lucide-vue-next';
+import { NCheckbox, NInput, NInputNumber, NSelect, NButton, NSwitch, NRadioGroup, NRadio, NTag, NEmpty, useDialog, useMessage, NTabs, NTab } from 'naive-ui';
+import { Save, Info, Download, Upload, Database, RefreshCw, CloudUpload } from 'lucide-vue-next';
 import { useQueryClient } from '@tanstack/vue-query';
 import type { BackupPayload } from '@/types';
-import { getStoredUser, updatePassword, updateDomainExpirySettings, saveAuthData, getSystemSettings, updateSystemSettings, exportBackup, restoreBackup } from '@/services/auth';
+import { getStoredUser, updatePassword, updateDomainExpirySettings, saveAuthData, getSystemSettings, updateSystemSettings, exportBackup, restoreBackup , testWebdav, syncWebdavBackup, listWebdavBackups, restoreWebdavBackup, getWebdavStatus} from '@/services/auth';
 import { isStrongPassword } from '@/utils/validators';
 import { TABLE_PAGE_SIZE } from '@/utils/constants';
 import TwoFactorSettings from '@/components/Settings/TwoFactorSettings.vue';
@@ -20,6 +20,7 @@ const route = useRoute();
 const activeTab = ref(String(route.query.tab || 'general'));
 
 const message = useMessage();
+const dialog = useDialog();
 const queryClient = useQueryClient();
 const providerStore = useProviderStore();
 const user = getStoredUser();
@@ -60,6 +61,22 @@ const retryTimeoutSeconds = ref('15');
 const backupSnapshotDir = ref('');
 const backupFilePrefix = ref('dns-panel-backup');
 const backupWriteServerCopy = ref(true);
+// WebDAV 远端备份
+const webdavEnabled = ref(false);
+const webdavUrl = ref('');
+const webdavUsername = ref('');
+const webdavPassword = ref('');
+const webdavAuto = ref(false);
+const webdavAutoHour = ref(3);
+const webdavKeep = ref(30);
+const webdavSaving = ref(false);
+const webdavTesting = ref(false);
+const webdavSyncing = ref(false);
+const webdavListLoading = ref(false);
+const webdavBackups = ref<Array<{ name: string; size?: number | null; lastModified?: string }>>([]);
+const webdavLastResult = ref<any>(null);
+const webdavRestoringName = ref('');
+const webdavPasswordHasBeenSet = ref(false);
 const databasePath = ref('');
 const backupDns = ref(true);
 const backupSsl = ref(true);
@@ -82,6 +99,15 @@ function applySystemSettings(settings: any) {
   backupSnapshotDir.value = String(settings?.backupSnapshotDir || '');
   backupFilePrefix.value = String(settings?.backupFilePrefix || 'dns-panel-backup');
   backupWriteServerCopy.value = settings?.backupWriteServerCopy !== false;
+  webdavEnabled.value = settings?.backupWebdavEnabled === true;
+  webdavUrl.value = String(settings?.backupWebdavUrl || '');
+  webdavUsername.value = String(settings?.backupWebdavUsername || '');
+  webdavPassword.value = '';
+  webdavAuto.value = settings?.backupWebdavAuto === true;
+  webdavAutoHour.value = Number(settings?.backupWebdavAutoHour ?? 3);
+  webdavKeep.value = Number(settings?.backupWebdavKeep ?? 30);
+  webdavLastResult.value = settings?.backupWebdavLastResult || null;
+  webdavPasswordHasBeenSet.value = settings?.backupWebdavHasPassword === true;
   databasePath.value = String(settings?.databasePath || '');
   registrationOpen.value = Boolean(settings?.registrationOpen);
 }
@@ -293,6 +319,105 @@ async function saveExpirySettings() {
   } finally {
     expirySaving.value = false;
   }
+}
+
+// ── WebDAV 备份操作 ──
+async function saveWebdavSettings() {
+  if (webdavEnabled.value && !/^https?:\/\//.test(webdavUrl.value.trim())) {
+    message.error('WebDAV 地址需以 http:// 或 https:// 开头');
+    return;
+  }
+  webdavSaving.value = true;
+  try {
+    const params: Record<string, any> = {
+      backupWebdavEnabled: webdavEnabled.value,
+      backupWebdavUrl: webdavUrl.value.trim(),
+      backupWebdavUsername: webdavUsername.value.trim(),
+      backupWebdavAuto: webdavAuto.value,
+      backupWebdavAutoHour: webdavAutoHour.value,
+      backupWebdavKeep: webdavKeep.value,
+    };
+    if (webdavPassword.value) params.backupWebdavPassword = webdavPassword.value;
+    await updateSystemSettings(params as any);
+    const sysRes = await getSystemSettings();
+    applySystemSettings((sysRes as any)?.data || sysRes);
+    message.success('WebDAV 设置已保存');
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    webdavSaving.value = false;
+  }
+}
+
+async function testWebdavConnection() {
+  if (!/^https?:\/\//.test(webdavUrl.value.trim())) {
+    message.error('WebDAV 地址需以 http:// 或 https:// 开头');
+    return;
+  }
+  webdavTesting.value = true;
+  try {
+    const res = await testWebdav({ url: webdavUrl.value.trim(), username: webdavUsername.value.trim(), password: webdavPassword.value || undefined });
+    message.success(res?.message || 'WebDAV 连接成功');
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    webdavTesting.value = false;
+  }
+}
+
+async function runWebdavSync() {
+  webdavSyncing.value = true;
+  try {
+    const res = await syncWebdavBackup();
+    message.success(res?.message || '全量备份已上传到 WebDAV');
+    const s = await getWebdavStatus();
+    webdavLastResult.value = s.data?.lastResult || null;
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    webdavSyncing.value = false;
+  }
+}
+
+async function loadWebdavBackups() {
+  webdavListLoading.value = true;
+  try {
+    const res = await listWebdavBackups();
+    webdavBackups.value = res.data?.backups || [];
+  } catch (err: any) {
+    message.error(String(err));
+  } finally {
+    webdavListLoading.value = false;
+  }
+}
+
+async function restoreFromWebdav(filename: string) {
+  dialog.warning({
+    title: '从 WebDAV 恢复',
+    content: `将用远端备份「${filename}」覆盖恢复 DNS 与 SSL 数据（含 EdgeOne 加速绑定），确定继续？`,
+    positiveText: '恢复',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      webdavRestoringName.value = filename;
+      try {
+        const res = await restoreWebdavBackup({ filename });
+        message.success(res?.message || '恢复完成');
+        await refreshRestoredData();
+      } catch (err: any) {
+        message.error(String(err));
+      } finally {
+        webdavRestoringName.value = '';
+      }
+    },
+  });
+}
+
+function formatWebdavResult(result: any): string {
+  if (!result) return '暂无记录';
+  const when = String(result.at || '').replace('T', ' ').slice(0, 19);
+  const users = Array.isArray(result.users) ? result.users : [];
+  if (!users.length) return `${when} · ${result.message || (result.ok ? '成功' : '失败')}`;
+  return `${when} · ${result.message || ''} ` + users.map((u: any) => `${u.username}: ${u.ok ? '✓' : '✗ ' + (u.error || '')}`).join('；');
 }
 
 async function refreshRestoredData() {
@@ -709,6 +834,91 @@ async function handleRestoreBackup() {
 
       <!-- 备份选项卡 -->
       <div v-if="activeTab === 'backup'" class="settings-tab-content">
+        <!-- WebDAV 远端备份 -->
+        <div v-if="isAdmin" class="bento-card mt-4">
+          <div class="flex flex-wrap items-center gap-3">
+            <div class="settings-icon-wrap bg-[#ebf4ff] text-[#2563eb]">
+              <CloudUpload :size="18" />
+            </div>
+            <div class="min-w-0 flex-1">
+              <p class="bento-section-title">WebDAV 远端备份</p>
+              <p class="bento-section-meta">自动全量备份（DNS + SSL + EdgeOne 加速绑定/缓存 + acme.sh 运行时）到坚果云 / 群晖 / Alist 等 WebDAV 存储</p>
+            </div>
+            <NSwitch v-model:value="webdavEnabled" size="small" />
+          </div>
+
+          <div v-if="webdavEnabled" class="mt-4 space-y-4">
+            <div class="grid gap-4 md:grid-cols-2">
+              <div class="settings-subpanel md:col-span-2">
+                <p class="settings-subpanel-label">WebDAV 地址（目录 URL）</p>
+                <NInput v-model:value="webdavUrl" placeholder="https://dav.jianguoyun.com/dns-panel-backup/" size="small" />
+              </div>
+              <div class="settings-subpanel">
+                <p class="settings-subpanel-label">账号</p>
+                <NInput v-model:value="webdavUsername" placeholder="WebDAV 用户名" size="small" />
+              </div>
+              <div class="settings-subpanel">
+                <p class="settings-subpanel-label">密码 / 应用密码</p>
+                <NInput
+                  v-model:value="webdavPassword"
+                  type="password"
+                  show-password-on="click"
+                  :placeholder="webdavPasswordHasBeenSet ? '已保存（输入新值可修改）' : 'WebDAV 密码'"
+                  size="small"
+                />
+              </div>
+            </div>
+            <div class="grid gap-4 md:grid-cols-3">
+              <div class="settings-subpanel">
+                <p class="settings-subpanel-label">每日自动全量备份</p>
+                <NSwitch v-model:value="webdavAuto" size="small" />
+              </div>
+              <div class="settings-subpanel">
+                <p class="settings-subpanel-label">自动备份时间（点）</p>
+                <NSelect
+                  v-model:value="webdavAutoHour"
+                  size="small"
+                  :options="Array.from({ length: 24 }, (_, h) => ({ label: `每天 ${String(h).padStart(2, '0')}:00`, value: h }))"
+                />
+              </div>
+              <div class="settings-subpanel">
+                <p class="settings-subpanel-label">远端保留份数</p>
+                <NInputNumber v-model:value="webdavKeep" size="small" :min="1" :max="3650" class="!w-full" />
+              </div>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <NButton size="small" type="primary" :loading="webdavSaving" @click="saveWebdavSettings">
+                <template #icon><Save :size="14" /></template>
+                保存 WebDAV 设置
+              </NButton>
+              <NButton size="small" secondary :loading="webdavTesting" @click="testWebdavConnection">测试连接</NButton>
+              <NButton size="small" secondary :loading="webdavSyncing" @click="runWebdavSync">
+                <template #icon><CloudUpload :size="14" /></template>
+                立即全量备份
+              </NButton>
+              <NButton size="small" quaternary :loading="webdavListLoading" @click="loadWebdavBackups">查看远端备份</NButton>
+            </div>
+            <p class="text-xs text-slate-500">最近结果：{{ formatWebdavResult(webdavLastResult) }}</p>
+
+            <div v-if="webdavBackups.length" class="rounded-xl border border-panel-border">
+              <div
+                v-for="b in webdavBackups"
+                :key="b.name"
+                class="flex flex-wrap items-center gap-2 border-b border-panel-border px-3 py-2 text-xs last:border-0"
+              >
+                <span class="min-w-0 flex-1 truncate font-mono text-slate-600">{{ b.name }}</span>
+                <span v-if="b.size" class="text-slate-400">{{ (b.size / 1024).toFixed(0) }} KB</span>
+                <NButton size="tiny" quaternary type="primary" :loading="webdavRestoringName === b.name" @click="restoreFromWebdav(b.name)">
+                  恢复
+                </NButton>
+              </div>
+            </div>
+            <p class="text-xs text-slate-400">
+              说明：手动「导出备份」在 WebDAV 启用时也会同步上传一份；自动任务每天在设定时间点后 10 分钟内触发。
+            </p>
+          </div>
+        </div>
+
         <div v-if="isAdmin" class="bento-card overflow-hidden">
           <div class="settings-workbench">
             <div class="settings-workbench-head">

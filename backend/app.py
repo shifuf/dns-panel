@@ -374,6 +374,14 @@ def system_settings_payload() -> Dict[str, Any]:
         "backupFilePrefix": get_backup_file_prefix(),
         "backupWriteServerCopy": should_write_backup_server_copy(),
         "databasePath": str(DB),
+        "backupWebdavEnabled": get_system_setting("backup_webdav_enabled", "0") == "1",
+        "backupWebdavUrl": get_system_setting("backup_webdav_url", ""),
+        "backupWebdavUsername": get_system_setting("backup_webdav_username", ""),
+        "backupWebdavHasPassword": bool(get_system_setting("backup_webdav_password", "")),
+        "backupWebdavAuto": get_system_setting("backup_webdav_auto", "0") == "1",
+        "backupWebdavAutoHour": p_int(get_system_setting("backup_webdav_auto_hour", "3"), 3, 23),
+        "backupWebdavKeep": p_int(get_system_setting("backup_webdav_keep", "30"), 30, 3650),
+        "backupWebdavLastResult": safe_json_loads(get_system_setting("backup_webdav_last_result", "")) or None,
     }
 
 
@@ -388,6 +396,201 @@ def write_backup_snapshot_file(backup: Dict[str, Any], filename: str) -> str:
     target_path = target_dir / filename
     target_path.write_text(json.dumps(backup, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(target_path)
+
+
+# ── WebDAV 备份远端存储 ─────────────────────────────────────────
+def get_backup_webdav_settings() -> Dict[str, Any]:
+    enabled = get_system_setting("backup_webdav_enabled", "0") == "1"
+    url = get_system_setting("backup_webdav_url", "").strip().rstrip("/")
+    username = get_system_setting("backup_webdav_username", "").strip()
+    password = decrypt_text(get_system_setting("backup_webdav_password", ""))
+    auto = get_system_setting("backup_webdav_auto", "0") == "1"
+    hour = p_int(get_system_setting("backup_webdav_auto_hour", "3"), 3, 23)
+    keep = p_int(get_system_setting("backup_webdav_keep", "30"), 30, 3650)
+    return {
+        "enabled": enabled, "url": url, "username": username, "password": password,
+        "auto": auto, "hour": hour, "keep": keep,
+    }
+
+
+def _webdav_request(method: str, url: str, *, content: bytes | None = None,
+                    headers: Dict[str, str] | None = None, timeout: int = 30) -> tuple[int, bytes]:
+    """One WebDAV HTTP call with Basic auth. Returns (status, body)."""
+    settings = get_backup_webdav_settings()
+    req = urllib.request.Request(url, method=method, data=content)
+    if settings.get("username"):
+        token = base64.b64encode(f"{settings['username']}:{settings['password']}".encode("utf-8")).decode("ascii")
+        req.add_header("Authorization", "Basic " + token)
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read() if exc.fp else b""
+
+
+def _webdav_ensure_dir(url: str) -> None:
+    """MKCOL each missing path segment (best effort; many servers auto-create)."""
+    parts = [p for p in url.split("/") if p]
+    if not parts:
+        return
+    scheme = parts[0]
+    host = parts[1] if len(parts) > 1 else ""
+    built = f"{scheme}//{host}"
+    for segment in parts[2:]:
+        built += "/" + segment
+        status, _ = _webdav_request("MKCOL", built)
+        if status not in (200, 201, 405):  # 405 = already exists
+            # 目录创建失败不致命，PUT 时再真实报错
+            return
+
+
+def upload_backup_to_webdav(backup: Dict[str, Any], filename: str) -> str:
+    """Upload one backup JSON to the configured WebDAV target. Raises on failure."""
+    settings = get_backup_webdav_settings()
+    if not settings["enabled"] or not settings["url"]:
+        raise ValueError("WebDAV 备份未启用或未配置地址")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+\.json", filename):
+        raise ValueError("非法的备份文件名")
+    content = json.dumps(backup, ensure_ascii=False, indent=2).encode("utf-8")
+    url = settings["url"] + "/" + filename
+    status, body = _webdav_request("PUT", url, content=content, timeout=120)
+    if status in (409, 425):
+        # 部分服务器要求先建目录
+        _webdav_ensure_dir(settings["url"])
+        status, body = _webdav_request("PUT", url, content=content, timeout=120)
+    if status not in (200, 201, 204):
+        raise ValueError(f"WebDAV 上传失败（HTTP {status}）: {body[:200]!r}")
+    # 清理超出保留数量的旧备份（同前缀）
+    try:
+        files = list_webdav_backups()
+        prefix = get_backup_file_prefix()
+        same = [f for f in files if f["name"].startswith(prefix)]
+        same.sort(key=lambda f: f["name"], reverse=True)
+        for old in same[settings["keep"]:]:
+            _webdav_request("DELETE", settings["url"] + "/" + old["name"])
+    except Exception:
+        pass
+    return url
+
+
+def list_webdav_backups() -> List[Dict[str, Any]]:
+    settings = get_backup_webdav_settings()
+    if not settings["enabled"] or not settings["url"]:
+        raise ValueError("WebDAV 备份未启用或未配置地址")
+    status, body = _webdav_request(
+        "PROPFIND", settings["url"] + "/",
+        headers={"Depth": "1", "Content-Type": "application/xml"},
+    )
+    if status not in (200, 207):
+        raise ValueError(f"WebDAV 列表获取失败（HTTP {status}）")
+    text = body.decode("utf-8", errors="replace")
+    prefix = get_backup_file_prefix()
+    items: List[Dict[str, Any]] = []
+    href_pattern = re.compile(r"<[a-zA-Z0-9]*:?href>\s*([^<]+?)\s*</[a-zA-Z0-9]*:?href>", re.I)
+    for match in href_pattern.finditer(text):
+        href = urllib.parse.unquote(match.group(1)).strip("/")
+        name = href.rsplit("/", 1)[-1]
+        if not name.endswith(".json") or not name.startswith(prefix):
+            continue
+        block_start = match.end()
+        block = text[match.start():block_start + 2000]
+        size_match = re.search(r"<[a-zA-Z0-9]*:?getcontentlength>(\d+)", block, re.I)
+        date_match = re.search(r"<[a-zA-Z0-9]*:?getlastmodified>([^<]+)", block, re.I)
+        items.append({
+            "name": name,
+            "size": int(size_match.group(1)) if size_match else None,
+            "lastModified": date_match.group(1).strip() if date_match else "",
+        })
+    items.sort(key=lambda f: f["name"], reverse=True)
+    return items
+
+
+def fetch_webdav_backup(filename: str) -> Dict[str, Any]:
+    settings = get_backup_webdav_settings()
+    if not settings["enabled"] or not settings["url"]:
+        raise ValueError("WebDAV 备份未启用或未配置地址")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+\.json", filename):
+        raise ValueError("非法的备份文件名")
+    status, body = _webdav_request("GET", settings["url"] + "/" + filename, timeout=120)
+    if status != 200:
+        raise ValueError(f"WebDAV 下载失败（HTTP {status}）")
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"备份文件解析失败: {exc}")
+    if not isinstance(data, dict) or "data" not in data:
+        raise ValueError("不是有效的面板备份文件")
+    return data
+
+
+def _persist_webdav_last_result(result: Dict[str, Any]) -> None:
+    try:
+        set_system_setting("backup_webdav_last_result", json.dumps(result, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def run_webdav_full_backup(trigger: str = "manual") -> Dict[str, Any]:
+    """全量备份（DNS + SSL，含 EdgeOne 加速绑定/缓存与 acme.sh 运行时）并上传 WebDAV。
+
+    多用户部署时逐个用户导出上传（文件名带用户名）；单用户部署即等于全站备份。
+    """
+    settings = get_backup_webdav_settings()
+    result: Dict[str, Any] = {"at": now_iso(), "trigger": trigger, "ok": False, "users": []}
+    if not settings["enabled"] or not settings["url"]:
+        result["message"] = "WebDAV 备份未启用或未配置地址"
+        _persist_webdav_last_result(result)
+        return result
+    with conn() as c:
+        user_rows = c.execute("SELECT id, username FROM users ORDER BY id ASC").fetchall()
+    ok_count = 0
+    for row in user_rows:
+        uid = int(row["id"])
+        username = str(row["username"] or f"user{uid}")
+        entry: Dict[str, Any] = {"userId": uid, "username": username, "ok": False}
+        try:
+            backup = export_backup_payload(uid, ["dns", "ssl"])
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            filename = f"{get_backup_file_prefix()}-{username}-{stamp}.json"
+            upload_backup_to_webdav(backup, filename)
+            if should_write_backup_server_copy():
+                try:
+                    write_backup_snapshot_file(backup, filename)
+                except Exception:
+                    pass
+            entry["ok"] = True
+            entry["filename"] = filename
+            entry["scopes"] = backup.get("scopes") or []
+            ok_count += 1
+        except Exception as exc:
+            entry["error"] = str(exc)[:300]
+        result["users"].append(entry)
+    result["ok"] = ok_count > 0 and ok_count == len(user_rows)
+    result["message"] = f"已上传 {ok_count}/{len(user_rows)} 个用户的备份"
+    _persist_webdav_last_result(result)
+    return result
+
+
+def _backup_webdav_worker() -> None:
+    """Daily automatic full backup → WebDAV (checks every 10 minutes)."""
+    while True:
+        try:
+            settings = get_backup_webdav_settings()
+            if settings["enabled"] and settings["auto"] and settings["url"]:
+                now_dt = datetime.now()
+                today = now_dt.strftime("%Y-%m-%d")
+                last_date = get_system_setting("backup_webdav_last_date", "")
+                if now_dt.hour >= settings["hour"] and last_date != today:
+                    run_webdav_full_backup(trigger="auto")
+                    set_system_setting("backup_webdav_last_date", today)
+        except Exception as exc:
+            try:
+                print(f"[webdav-backup] worker error: {exc}")
+            except Exception:
+                pass
+        time.sleep(600)
 
 
 def cleanup_logs_older_than(retention_days: int | None = None) -> int:
@@ -559,7 +762,7 @@ def export_backup_payload(user_id: int, scopes: List[str]) -> Dict[str, Any]:
                 """
                 SELECT id, credentialId, provider, remoteCertId, domain, san, certType, productName,
                        status, statusMsg, issuer, notBefore, notAfter, dvAuthMethod, isUploaded,
-                       remoteCreatedAt, syncedAt, createdAt, updatedAt, autoRenew, autoRenewDays,
+                       remoteCreatedAt, syncedAt, createdAt, updatedAt, autoRenew,
                        lastRenewedAt, acmeCa
                 FROM ssl_certificates
                 WHERE userId = ? AND provider = 'acme'
@@ -569,8 +772,9 @@ def export_backup_payload(user_id: int, scopes: List[str]) -> Dict[str, Any]:
             ).fetchall() if table_exists('ssl_certificates') else []
             acme_job_rows = c.execute(
                 """
-                SELECT id, certificateId, credentialId, domain, ca, eabKid, eabHmac, status,
-                       attempts, lastError, createdAt, updatedAt, completedAt
+                SELECT id, certificateId, dnsCredentialId, domain, domains, keyLength, ca,
+                       eabKid, eabHmac, operation, status, attempts, error AS lastError,
+                       createdAt, updatedAt, completedAt
                 FROM ssl_acme_jobs
                 WHERE userId = ?
                 ORDER BY createdAt ASC, id ASC
@@ -879,8 +1083,9 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                             INSERT INTO ssl_certificates (
                               userId, credentialId, provider, remoteCertId, domain, san, certType, productName,
                               status, statusMsg, issuer, notBefore, notAfter, dvAuthMethod, isUploaded,
-                              remoteCreatedAt, syncedAt, createdAt, updatedAt
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              remoteCreatedAt, syncedAt, createdAt, updatedAt,
+                              autoRenew, lastRenewedAt, acmeCa
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 user_id,
@@ -902,6 +1107,9 @@ def restore_backup_payload(user_id: int, payload: Dict[str, Any], scopes: List[s
                                 item.get("syncedAt"),
                                 str(item.get("createdAt") or now_iso()),
                                 str(item.get("updatedAt") or now_iso()),
+                                1 if bool(item.get("autoRenew")) else 0,
+                                item.get("lastRenewedAt"),
+                                str(item.get("acmeCa") or ""),
                             ),
                         )
                         old_cert_id = int(item.get("id") or 0)
@@ -3544,6 +3752,7 @@ def main() -> None:
     threading.Thread(target=_ssl_acme_job_worker, daemon=True).start()
     threading.Thread(target=_ssl_task_cleanup_worker, daemon=True).start()
     threading.Thread(target=_acceleration_cert_worker, daemon=True).start()
+    threading.Thread(target=_backup_webdav_worker, daemon=True).start()
     threading.Thread(target=_domain_expiry_worker, daemon=True).start()
     threading.Thread(target=_alert_rules_worker, daemon=True).start()
     s = ThreadingHTTPServer(("0.0.0.0", PORT), H)
