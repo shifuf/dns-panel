@@ -69,8 +69,9 @@ services:
     volumes:
       # Release 更新模式：宿主机 frontend/dist 直接挂进 nginx（release-update.sh 维护）
       - ./frontend/dist:/usr/share/nginx/html:ro
+      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]
       interval: 10s
       timeout: 5s
       retries: 3

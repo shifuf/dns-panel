@@ -1,7 +1,10 @@
 import api from './api';
+import { clearSession, readSessionUser, saveSession } from './session';
 import { ApiResponse, BackupPayload, LoginResponse, SetupStatus, SystemSettings, User } from '@/types';
 
 let cachedSetupStatus: SetupStatus | null = null;
+let setupRequest: Promise<ApiResponse<SetupStatus>> | null = null;
+let setupVersion = 0;
 
 /**
  * 用户注册
@@ -40,11 +43,17 @@ export const getSetupStatus = async (force = false): Promise<ApiResponse<SetupSt
       data: cachedSetupStatus,
     };
   }
-  const res = await api.get('/auth/setup-status');
-  // Response interceptor already unwraps to ApiResponse.
-  const typed = res as unknown as ApiResponse<SetupStatus>;
-  cachedSetupStatus = res.data;
-  return typed;
+  if (!force && setupRequest) return setupRequest;
+  const version = ++setupVersion;
+  const request = api.get('/auth/setup-status').then(res => {
+    const typed = res as unknown as ApiResponse<SetupStatus>;
+    if (version === setupVersion) cachedSetupStatus = typed.data ?? null;
+    return typed;
+  }).finally(() => {
+    if (setupRequest === request) setupRequest = null;
+  });
+  setupRequest = request;
+  return request;
 };
 
 export const initializeSetup = async (params: {
@@ -54,6 +63,8 @@ export const initializeSetup = async (params: {
 }): Promise<LoginResponse> => {
   const res = await api.post('/auth/setup', params);
   const typed = res as unknown as LoginResponse;
+  setupVersion += 1;
+  setupRequest = null;
   cachedSetupStatus = { ...(typed.data || {}), setupComplete: true, hasUsers: true } as SetupStatus;
   return typed;
 };
@@ -151,24 +162,21 @@ export const updateCfToken = async (cfApiToken: string): Promise<ApiResponse> =>
  * 保存登录信息到本地存储
  */
 export const saveAuthData = (token: string, user: User) => {
-  localStorage.setItem('token', token);
-  localStorage.setItem('user', JSON.stringify(user));
+  saveSession(token, user);
 };
 
 /**
  * 清除登录信息
  */
 export const clearAuthData = () => {
-  localStorage.removeItem('token');
-  localStorage.removeItem('user');
+  clearSession();
 };
 
 /**
  * 获取本地存储的用户信息
  */
 export const getStoredUser = (): User | null => {
-  const userStr = localStorage.getItem('user');
-  return userStr ? JSON.parse(userStr) : null;
+  return readSessionUser<User>();
 };
 
 /**

@@ -43,7 +43,7 @@ import public
 
 __plugin_path = "/www/server/panel/plugin/dnspanel_ssl/"
 __config = None
-PLUGIN_VERSION = "2.1.0"
+PLUGIN_VERSION = "2.1.1"
 PLUGIN_LOG_TAG = "DNS panel SSL sync"
 
 # ---------------------------------------------------------------------
@@ -3559,23 +3559,26 @@ class dnspanel_ssl_main:
                 with open(target, "rb") as src:
                     _atomic_write(backup, src.read())
                 backups[target] = backup
+
+        def deployment_failed(message, nginx_backups=None):
+            restored = self._rollback_deploy(backups, nginx_backups)
+            suffix = "，已恢复原证书和配置" if restored else "；回滚未完成，请检查备份和 Nginx 配置"
+            return public.ReturnMsg(False, message + suffix)
+
         try:
             _atomic_write(fullchain_path, public_key)
             _atomic_write(privkey_path, private_key)
         except Exception as e:
-            self._rollback_deploy(backups, None)
-            return public.ReturnMsg(False, "证书原子写入失败: " + str(e))
+            return deployment_failed("证书原子写入失败: " + str(e))
 
         # For reverse proxy sites, directly modify nginx config
         web_server = str(public.GetWebServer() or "").strip().lower()
-        nginx_conf_backup = None
+        nginx_conf_backups = []
         if web_server in ("nginx", "openresty"):
             try:
-                nginx_conf_backup = self._enable_nginx_ssl_for_proxy(site_name, fullchain_path, privkey_path)
+                self._enable_nginx_ssl_for_proxy(site_name, fullchain_path, privkey_path, backups=nginx_conf_backups)
             except Exception as e:
-                possible_backup = "/www/server/panel/vhost/nginx/" + site_name + ".conf.dnspanel.bak"
-                self._rollback_deploy(backups, possible_backup if os.path.exists(possible_backup) else nginx_conf_backup)
-                return public.ReturnMsg(False, "更新 Nginx/OpenResty 配置失败，已恢复原证书: " + str(e))
+                return deployment_failed("更新 Nginx/OpenResty 配置失败: " + str(e), nginx_conf_backups)
 
         # Reload web server
         if web_server in ("nginx", "openresty"):
@@ -3585,19 +3588,16 @@ class dnspanel_ssl_main:
                 "nginx",
             ])
             if not nginx_bin:
-                self._rollback_deploy(backups, nginx_conf_backup)
-                return public.ReturnMsg(False, "未找到 Nginx/OpenResty 可执行文件，已恢复原证书和配置")
+                return deployment_failed("未找到 Nginx/OpenResty 可执行文件", nginx_conf_backups)
             test_ok, test_output = _run_checked([nginx_bin, "-t"])
             public.WriteLog("DNS面板SSL同步", "nginx配置测试: " + test_output)
             if test_ok:
                 if subprocess.call([nginx_bin, "-s", "reload"]) != 0:
-                    self._rollback_deploy(backups, nginx_conf_backup)
-                    return public.ReturnMsg(False, "Nginx 重载失败，已恢复原证书和配置")
+                    return deployment_failed("Nginx 重载失败", nginx_conf_backups)
                 public.WriteLog("DNS面板SSL同步", "nginx已重载")
             else:
                 public.WriteLog("DNS面板SSL同步", "nginx配置测试失败，未重载")
-                self._rollback_deploy(backups, nginx_conf_backup)
-                return public.ReturnMsg(False, "Nginx 配置校验失败，已恢复原证书和配置")
+                return deployment_failed("Nginx 配置校验失败", nginx_conf_backups)
         elif web_server == "apache":
             apache_bin = _find_executable([
                 "/www/server/apache/bin/httpd",
@@ -3607,20 +3607,16 @@ class dnspanel_ssl_main:
                 "apachectl",
             ])
             if not apache_bin:
-                self._rollback_deploy(backups, None)
-                return public.ReturnMsg(False, "未找到 Apache 可执行文件，已恢复原证书")
+                return deployment_failed("未找到 Apache 可执行文件")
             test_ok, test_output = _run_checked([apache_bin, "-t"])
             public.WriteLog("DNS面板SSL同步", "apache配置测试: " + test_output)
             if test_ok:
                 if subprocess.call([apache_bin, "-k", "graceful"]) != 0:
-                    self._rollback_deploy(backups, None)
-                    return public.ReturnMsg(False, "Apache 重载失败，已恢复原证书")
+                    return deployment_failed("Apache 重载失败")
             else:
-                self._rollback_deploy(backups, None)
-                return public.ReturnMsg(False, "Apache 配置校验失败，已恢复原证书")
+                return deployment_failed("Apache 配置校验失败")
         else:
-            self._rollback_deploy(backups, nginx_conf_backup)
-            return public.ReturnMsg(False, "暂不支持当前 Web 服务: " + (web_server or "unknown"))
+            return deployment_failed("暂不支持当前 Web 服务: " + (web_server or "unknown"), nginx_conf_backups)
 
         # Only mark the site as SSL-enabled after config validation/reload succeeds.
         try:
@@ -3637,18 +3633,12 @@ class dnspanel_ssl_main:
 
         deployed_fingerprints[site_name] = fingerprint
         _set_config("deployedFingerprints", deployed_fingerprints)
-        for backup in backups.values():
+        for backup in list(backups.values()) + nginx_conf_backups:
             if backup:
                 try:
                     os.remove(backup)
                 except Exception:
                     pass
-        if nginx_conf_backup:
-            try:
-                os.remove(nginx_conf_backup)
-            except Exception:
-                pass
-
         public.WriteLog("DNS面板SSL同步", "部署证书到站点 " + site_name + " (certId=" + cert_id + ")")
         success_message = "证书已部署并启用SSL，请刷新页面查看"
         if added_count:
@@ -3656,22 +3646,38 @@ class dnspanel_ssl_main:
         return public.ReturnMsg(True, success_message)
 
     def _rollback_deploy(self, backups, nginx_conf_backup):
-        for target, backup in backups.items():
+        restored = True
+        for target, backup in reversed(list(backups.items())):
             try:
                 if backup and os.path.exists(backup):
                     os.replace(backup, target) if hasattr(os, "replace") else os.rename(backup, target)
                 elif not backup and os.path.exists(target):
                     os.remove(target)
-            except Exception:
-                pass
-        if nginx_conf_backup:
+            except Exception as exc:
+                restored = False
+                _write_log("证书回滚失败: " + str(target) + ": " + str(exc))
+        nginx_backups = nginx_conf_backup or []
+        if not isinstance(nginx_backups, (list, tuple)):
+            nginx_backups = [nginx_backups]
+        for backup in reversed(nginx_backups):
             try:
-                target = nginx_conf_backup[:-len(".dnspanel.bak")]
-                os.replace(nginx_conf_backup, target) if hasattr(os, "replace") else os.rename(nginx_conf_backup, target)
-            except Exception:
-                pass
+                target = backup[:-len(".dnspanel.bak")]
+                os.replace(backup, target) if hasattr(os, "replace") else os.rename(backup, target)
+            except Exception as exc:
+                restored = False
+                _write_log("Nginx 配置回滚失败: " + str(backup) + ": " + str(exc))
+        if nginx_backups:
+            nginx_bin = _find_executable([
+                "/www/server/nginx/sbin/nginx",
+                "/www/server/openresty/nginx/sbin/nginx",
+                "nginx",
+            ])
+            test_ok, output = _run_checked([nginx_bin, "-t"]) if nginx_bin else (False, "未找到 Nginx/OpenResty 可执行文件")
+            _write_log("Nginx 回滚配置校验: " + _as_text(output))
+            restored = restored and test_ok
+        return restored
 
-    def _enable_nginx_ssl_for_proxy(self, site_name, cert_path, key_path, cert_names=None):
+    def _enable_nginx_ssl_for_proxy(self, site_name, cert_path, key_path, cert_names=None, backups=None):
         """Point every nginx/OpenResty vhost of the site at the given certificate.
 
         Handles both shapes: a config that already declares ssl_certificate
@@ -3679,7 +3685,10 @@ class dnspanel_ssl_main:
         site that never had SSL configured (a generated HTTPS block is added).
         Returns the list of config backups that were created.
         """
-        backups = []
+        # Share the journal with deploy so a later write failure cannot hide
+        # backups for configs that were already changed.
+        if backups is None:
+            backups = []
         targets = []
         live_conf = None
         for conf_path in _site_vhost_conf_paths(site_name):
@@ -3897,6 +3906,16 @@ class dnspanel_ssl_main:
         event_deployed = 0
         event_failed = 0
         event_skipped = 0
+        report_errors = []
+
+        def report_event(event_id, payload):
+            try:
+                response = _panel_post("/ssl/deployment-events/" + str(event_id) + "/result", payload, timeout=30)
+                if not response.get("success"):
+                    report_errors.append(_as_text(response.get("message") or "结果回传失败"))
+            except Exception as exc:
+                report_errors.append(_as_text(exc))
+
         sites = _list_bt_sites()
         allowed_sites = set(str(x) for x in (cfg.get("allowedSites") or []) if str(x))
         allowed_sources = set(str(x).lower() for x in (cfg.get("allowedSources") or ["tencent", "letsencrypt"]))
@@ -3941,7 +3960,7 @@ class dnspanel_ssl_main:
                         "targetName": ", ".join(matched_names),
                         "error": "证书已过期，禁止部署（请续期或删除）",
                     }
-                    _panel_post("/ssl/deployment-events/" + str(event_id) + "/result", result_payload, timeout=30)
+                    report_event(event_id, result_payload)
                     event_skipped += 1
                     continue
                 for site in allowed_matches:
@@ -3989,14 +4008,17 @@ class dnspanel_ssl_main:
                         result_payload["error"] = "部分站点部署失败（成功: " + ", ".join(successes) + "）：" + result_payload["error"]
             else:
                 event_failed += 1
-            _panel_post("/ssl/deployment-events/" + str(event_id) + "/result", result_payload, timeout=30)
+            report_event(event_id, result_payload)
 
         if event_mode:
             # Keep the panel's 域名→站点/反代IP snapshot fresh on every sync.
             _report_site_bindings()
             _set_config("lastSyncAt", time.strftime("%Y-%m-%d %H:%M:%S"))
-            public.WriteLog("DNS面板SSL同步", "增量同步完成：部署 " + str(event_deployed) + "，失败 " + str(event_failed) + "，跳过 " + str(event_skipped))
-            return public.ReturnMsg(True, "增量同步完成：部署 " + str(event_deployed) + " 个，失败 " + str(event_failed) + " 个，跳过 " + str(event_skipped) + " 个")
+            message = "增量同步完成：部署 " + str(event_deployed) + " 个，失败 " + str(event_failed) + " 个，跳过 " + str(event_skipped) + " 个"
+            if report_errors:
+                message += "；结果回传失败 " + str(len(report_errors)) + " 个：" + "; ".join(report_errors)[:400]
+            public.WriteLog("DNS面板SSL同步", message)
+            return public.ReturnMsg(event_failed == 0 and not report_errors, message)
 
         # Pull certs and auto-deploy to matching sites by domain
         raw = _http_request(
@@ -4118,16 +4140,19 @@ class dnspanel_ssl_main:
         #    applies new certs and adds DNS validation; issuance completes
         #    asynchronously, so the freshly-issued cert is deployed on a later
         #    run. Safe to call daily — already-issued domains are skipped.
+        renewal_errors = []
         try:
-            _http_request(
-                _panel_api("/ssl/certificates/renew-expired"),
-                method="POST",
-                headers=_panel_headers(),
-                data={"renewDays": renew_days},
-                timeout=180,
-            )
-        except Exception:
-            pass
+            renewal = _panel_post("/ssl/certificates/renew-expired", {"renewDays": renew_days}, timeout=180)
+            if not renewal.get("success"):
+                renewal_errors.append(_as_text(renewal.get("message") or "续期请求失败"))
+            else:
+                for failure in (renewal.get("data") or {}).get("failed") or []:
+                    if isinstance(failure, dict):
+                        renewal_errors.append(_as_text(failure.get("domain")) + ": " + _as_text(failure.get("error") or failure.get("reason") or "续期失败"))
+                    else:
+                        renewal_errors.append(_as_text(failure))
+        except Exception as exc:
+            renewal_errors.append(_as_text(exc))
         # 2) Deploy the freshest issued cert per domain, then prune superseded
         #    (< renew_days) certs and clean their _dnsauth validation records.
         result = self.sync_now(args)
@@ -4138,6 +4163,10 @@ class dnspanel_ssl_main:
             self.check_site_certificates(type("A", (), {})())
         except Exception as e:
             public.WriteLog("DNS面板SSL同步", "站点证书检测失败: " + str(e))
+        if renewal_errors:
+            message = "续期检查失败：" + "; ".join(renewal_errors)[:600] + "；" + _as_text(result.get("msg"))
+            public.WriteLog("DNS面板SSL同步", message)
+            return public.ReturnMsg(False, message)
         return result
 
 

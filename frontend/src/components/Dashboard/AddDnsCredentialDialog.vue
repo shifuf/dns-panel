@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue';
+import { useQueryClient } from '@tanstack/vue-query';
 import { NModal, NInput, NButton, NAlert, NSpin } from 'naive-ui';
 import { Eye, EyeOff, Plus } from 'lucide-vue-next';
 import { getProviders, createDnsCredential } from '@/services/dnsCredentials';
@@ -19,6 +20,7 @@ const emit = defineEmits<{
 }>();
 
 const providerStore = useProviderStore();
+const queryClient = useQueryClient();
 
 const providers = ref<ProviderConfig[]>([]);
 const loadingProviders = ref(false);
@@ -166,6 +168,9 @@ async function handleSubmit() {
       name: formName.value.trim(),
       provider: formProvider.value,
       secrets,
+    });
+    queryClient.removeQueries({
+      predicate: ({ queryKey }) => queryKey[0] === 'tunnels' || String(queryKey[0]).startsWith('tunnel-'),
     });
     await providerStore.loadData();
     emit('created');

@@ -3,71 +3,73 @@ import type { RouteRecordRaw } from 'vue-router';
 import { getSetupStatus, isAuthenticated, getCurrentUser } from '@/services/auth';
 import { onUnauthorized } from '@/services/api';
 import { logPageAccess } from '@/services/logs';
+import { onSessionReset } from '@/services/session';
+import { createNavigationController, lazyRoute } from './navigation';
 
 const routes: RouteRecordRaw[] = [
   {
     path: '/login',
     name: 'Login',
-    component: () => import('@/pages/LoginPage.vue'),
+    component: lazyRoute(() => import('@/pages/LoginPage.vue')),
     meta: { public: true },
   },
   {
     path: '/setup',
     name: 'Setup',
-    component: () => import('@/pages/SetupPage.vue'),
+    component: lazyRoute(() => import('@/pages/SetupPage.vue')),
     meta: { public: true },
   },
   {
     path: '/register',
     name: 'Register',
-    component: () => import('@/pages/RegisterPage.vue'),
+    component: lazyRoute(() => import('@/pages/RegisterPage.vue')),
     meta: { public: true },
   },
   {
     path: '/',
-    component: () => import('@/layouts/AppLayout.vue'),
+    component: lazyRoute(() => import('@/layouts/AppLayout.vue')),
     children: [
       {
         path: '',
         name: 'Dashboard',
-        component: () => import('@/pages/DashboardPage.vue'),
+        component: lazyRoute(() => import('@/pages/DashboardPage.vue')),
       },
       {
         path: 'domain/:zoneId',
         name: 'DomainDetail',
-        component: () => import('@/pages/DomainDetailPage.vue'),
+        component: lazyRoute(() => import('@/pages/DomainDetailPage.vue')),
         props: true,
       },
       {
         path: 'hostnames/:zoneId',
         name: 'CustomHostnames',
-        component: () => import('@/pages/CustomHostnamesPage.vue'),
+        component: lazyRoute(() => import('@/pages/CustomHostnamesPage.vue')),
         props: true,
       },
       {
         path: 'tunnels',
         name: 'Tunnels',
-        component: () => import('@/pages/TunnelsPage.vue'),
+        component: lazyRoute(() => import('@/pages/TunnelsPage.vue')),
       },
       {
         path: 'logs',
         name: 'Logs',
-        component: () => import('@/pages/LogsPage.vue'),
+        component: lazyRoute(() => import('@/pages/LogsPage.vue')),
       },
       {
         path: 'settings',
         name: 'Settings',
-        component: () => import('@/pages/SettingsPage.vue'),
+        component: lazyRoute(() => import('@/pages/SettingsPage.vue')),
       },
       {
         path: 'ssl',
         name: 'SSLCertificates',
-        component: () => import('@/pages/SSLCertificatesPage.vue'),
+        component: lazyRoute(() => import('@/pages/SSLCertificatesPage.vue')),
       },
       {
         path: 'platform-deployments',
         name: 'PlatformDeployments',
-        component: () => import('@/pages/PlatformDeploymentsPage.vue'),
+        component: lazyRoute(() => import('@/pages/PlatformDeploymentsPage.vue')),
       },
       {
         // Legacy deep-link: Let's Encrypt is a channel tab inside the SSL page now.
@@ -77,7 +79,7 @@ const routes: RouteRecordRaw[] = [
       {
         path: 'edgeone',
         name: 'EdgeOne',
-        component: () => import('@/pages/EdgeOnePage.vue'),
+        component: lazyRoute(() => import('@/pages/EdgeOnePage.vue')),
       },
     ],
   },
@@ -91,6 +93,7 @@ const router = createRouter({
   history: createWebHistory(),
   routes,
 });
+export const navigation = createNavigationController(router);
 
 // ── 唯一跳转方 ───────────────────────────────────────────────────────────
 // axios 拦截器只负责清理会话并广播事件，跳转统一由路由完成。以前拦截器也会
@@ -113,36 +116,47 @@ onUnauthorized(() => {
 
 // localStorage 里有 token 不等于会话有效（可能来自旧/别的数据库或已过期）。
 // 每个会话只校验一次，避免守卫在 '/' 与 '/login' 之间来回弹跳。
-let sessionVerified: boolean | null = null;
-let sessionProbe: Promise<boolean> | null = null;
+let sessionVerifiedToken: string | null = null;
+let sessionEpoch = 0;
+let sessionProbe: { token: string; promise: Promise<boolean> } | null = null;
 async function hasValidSession(): Promise<boolean> {
-  if (!isAuthenticated()) {
-    sessionVerified = false;
+  const token = localStorage.getItem('token');
+  if (!token) {
+    sessionVerifiedToken = null;
     return false;
   }
-  if (sessionVerified === true) return true;
-  if (!sessionProbe) {
-    sessionProbe = getCurrentUser()
+  if (sessionVerifiedToken === token) return true;
+  if (!sessionProbe || sessionProbe.token !== token) {
+    const epoch = sessionEpoch;
+    const promise = getCurrentUser()
       .then(() => {
-        sessionVerified = true;
+        if (epoch !== sessionEpoch || localStorage.getItem('token') !== token) return false;
+        sessionVerifiedToken = token;
         return true;
       })
       .catch(() => {
-        sessionVerified = false;
+        if (epoch === sessionEpoch) sessionVerifiedToken = null;
         return false;
       })
       .finally(() => {
-        sessionProbe = null;
+        if (sessionProbe?.promise === promise) sessionProbe = null;
       });
+    sessionProbe = { token, promise };
   }
-  return sessionProbe;
+  return sessionProbe.promise;
 }
 
 export function resetSessionCache() {
-  sessionVerified = null;
+  sessionEpoch += 1;
+  sessionVerifiedToken = null;
+  sessionProbe = null;
 }
+onSessionReset(resetSessionCache);
 
 router.beforeEach(async (to) => {
+  // Download this route while the setup/session checks run; only the guard
+  // below decides whether its component is allowed to mount.
+  void navigation.prefetch(to);
   try {
     const status = (await getSetupStatus()).data;
     if (!status?.setupComplete && to.name !== 'Setup') {

@@ -48,12 +48,16 @@ class UpyunConsoleApi:
         self._jar = http.cookiejar.CookieJar()
         self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._jar))
         self._logged_in = False
+        self._domain_cert_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         if auto_login and self.username and self.password:
             self.login()
 
     # ── low level ────────────────────────────────────────────────
     def _request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None,
                  json_body: Any = None) -> Dict[str, Any]:
+        if method.upper() != "GET":
+            # 上传、绑定、迁移、解绑（包括写入失败）之后必须重新读取绑定状态。
+            self._domain_cert_cache = {}
         url = BASE + path
         if params:
             url += "?" + urllib.parse.urlencode(
@@ -314,10 +318,18 @@ class UpyunConsoleApi:
     def get_domain_cert(self, domain: str) -> Dict[str, Any]:
         """查询域名当前生效/可选证书列表（含 validity 与 certificate_id）。"""
         self._ensure_login()
-        domain = str(domain or "").strip().strip(".")
+        domain = str(domain or "").strip().strip(".").lower()
         if not domain:
             raise UpyunConsoleError("缺少域名", 400)
-        return self._request("GET", "/api/https/services/manager", params={"domain": domain})
+        cached = self._domain_cert_cache.get(domain)
+        if cached and time.monotonic() - cached[0] < 2:
+            return cached[1]
+        resp = self._request("GET", "/api/https/services/manager", params={"domain": domain})
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if self._ok(resp) and isinstance(data, dict) and isinstance(data.get("result"), list):
+            # 上传 ID 兜底查询与紧接着的绑定共用一次结果，避免控制台 21000 限速。
+            self._domain_cert_cache[domain] = (time.monotonic(), resp)
+        return resp
 
     def find_cert_id_by_fingerprint_time(self, domain: str, not_after_ms_hint: int = 0) -> str:
         """从域名证书列表里挑出最新一张自定义证书的 ID（用于上传后兜底解析）。"""
@@ -346,10 +358,16 @@ class UpyunConsoleApi:
     def bind_domain(self, domain: str, cert_id: str, https: bool = True,
                     force_https: bool = False) -> Dict[str, Any]:
         self._ensure_login()
-        domain = str(domain or "").strip().strip(".")
+        domain = str(domain or "").strip().strip(".").lower()
         cert_id = str(cert_id or "").strip()
         if not domain or not cert_id:
             raise UpyunConsoleError("绑定证书需要域名与证书 ID", 400)
+        if https:
+            current = self.get_binding_status(domain)
+            if current.get("error"):
+                raise UpyunConsoleError(f"又拍云查询绑定失败 ({domain}): {current['error']}", 400)
+            if current.get("bound"):
+                return self._renew_domain_binding(domain, cert_id, current)
         resp = self._request("POST", "/api/https/certificate/manager", json_body={
             "certificate_id": cert_id,
             "domain": domain,
@@ -357,17 +375,51 @@ class UpyunConsoleApi:
             "force_https": bool(force_https),
         })
         if not self._ok(resp):
+            data = resp.get("data") if isinstance(resp, dict) else None
+            if https and isinstance(data, dict) and (
+                str(data.get("error_code")) == "21713"
+                or data.get("type") == "YouHaveBindThisDomainsToACertificate"
+            ):
+                # 查询与写入之间可能已有绑定；重新确认后仍执行相同的迁移保护。
+                current = self.get_binding_status(domain)
+                if current.get("bound"):
+                    return self._renew_domain_binding(domain, cert_id, current)
             raise UpyunConsoleError(f"又拍云绑定证书失败 ({domain}): {self._error_text(resp)}", 400)
         return resp
 
+    def _renew_domain_binding(self, domain: str, cert_id: str,
+                              current: Dict[str, Any]) -> Dict[str, Any]:
+        old_cert_id = str(current.get("certificateId") or "").strip()
+        if old_cert_id == cert_id:
+            return {"data": {"status": True}}
+        detail = self.get_cert_detail(old_cert_id)
+        data = detail.get("data") if isinstance(detail, dict) else None
+        domains = data.get("domains") if isinstance(data, dict) else None
+        if not self._ok(detail) or not isinstance(domains, list):
+            raise UpyunConsoleError(f"无法确认又拍云旧证书绑定域名，未迁移 ({domain})", 409)
+        bound_domains = {
+            str(item.get("name") or "").strip().strip(".").lower()
+            for item in domains if isinstance(item, dict) and item.get("https") is True
+        }
+        if bound_domains != {domain}:
+            raise UpyunConsoleError(
+                f"又拍云旧证书并非仅绑定当前域名 ({domain})，需按旧证书批量处理后再换证", 409,
+                need_manual=True,
+            )
+        # 使用整体迁移，不以默认 False 重写原域名的 HTTPS/强制 HTTPS/回源配置。
+        ok, resp = self.migrate_cert(old_cert_id, cert_id)
+        if not ok:
+            raise UpyunConsoleError(f"又拍云迁移证书失败 ({domain}): {self._error_text(resp)}", 400)
+        return resp
+
     def get_binding_status(self, domain: str) -> Dict[str, Any]:
-        """查询域名当前实际绑定的证书（实时状态）。
+        """查询域名实际绑定的证书（短时复用查询，写操作后刷新）。
 
         返回 {bound: bool, certificateId, commonName, https, forceHttps,
               notBefore, notAfter, crtType}；未接入/无 HTTPS 时 bound=False。
         """
         self._ensure_login()
-        domain = str(domain or "").strip().strip(".")
+        domain = str(domain or "").strip().strip(".").lower()
         if not domain:
             raise UpyunConsoleError("缺少域名", 400)
         resp = self.get_domain_cert(domain)
@@ -378,10 +430,28 @@ class UpyunConsoleApi:
         result = data.get("result") if isinstance(data, dict) else None
         if not isinstance(result, list) or not result:
             return {"bound": False, "https": False}
-        best = max(
-            (i for i in result if isinstance(i, dict)),
-            key=lambda x: (x.get("validity") or {}).get("end") or x.get("end") or 0,
-        )
+        # services/manager 列的是可选证书，最新有效期并不代表已绑定。
+        # 优先使用列表的 https 标记，避免重复请求触发控制台 21000 限速。
+        candidates = [item for item in result if isinstance(item, dict) and item.get("certificate_id")]
+        active = [item for item in candidates if item.get("https") is True]
+        unknown = [item for item in candidates if "https" not in item] if not active else []
+        for item in unknown:
+            # 兼容不带状态标记的列表，仅此时查询详情中的目标域名配置。
+            detail = self.get_cert_detail(str(item["certificate_id"]))
+            detail_data = detail.get("data") if isinstance(detail, dict) else None
+            domains = detail_data.get("domains") if isinstance(detail_data, dict) else None
+            if not self._ok(detail) or not isinstance(domains, list):
+                raise UpyunConsoleError(f"无法确认又拍云证书绑定状态 ({domain})", 502)
+            for config in domains:
+                if (isinstance(config, dict) and config.get("https") is True
+                        and str(config.get("name") or "").strip().strip(".").lower() == domain):
+                    active.append({**item, "https": True, "force_https": config.get("force_https")})
+                    break
+        if not active:
+            return {"bound": False, "https": False}
+        if len(active) != 1:
+            raise UpyunConsoleError(f"又拍云返回多个生效证书，无法确认当前绑定 ({domain})", 409)
+        best = active[0]
         validity = best.get("validity") or {}
         return {
             "bound": True,

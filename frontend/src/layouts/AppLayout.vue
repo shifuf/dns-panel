@@ -1,18 +1,18 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { useRoute, useRouter } from 'vue-router';
-import { Menu, ChevronsRight } from 'lucide-vue-next';
+import { useRoute } from 'vue-router';
+import { Menu, ChevronsRight, LoaderCircle } from 'lucide-vue-next';
 import AppSidebar from '@/components/Sidebar/AppSidebar.vue';
 import { useProviderStore } from '@/stores/provider';
 import { useBreadcrumbStore } from '@/stores/breadcrumb';
 import { useResponsive } from '@/composables/useResponsive';
 import { getProviderDisplayName } from '@/utils/provider';
+import { navigation } from '@/router';
 
 const providerStore = useProviderStore();
 const breadcrumbStore = useBreadcrumbStore();
 const { isMobile } = useResponsive();
 const route = useRoute();
-const router = useRouter();
 
 const mobileOpen = ref(false);
 const initializedRootDefault = ref(false);
@@ -148,7 +148,10 @@ function onSidebarClose() {
               <button
                 v-if="item.path"
                 class="truncate rounded-lg px-1 py-0.5 font-semibold text-slate-500 transition-colors hover:text-slate-700"
-                @click="router.push(item.path)"
+                @pointerenter="navigation.prefetch(item.path)"
+                @focus="navigation.prefetch(item.path)"
+                @pointerdown="navigation.prefetch(item.path)"
+                @click="navigation.navigate(item.path)"
               >
                 {{ item.label }}
               </button>
@@ -156,32 +159,27 @@ function onSidebarClose() {
               <ChevronsRight v-if="i < breadcrumbs.length - 1" :size="14" class="shrink-0 text-slate-400" />
             </template>
           </nav>
-          <span class="inline-flex max-w-full rounded-xl border border-panel-border bg-panel-surface px-3 py-1 text-xs font-semibold text-slate-500 md:max-w-[40%]">
+          <span v-if="navigation.state.pendingPath" role="status" aria-live="polite" class="inline-flex shrink-0 items-center gap-2 text-sm text-accent">
+            <LoaderCircle :size="16" class="animate-spin motion-reduce:animate-none" />
+            正在打开页面…
+          </span>
+          <span v-else class="inline-flex max-w-full rounded-xl border border-panel-border bg-panel-surface px-3 py-1 text-xs font-semibold text-slate-500 md:max-w-[40%]">
             {{ scopeHint }}
           </span>
         </div>
       </header>
 
-      <section class="app-content bento-scroll-y">
+      <div v-if="navigation.state.error" role="alert" class="mx-4 mb-3 flex items-center gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <span class="flex-1">{{ navigation.state.error }}</span>
+        <button class="font-semibold underline" @click="navigation.retry()">重试</button>
+        <button @click="navigation.dismissError()">关闭</button>
+      </div>
+
+      <section class="app-content bento-scroll-y" :aria-busy="!!navigation.state.pendingPath">
         <router-view v-slot="{ Component }">
-          <transition name="page-slide" mode="out-in">
-            <component :is="Component" />
-          </transition>
+          <component :is="Component" />
         </router-view>
       </section>
     </main>
   </div>
 </template>
-
-<style scoped>
-.page-slide-enter-active,
-.page-slide-leave-active {
-  transition: all 180ms ease;
-}
-
-.page-slide-enter-from,
-.page-slide-leave-to {
-  transform: translateY(4px);
-  opacity: 0;
-}
-</style>

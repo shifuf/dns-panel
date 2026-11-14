@@ -2,7 +2,7 @@
 import { ref, computed, watch, h, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
-import { NDataTable, NInput, NButton, NTag, NEmpty, NSpin, NPagination, NSelect, NDrawer, NModal, NSwitch, useMessage, useDialog } from 'naive-ui';
+import { NDataTable, NInput, NButton, NTag, NEmpty, NSpin, NPagination, NSelect, NDrawer, NModal, NSwitch, NAlert, useMessage, useDialog } from 'naive-ui';
 import { Search, RefreshCw, Plus, Trash2, Download, ArrowUpDown, ShieldCheck, AlertTriangle, Clock3, Layers3, Tag, Check } from 'lucide-vue-next';
 import type { DataTableColumns } from 'naive-ui';
 import { useProviderStore } from '@/stores/provider';
@@ -229,8 +229,8 @@ const addInitialCredId = computed<number | undefined>(() => {
 // "全部账户" aggregate view and the single-provider view reuse the same data.
 // Switching scopes then renders from cache instead of re-hitting upstream APIs.
 function fetchCredentialDomains(cred: DnsCredential): Promise<Domain[]> {
-  return queryClient.ensureQueryData({
-    queryKey: ['domains-cred', cred.id],
+  return queryClient.fetchQuery({
+    queryKey: ['domains-cred', cred.id, cred.provider, cred.updatedAt, cred.name],
     queryFn: async () => {
       const res = await getDomains(cred.id);
       return (res.data?.domains || []).map((d) => ({
@@ -245,8 +245,11 @@ function fetchCredentialDomains(cred: DnsCredential): Promise<Domain[]> {
 }
 
 // Domain data query
-const { data: domainsData, isLoading, refetch } = useQuery({
-  queryKey: computed(() => ['domains', providerStore.selectedProvider, effectiveCredentialId.value, isEsaPanel.value]),
+const { data: domainsData, isLoading, isFetching, error: domainsError, refetch } = useQuery({
+  queryKey: computed(() => [
+    'domains', providerStore.selectedProvider, effectiveCredentialId.value, isEsaPanel.value,
+    scopedCredentials.value.map(cred => [cred.id, cred.provider, cred.updatedAt, cred.name]),
+  ]),
   queryFn: async () => {
     if (isEsaPanel.value) {
       const creds = effectiveCredentialId.value === 'all'
@@ -314,6 +317,10 @@ const { data: domainsData, isLoading, refetch } = useQuery({
 });
 
 const domains = computed(() => domainsData.value || []);
+const domainLoadError = computed(() => {
+  const error = providerStore.error || domainsError.value;
+  return error ? String(error instanceof Error ? error.message : error) : '';
+});
 
 onMounted(() => {
   localSyncTasks.value = readJsonStorage<SyncJob[]>(DASHBOARD_SYNC_TASKS_KEY, []);
@@ -965,7 +972,8 @@ async function handleBatchRefresh() {
       await refreshDomains(effectiveCredentialId.value);
     }
     await queryClient.invalidateQueries({ queryKey: ['domains-cred'] });
-    await refetch();
+    await queryClient.invalidateQueries({ queryKey: ['domains'], refetchType: 'none' });
+    await refetch({ throwOnError: true });
     finishLocalSyncTask(taskId, { status: 'success', durationMs: Date.now() - begin });
     message.success(`已同步 ${target.length} 个域名所属账户`);
     await refetchRemoteSyncJobs();
@@ -1001,7 +1009,8 @@ function confirmBatchDelete() {
       }
       selectedRowKeys.value = [];
       await queryClient.invalidateQueries({ queryKey: ['domains-cred'] });
-      await refetch();
+      await queryClient.invalidateQueries({ queryKey: ['domains'], refetchType: 'none' });
+      await refetch({ throwOnError: true });
       if (failed === 0) message.success(`已删除 ${success} 个域名`);
       else message.warning(`删除完成，成功 ${success}，失败 ${failed}`);
     },
@@ -1122,14 +1131,19 @@ async function handleRefresh() {
   });
   const begin = Date.now();
   try {
+    if (providerStore.error) {
+      await providerStore.loadData();
+      if (providerStore.error) throw new Error(providerStore.error);
+    }
     if (!isEsaPanel.value && typeof effectiveCredentialId.value === 'number') {
       await refreshDomains(effectiveCredentialId.value);
     } else if (!isEsaPanel.value && effectiveCredentialId.value === 'all') {
       await Promise.all(scopedCredentials.value.map(c => refreshDomains(c.id)));
     }
-    // Drop the shared per-credential cache so refetch pulls fresh data.
+    // Invalidate both levels: other scopes must also reload after this refresh.
     await queryClient.invalidateQueries({ queryKey: ['domains-cred'] });
-    await refetch();
+    await queryClient.invalidateQueries({ queryKey: ['domains'], refetchType: 'none' });
+    await refetch({ throwOnError: true });
     lastRefreshedAt.value = Date.now();
     finishLocalSyncTask(taskId, { status: 'success', durationMs: Date.now() - begin });
     await refetchRemoteSyncJobs();
@@ -1143,9 +1157,9 @@ async function handleRefresh() {
 // Delete zone
 const deleteMutation = useMutation({
   mutationFn: (vars: { credentialId: number; zoneId: string }) => deleteZone(vars.credentialId, vars.zoneId),
-  onSuccess: () => {
-    queryClient.invalidateQueries({ queryKey: ['domains'] });
-    queryClient.invalidateQueries({ queryKey: ['domains-cred'] });
+  onSuccess: async () => {
+    await queryClient.invalidateQueries({ queryKey: ['domains-cred'] });
+    await queryClient.invalidateQueries({ queryKey: ['domains'] });
     message.success('域名已删除');
   },
   onError: (err: any) => message.error(String(err)),
@@ -1430,7 +1444,7 @@ watch(domains, (list) => {
           <template #icon><Plus :size="14" /></template>
           添加 ESA 站点
         </NButton>
-        <NButton size="small" secondary :loading="isLoading" @click="handleRefresh">
+        <NButton size="small" secondary :loading="isFetching" @click="handleRefresh">
           <template #icon><RefreshCw :size="14" /></template>
         </NButton>
       </div>
@@ -1691,11 +1705,27 @@ watch(domains, (list) => {
         </NButton>
       </div>
 
+      <NAlert v-if="domainLoadError" type="error" title="域名加载失败" class="mb-4">
+        {{ domainLoadError }}
+        <span v-if="domains.length">；下方显示上次成功加载的数据。</span>
+        <NButton size="small" secondary :loading="isFetching" class="ml-3" @click="handleRefresh">重试</NButton>
+      </NAlert>
+
+      <NAlert
+        v-if="providerStore.selectedProvider === 'cloudflare' && !isLoading && !domainLoadError"
+        type="info"
+        class="mb-4"
+      >
+        当前所选账户的 API Token 可见 {{ domains.length }} 个域名（筛选前）。如果少于 Cloudflare 控制台，
+        请核查 Token 的 Zone Resources 是否包含全部目标域名，以及账户成员权限。
+        <NButton size="small" text class="ml-2" @click="router.push('/settings?tab=general')">检查凭证</NButton>
+      </NAlert>
+
       <div v-if="isLoading" class="flex justify-center py-20">
         <NSpin size="large" />
       </div>
 
-      <NEmpty v-else-if="filteredDomains.length === 0" class="py-20" description="暂无域名数据">
+      <NEmpty v-else-if="filteredDomains.length === 0" class="py-20" :description="domainLoadError ? '域名数据未加载成功' : '暂无域名数据'">
         <template #extra>
           <NButton
             v-if="providerStore.selectedProvider"

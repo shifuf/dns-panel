@@ -18,10 +18,11 @@ import urllib.request
 import mimetypes
 import bcrypt
 import jwt as pyjwt
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List
 from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from modules.provider_catalog import (
@@ -249,10 +250,15 @@ def parse_dt(v: Any) -> datetime | None:
     return None
 
 
-def conn() -> sqlite3.Connection:
+@contextmanager
+def conn() -> Iterator[sqlite3.Connection]:
     c = sqlite3.connect(str(DB))
     c.row_factory = sqlite3.Row
-    return c
+    try:
+        with c:
+            yield c
+    finally:
+        c.close()
 
 
 def table_exists(name: str) -> bool:
@@ -2577,6 +2583,46 @@ class H(BaseHTTPRequestHandler):
         if self._is_fallback_ingress_rule(rules[-1]):
             return rules
         return [*rules, {"service": "http_status:404"}]
+
+    @staticmethod
+    def _validate_tunnel_hostname(value: Any, wildcard: bool = True) -> str:
+        host = str(value or "").strip().rstrip(".").lower()
+        prefix = "*." if wildcard and host.startswith("*.") else ""
+        name = host[2:] if prefix else host
+        try:
+            name = name.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError("hostname 格式无效")
+        if not name or len(name) > 253 or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in name.split(".")):
+            raise ValueError("hostname 格式无效，请填写主机名，不包含协议、端口或路径")
+        return prefix + name
+
+    @staticmethod
+    def _validate_tunnel_service(value: Any) -> str:
+        service = str(value or "").strip()
+        if service in ("hello_world", "helloworld") or re.fullmatch(r"http_status:[1-5][0-9]{2}", service):
+            return service
+        if service.startswith(("unix:/", "unix+tls:/")) and not any(c.isspace() for c in service):
+            return service
+        try:
+            url = urllib.parse.urlsplit(service)
+            valid = url.scheme in ("http", "https", "tcp", "ssh", "rdp", "smb") and url.hostname and not url.username and not url.password
+            valid = valid and not url.query and not url.fragment and url.path in ("", "/")
+            if url.port is not None and not 1 <= url.port <= 65535:
+                valid = False
+            if valid and not any(c.isspace() for c in service):
+                return service
+        except ValueError:
+            pass
+        raise ValueError("service 格式无效，例如 http://localhost:8080、tcp://localhost:22 或 http_status:404")
+
+    def _tunnel_zone(self, cf: CloudflareApi, account_id: str, hostname: str, zone_id: str = "") -> str:
+        zones = [cf.get_zone(zone_id)] if zone_id else cf.list_tunnel_zones(account_id)
+        zones = [z for z in zones if str((z.get("account") or {}).get("id") or "") == account_id]
+        match = self._find_best_zone(hostname, zones)
+        if not match:
+            raise ValueError("该主机名不属于所选账户的可用域名，请检查 Zone 读取及 DNS 编辑权限")
+        return str(match["id"])
 
     def _parse_credential_id(self, value: Any) -> int | None:
         if value is None:

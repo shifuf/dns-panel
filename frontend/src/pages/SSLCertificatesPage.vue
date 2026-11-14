@@ -1335,8 +1335,9 @@ const platformCheckFetching = ref(false);
 const checksForCert = (cert: SslCertificate | null | undefined): PlatformBindingCheck[] => {
   if (!cert || !platformChecks.value.length) return [];
   const byRemote = platformChecks.value.filter(c2 => {
-    const dep = platformDeployments.value.find(d => d.id === c2.deploymentId);
-    return dep && dep.certRemoteId === cert.remoteCertId;
+    const dep = platformDeployments.value.find(d => d.provider === c2.provider && d.domain === c2.domain &&
+      (d.provider === 'edgeone' ? d.credentialId === c2.credentialId && d.siteId === c2.siteId : d.id === c2.deploymentId));
+    return dep && (dep.certRemoteId ? dep.certRemoteId === cert.remoteCertId : !!cert.id && dep.certRowId === cert.id);
   });
   return byRemote;
 };
@@ -1355,7 +1356,7 @@ const platformDeploymentsFor = (cert: SslCertificate | null | undefined): Platfo
 };
 
 // ── 宝塔站点绑定（插件上报：域名 → 站点 / 反代 IP） ──
-const { data: siteBindingsData, isFetching: siteBindingsFetching } = useQuery({
+const { data: siteBindingsData } = useQuery({
   queryKey: ['ssl-site-bindings'],
   queryFn: async (): Promise<SiteBinding[]> => {
     const res = await getSiteBindings();
@@ -1411,7 +1412,9 @@ async function runPlatformCheck() {
     const drift = res.data?.drift ?? 0;
     let msg = `检查完成：${checked}/${total} 个域名状态已核实`;
     if (drift) msg += `，${drift} 个漂移`;
-    message.success(msg);
+    if (checked < total) msg += `，${total - checked} 个未核实`;
+    if (checked < total || drift) message.warning(msg);
+    else message.success(msg);
     queryClient.invalidateQueries({ queryKey: ['ssl-platform-deployments'] });
   } catch (err: any) {
     message.error(String(err));
@@ -2407,7 +2410,7 @@ const tableScrollX = computed(() =>
           <p class="text-xs font-semibold text-slate-600">实时绑定状态（点上方「检查部署状态」刷新）</p>
           <div
             v-for="chk in platformChecks"
-            :key="chk.deploymentId"
+            :key="`${chk.provider}-${chk.deploymentId}-${chk.domain}`"
             class="rounded-xl border p-3 text-sm"
             :class="chk.drift ? 'border-amber-300 bg-amber-50/60' : chk.live?.bound ? 'border-emerald-200 bg-emerald-50/40' : 'border-panel-border bg-panel-bg'"
           >
@@ -3550,7 +3553,7 @@ const tableScrollX = computed(() =>
             </div>
             <div
               v-for="dep in platformDeploymentsFor(detailData)"
-              :key="dep.id"
+              :key="`${dep.provider}-${dep.id}-${dep.domain}`"
               class="panel-muted mb-2 p-3 text-sm"
             >
               <div class="flex flex-wrap items-center gap-2">
@@ -3562,20 +3565,25 @@ const tableScrollX = computed(() =>
                 </NTag>
                 <NButton size="tiny" quaternary type="error" class="ml-auto" @click="pdDeleteMutation.mutate(dep.id)">删除记录</NButton>
               </div>
-              <p class="mt-1 text-xs text-slate-600">绑定域名：{{ dep.domain }}</p>
+              <p class="mt-1 text-xs text-slate-600">目标域名：{{ dep.domain }}</p>
+              <p v-if="dep.status === 'failed' && dep.platformCertId" class="mt-1 text-xs text-amber-700">证书已上传，上次绑定失败</p>
               <p v-if="dep.platformCertName" class="text-xs text-slate-500">平台证书：{{ dep.platformCertName }}<span v-if="dep.platformCertId">（{{ dep.platformCertId }}）</span></p>
               <p class="text-xs text-slate-400">
                 到期：{{ formatDateTime(dep.notAfter) }}
                 <span v-if="dep.uploadedAt"> · 上传于 {{ formatDateTime(dep.uploadedAt) }}</span>
               </p>
-              <p v-if="dep.lastError" class="mt-1 break-all text-xs text-red-500">{{ dep.lastError }}</p>
-              <template v-for="chk in checksForCert(detailData).filter(c2 => c2.deploymentId === dep.id)" :key="'chk-' + chk.deploymentId">
-                <p v-if="chk.checked" class="mt-1 text-xs" :class="chk.drift ? 'text-amber-700' : 'text-emerald-700'">
+              <details v-if="dep.lastError" class="mt-1 break-all text-xs text-slate-500" :open="!checksForCert(detailData).some(c2 => c2.provider === dep.provider && c2.domain === dep.domain && (dep.provider === 'edgeone' ? c2.credentialId === dep.credentialId && c2.siteId === dep.siteId : c2.deploymentId === dep.id))">
+                <summary class="cursor-pointer">上次部署错误（历史记录）</summary>
+                <p class="mt-1">{{ dep.lastError }}</p>
+              </details>
+              <template v-for="chk in checksForCert(detailData).filter(c2 => c2.provider === dep.provider && c2.domain === dep.domain && (dep.provider === 'edgeone' ? c2.credentialId === dep.credentialId && c2.siteId === dep.siteId : c2.deploymentId === dep.id))" :key="'chk-' + chk.provider + '-' + chk.deploymentId">
+                <p v-if="chk.checked" class="mt-1 text-xs" :class="chk.drift || !chk.live?.bound ? 'text-amber-700' : 'text-emerald-700'">
                   实时状态：<strong>{{ chk.drift ? '证书漂移' : chk.live?.bound ? '已绑定' : '未绑定' }}</strong>
                   <span v-if="chk.live?.certificateId"> · 平台证书 {{ chk.live.certificateId }}</span>
                   <span v-if="chk.live?.notAfter"> · 实际到期 {{ formatDateTime(chk.live.notAfter) }}</span>
                 </p>
                 <p v-else-if="chk.error" class="mt-1 break-all text-xs text-red-500">实时检查失败：{{ chk.error }}</p>
+                <p v-if="chk.live?.error" class="mt-1 break-all text-xs text-amber-700">{{ chk.live.error }}</p>
               </template>
             </div>
           </template>

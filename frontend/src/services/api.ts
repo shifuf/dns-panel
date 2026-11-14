@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { clearSession } from './session';
 
 /**
  * Auth lifecycle events. The interceptor must NEVER navigate on its own: a hard
@@ -59,16 +60,14 @@ api.interceptors.response.use(
       if (status === 401) {
         const message = String(data?.message || '');
         const authMessages = ['未提供认证令牌', '无效或过期的令牌', '认证失败'];
-        const shouldLogout = authMessages.some(m => message.includes(m));
+        const shouldLogout = authMessages.some(m => message === m || message.startsWith(`${m}:`));
 
-        if (shouldLogout) {
-          const hadToken = Boolean(localStorage.getItem('token'));
-          localStorage.removeItem('token');
-          localStorage.removeItem('user');
+        const activeToken = localStorage.getItem('token');
+        const requestToken = error.config?.headers?.Authorization;
+        if (shouldLogout && activeToken && requestToken === `Bearer ${activeToken}`) {
+          clearSession();
           // 只有在确实存在会话时才广播，避免登录页自身的 401 反复触发跳转。
-          if (hadToken) {
-            window.dispatchEvent(new CustomEvent(AUTH_UNAUTHORIZED_EVENT));
-          }
+          window.dispatchEvent(new CustomEvent(AUTH_UNAUTHORIZED_EVENT));
         }
       }
 

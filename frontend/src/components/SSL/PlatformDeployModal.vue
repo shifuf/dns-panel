@@ -3,7 +3,7 @@
     <div class="space-y-4 pt-2">
       <NAlert type="info" :bordered="false">
         读取面板已签发的证书（Let's Encrypt / 腾讯云）上传到平台，并自动绑定到指定 CDN 域名。
-        acme.sh 自动续期成功后会自动重新上传新证书并替换。
+        已开启自动续期的证书续期成功后，会按保存的有效部署目标重新上传；请同时确认平台绑定成功。
       </NAlert>
       <NFormItem label="选择证书" required>
         <NSelect v-model:value="pdCertId" :options="certOptions" filterable placeholder="选择面板中已签发的证书" />
@@ -110,16 +110,16 @@
           <p v-if="showSecrets && !secretsLoading && !secretsData" class="text-xs text-red-500">密钥读取失败</p>
         </div>
       </NFormItem>
-      <NFormItem label="绑定域名" required>
+      <NFormItem label="平台已接入的 CDN 域名" required>
         <div class="w-full space-y-1">
           <NInput
             v-model:value="pdDomains"
             type="textarea"
             :rows="3"
-            :placeholder="(certNames[0] || 'cdn.example.com') + '，多个域名用逗号分隔'"
+            placeholder="例如 cdn.example.com，多个域名用逗号分隔"
           />
           <p class="text-xs text-slate-400">
-            证书覆盖：{{ certNames.join('、') || '-' }}；只能绑定证书覆盖范围内的域名
+            证书覆盖：{{ certNames.join('、') || '-' }}。泛域名只覆盖一层子域名，不会自动创建或接入 CDN 域名。
           </p>
           <div v-if="pdProvider === 'upyun'" class="pt-1">
             <p class="mb-1 text-xs text-slate-500">
@@ -135,7 +135,7 @@
                 :bordered="false"
                 :type="d.covered ? 'success' : 'default'"
                 :class="d.covered ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'"
-                :title="d.covered ? `点击添加 ${d.domain}` : '该域名不在任何已签发证书的覆盖范围内'"
+                :title="d.covered ? `点击添加 ${d.domain}` : '当前所选证书不覆盖该域名'"
                 @click="d.covered && addDomain(d.domain)"
               >{{ d.domain }}（{{ d.bucket }}）</NTag>
             </div>
@@ -169,6 +169,7 @@ import {
 } from '@/services/ssl';
 import type { PlatformCredential, PlatformDeploymentsResponse, UpyunAccountDomain, PlatformDeployment } from '@/services/ssl';
 import type { SslCertificate } from '@/types/ssl';
+import { certificateNames, certificateCoversDomain, deploymentDomains } from '@/utils/certificateDomains';
 
 const props = defineProps<{ show: boolean; initialCertId?: string | null }>();
 const emit = defineEmits<{ (e: 'update:show', v: boolean): void; (e: 'deployed'): void }>();
@@ -197,7 +198,7 @@ const { data: allIssuedCerts } = useQuery({
   staleTime: 30_000,
 });
 
-const { data: platformDeploymentsData, refetch: refetchDeployments } = useQuery({
+const { data: platformDeploymentsData } = useQuery({
   queryKey: ['ssl-platform-deployments'],
   queryFn: async (): Promise<PlatformDeploymentsResponse | undefined> => {
     const res = await getPlatformDeployments();
@@ -213,7 +214,8 @@ const platformDeployments = computed<PlatformDeployment[]>(() => {
   if (Array.isArray(payload)) return payload;
   return payload?.deployments || [];
 });
-const upyunDomains = computed<UpyunAccountDomain[]>(() => platformDeploymentsData.value?.upyunDomains || []);
+const upyunDomains = computed<UpyunAccountDomain[]>(() => (platformDeploymentsData.value?.upyunDomains || [])
+  .map(d => ({ ...d, covered: certificateCoversDomain(d.domain, certNames.value) })));
 const upyunError = computed(() => platformDeploymentsData.value?.upyunError || '');
 
 const { data: platformCredentials } = useQuery({
@@ -254,11 +256,7 @@ const credentialOptions = computed(() =>
 
 const certNames = computed(() => {
   const cert = (allIssuedCerts.value || []).find(c => c.remoteCertId === pdCertId.value);
-  if (!cert) return [] as string[];
-  const names: string[] = [cert.domain];
-  if (Array.isArray(cert.san)) names.push(...cert.san);
-  else if (typeof cert.san === 'string' && cert.san) names.push(cert.san);
-  return names.filter(Boolean);
+  return certificateNames(cert);
 });
 
 watch(pdProvider, () => { pdCredId.value = null; testResult.value = null; });
@@ -266,17 +264,16 @@ watch(() => props.show, (visible) => {
   if (visible) {
     testResult.value = null;
     showQuickAdd.value = false;
-    // 从证书列表页带着具体证书进来时，预选该证书并填入其主域名
+    pdDomains.value = '';
+    // 证书覆盖范围不代表平台实际已接入的 CDN 域名。
     if (props.initialCertId) {
       pdCertId.value = props.initialCertId;
-      const cert = (allIssuedCerts.value || []).find(c => c.remoteCertId === props.initialCertId);
-      pdDomains.value = cert?.domain || '';
     }
   }
 });
 
 function addDomain(domain: string) {
-  const current = pdDomains.value.split(/[,,\s]+/).map(s => s.trim()).filter(Boolean);
+  const current = pdDomains.value.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
   if (!current.includes(domain)) current.push(domain);
   pdDomains.value = current.join(', ');
 }
@@ -292,21 +289,24 @@ const showSecrets = ref(false);
 const secretsVisible = ref(false);
 const secretsLoading = ref(false);
 const secretsData = ref<{ id: number; name: string; provider: 'qiniu' | 'upyun'; secrets: Record<string, string> } | null>(null);
+let secretsRequest = 0;
 
 async function toggleSecrets() {
   showSecrets.value = !showSecrets.value;
-  if (!showSecrets.value) return;
+  const request = ++secretsRequest;
+  if (!showSecrets.value) { secretsData.value = null; secretsLoading.value = false; return; }
   if (!pdCredId.value) return;
+  const credentialId = pdCredId.value;
   secretsLoading.value = true;
   secretsData.value = null;
   secretsVisible.value = false;
   try {
-    const res = await getPlatformCredentialSecrets(pdCredId.value);
-    secretsData.value = res.data || null;
+    const res = await getPlatformCredentialSecrets(credentialId);
+    if (request === secretsRequest && credentialId === pdCredId.value && props.show && showSecrets.value) secretsData.value = res.data || null;
   } catch (err: any) {
-    message.error(String(err));
+    if (request === secretsRequest) message.error(String(err));
   } finally {
-    secretsLoading.value = false;
+    if (request === secretsRequest) secretsLoading.value = false;
   }
 }
 
@@ -319,7 +319,12 @@ async function copySecret(value: string) {
   }
 }
 
-watch(pdCredId, () => { showSecrets.value = false; secretsData.value = null; });
+watch([pdCredId, () => props.show], () => {
+  secretsRequest += 1;
+  showSecrets.value = false;
+  secretsData.value = null;
+  secretsLoading.value = false;
+});
 
 const testMutation = useMutation({
   mutationFn: () => {
@@ -373,8 +378,7 @@ const deployMutation = useMutation({
   mutationFn: () => {
     if (!pdCertId.value) throw new Error('请选择要上传的面板证书');
     if (!pdCredId.value) throw new Error('请选择平台凭证');
-    const domains = pdDomains.value.split(/[,,\s]+/).map(s => s.trim()).filter(Boolean);
-    if (!domains.length) throw new Error('请填写要绑定的 CDN 域名');
+    const domains = deploymentDomains(pdDomains.value, certNames.value, pdProvider.value);
     return deployCertToPlatform({
       provider: pdProvider.value,
       credentialId: pdCredId.value,
@@ -383,10 +387,15 @@ const deployMutation = useMutation({
     });
   },
   onSuccess: (res: any) => {
-    message.success(res?.message || '上传成功');
-    emit('update:show', false);
     emit('deployed');
     queryClient.invalidateQueries({ queryKey: ['ssl-platform-deployments'] });
+    const failed = (res?.data?.results || []).filter((result: { ok?: boolean }) => !result.ok);
+    if (failed.length) {
+      message.warning(res?.message || `证书已上传，但 ${failed.length} 个域名绑定失败，请检查部署记录`);
+      return;
+    }
+    message.success(res?.message || '上传并绑定成功');
+    emit('update:show', false);
   },
   onError: (err: any) => message.error(String(err)),
 });

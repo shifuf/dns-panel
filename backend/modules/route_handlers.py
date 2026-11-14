@@ -5394,9 +5394,19 @@ def _tunnels_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     credential_id = first_or_none(q, "credentialId")
 
     try:
-        ctx = self._cf_context(uid, credential_id, require_account=True)
+        ctx = self._cf_context(uid, credential_id, require_account=False)
         cf: CloudflareApi = ctx["cf"]
         account_id = str(ctx.get("accountId") or "")
+        if self.command == "GET" and sub == "/accounts":
+            accounts = [{"id": account_id, "name": account_id}] if account_id else cf.list_accounts()
+            self._ok({"accounts": accounts}, "获取 Cloudflare 账户成功")
+            return
+        requested_account = str(first_or_none(q, "accountId") or "").strip()
+        if account_id and requested_account and account_id != requested_account:
+            raise ValueError("所选账户与凭证绑定的 Account ID 不一致")
+        account_id = requested_account or account_id or cf.get_default_account_id()
+        if not account_id:
+            raise ValueError("未找到 Cloudflare 账户，请在凭证中设置 Account ID 或授予账户/区域读取权限")
     except Exception as e:
         self._err(str(e), 400)
         return
@@ -5410,13 +5420,22 @@ def _tunnels_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             self._err(str(e), code)
         return
 
+    if self.command == "GET" and sub == "/zones":
+        try:
+            zones = cf.list_tunnel_zones(account_id)
+            self._ok({"zones": [{"id": z["id"], "name": z["name"]} for z in zones]}, "获取 Tunnel 可用域名成功")
+        except Exception as e:
+            self._err(str(e), e.status if isinstance(e, CloudflareApiError) else 400)
+        return
+
     m = re.fullmatch(r"/([^/]+)/config", sub)
     if self.command == "GET" and m:
         tunnel_id = urllib.parse.unquote(m.group(1))
         try:
+            cf.require_remote_tunnel(account_id, tunnel_id)
             raw = cf.get_tunnel_config(account_id, tunnel_id)
             config = self._extract_tunnel_config(raw)
-            if not config:
+            if config is None:
                 self._err("Tunnel 配置解析失败，请重试", 502)
                 return
             self._ok({"config": config}, "获取 Tunnel 配置成功")
@@ -5432,8 +5451,7 @@ def _tunnels_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             return
         try:
             tunnel = cf.create_tunnel(account_id, name)
-            token = cf.get_tunnel_token(account_id, str(tunnel.get("id") or ""))
-            self._ok({"tunnel": tunnel, "token": token}, "创建 Tunnel 成功", 201)
+            self._ok({"tunnel": tunnel}, "创建 Tunnel 成功", 201)
         except Exception as e:
             code = e.status if isinstance(e, CloudflareApiError) else 400
             self._err(str(e), code)
@@ -5447,6 +5465,16 @@ def _tunnels_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             self._err("缺少或无效的 config 参数", 400)
             return
         try:
+            cf.require_remote_tunnel(account_id, tunnel_id)
+            ingress = config.get("ingress")
+            if not isinstance(ingress, list) or not ingress or not self._is_fallback_ingress_rule(ingress[-1]):
+                raise ValueError("ingress 最后一条必须是不含 hostname 和 path 的兜底规则")
+            for index, rule in enumerate(ingress):
+                if not isinstance(rule, dict) or (index < len(ingress) - 1 and self._is_fallback_ingress_rule(rule)):
+                    raise ValueError("ingress 包含无效规则或提前出现的兜底规则")
+                self._validate_tunnel_service(rule.get("service"))
+                if rule.get("hostname"):
+                    self._validate_tunnel_hostname(rule["hostname"])
             cf.update_tunnel_config(account_id, tunnel_id, config)
             self._ok({"config": config}, "更新 Tunnel 配置成功")
         except Exception as e:
@@ -5467,13 +5495,14 @@ def _tunnels_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         if not service_raw:
             self._err("缺少 service", 400)
             return
-        if not zone_id:
-            self._err("缺少 zoneId", 400)
-            return
         try:
+            hostname_raw = self._validate_tunnel_hostname(hostname_raw)
+            service_raw = self._validate_tunnel_service(service_raw)
+            cf.require_remote_tunnel(account_id, tunnel_id)
+            zone_id = self._tunnel_zone(cf, account_id, hostname_raw, zone_id)
             raw = cf.get_tunnel_config(account_id, tunnel_id)
             config = self._extract_tunnel_config(raw)
-            if not config:
+            if config is None:
                 self._err("获取 Tunnel 配置失败: 返回格式无法解析", 502)
                 return
             old_config = json.loads(json.dumps(config, ensure_ascii=False))
@@ -5531,9 +5560,11 @@ def _tunnels_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             self._err("缺少 hostname", 400)
             return
         try:
+            hostname_raw = self._validate_tunnel_hostname(hostname_raw)
+            cf.require_remote_tunnel(account_id, tunnel_id)
             raw = cf.get_tunnel_config(account_id, tunnel_id)
             config = self._extract_tunnel_config(raw)
-            if not config:
+            if config is None:
                 self._err("获取 Tunnel 配置失败: 返回格式无法解析", 502)
                 return
             old_config = json.loads(json.dumps(config, ensure_ascii=False))
@@ -5547,10 +5578,18 @@ def _tunnels_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 if match_host and match_path:
                     continue
                 next_ingress.append(rule)
+            if len(next_ingress) == len(ingress):
+                self._err("公共路由不存在，请刷新后重试", 404)
+                return
+            shared_hostname = any(self._norm_hostname(r.get("hostname")) == host_key for r in next_ingress)
+            if delete_dns and not shared_hostname:
+                zone_id = self._tunnel_zone(cf, account_id, hostname_raw, zone_id)
             config["ingress"] = self._ensure_fallback_rule(next_ingress)
             cf.update_tunnel_config(account_id, tunnel_id, config)
             dns = None
-            if delete_dns and zone_id:
+            if delete_dns and shared_hostname:
+                dns = {"deleted": False, "reason": "同一主机名仍有其他路径使用此 DNS 记录"}
+            if delete_dns and zone_id and not shared_hostname:
                 try:
                     dns = cf.delete_tunnel_cname_record_if_match(zone_id, hostname_raw, tunnel_id)
                 except Exception as dns_err:
@@ -5615,6 +5654,10 @@ def _tunnels_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             self._err("缺少 network（CIDR）参数", 400)
             return
         try:
+            try:
+                network = str(ipaddress.ip_network(network, strict=True))
+            except ValueError:
+                raise ValueError("network 必须是有效的 CIDR 网段，例如 10.0.0.0/8；不能包含主机位")
             created = cf.create_cidr_route(
                 account_id,
                 {
@@ -5672,6 +5715,7 @@ def _tunnels_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             self._err("缺少 hostname 参数", 400)
             return
         try:
+            hostname = self._validate_tunnel_hostname(hostname, wildcard=False)
             created = cf.create_hostname_route(account_id, {"hostname": hostname, "tunnel_id": tunnel_id, "comment": comment or None})
             route = self._map_hostname_route(created)
             self._ok({"route": route}, "创建主机名路由成功", 201)
@@ -5706,10 +5750,19 @@ def _tunnels_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         cleanup_dns = self._parse_bool(first_or_none(q, "cleanupDns"))
         try:
             cleanup_summary = None
+            dns_records = []
             if cleanup_dns:
-                cleanup_summary = {"requested": True, "note": "Python 版本已执行 Tunnel 删除，DNS 清理按可识别主机名尽力执行"}
+                dns_records = cf.tunnel_dns_records(account_id, tunnel_id)
+                cleanup_summary = {"requested": True, "matched": len(dns_records), "deleted": 0, "errors": []}
             cf.delete_tunnel(account_id, tunnel_id)
-            self._ok({"cleanup": cleanup_summary}, "删除 Tunnel 成功")
+            for record in dns_records:
+                try:
+                    result = cf.delete_tunnel_cname_record_if_match(record["zoneId"], record["hostname"], tunnel_id)
+                    cleanup_summary["deleted"] += int(result.get("deleted") is True)
+                except Exception as exc:
+                    cleanup_summary["errors"].append({"hostname": record["hostname"], "message": str(exc)})
+            partial = cleanup_summary and cleanup_summary["errors"]
+            self._ok({"cleanup": cleanup_summary}, "Tunnel 已删除，部分 DNS 清理失败，请检查失败记录" if partial else "删除 Tunnel 成功")
         except Exception as e:
             code = e.status if isinstance(e, CloudflareApiError) else 400
             self._err(str(e), code)
@@ -5719,8 +5772,9 @@ def _tunnels_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
     if self.command == "GET" and m:
         tunnel_id = urllib.parse.unquote(m.group(1))
         try:
+            cf.require_remote_tunnel(account_id, tunnel_id)
             token = cf.get_tunnel_token(account_id, tunnel_id)
-            self._ok({"token": token}, "获取 Tunnel Token 成功")
+            self._sensitive_ok({"token": token}, "获取 Tunnel Token 成功")
         except Exception as e:
             code = e.status if isinstance(e, CloudflareApiError) else 400
             self._err(str(e), code)
@@ -6172,11 +6226,10 @@ def _accel_targets_for_cert_names(uid: int, cert_names: List[str]) -> List[Dict[
     Two sources:
       1. dns_record_acceleration_states — accelerations enabled from the panel
          (EdgeOne today).
-      2. Native provider resources: CF custom hostnames and Aliyun ESA proxied
-         records configured directly in those consoles. These have no panel
-         credential row of their own, so the user's DNS credentials for those
-         providers are enumerated (cached) and the matching credentials are
-         carried on the target for the binder.
+      2. Native provider resources: EdgeOne HTTPS hosts, CF custom hostnames
+         and Aliyun ESA proxied records configured directly in those consoles.
+         The user's provider credentials are enumerated (cached) and the
+         matching credentials are carried on the target for the binder.
     """
     normalized_names = [n for n in (_norm_host(x) for x in (cert_names or [])) if n]
     if not normalized_names:
@@ -6223,8 +6276,8 @@ def _accel_targets_for_cert_names(uid: int, cert_names: List[str]) -> List[Dict[
 
 
 def _native_cdn_targets(uid: int, normalized_names: List[str]) -> List[Dict[str, Any]]:
-    """Panel-external acceleration targets: CF custom hostnames + ESA proxied
-    records, discovered from the user's existing DNS credentials.
+    """Panel-external acceleration targets: EdgeOne HTTPS hosts, CF custom
+    hostnames and ESA proxied records, from the user's existing credentials.
 
     Cached per user for 5 minutes — a full sync iterates every certificate and
     listing zones/hostnames per cert would hammer the provider APIs. Failures
@@ -6241,11 +6294,12 @@ def _native_cdn_targets(uid: int, normalized_names: List[str]) -> List[Dict[str,
     try:
         with conn() as c:
             cred_rows = c.execute(
-                "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ? AND provider IN ('cloudflare', 'aliyun')",
+                "SELECT id, name, provider, secrets FROM dns_credentials WHERE userId = ? AND provider IN ('cloudflare', 'aliyun', 'edgeone') ORDER BY id ASC",
                 (uid,),
             ).fetchall()
     except Exception:
         return targets
+    seen_edgeone_accounts: set = set()
     for row in cred_rows:
         provider = str(row["provider"] or "").strip().lower()
         try:
@@ -6262,6 +6316,14 @@ def _native_cdn_targets(uid: int, normalized_names: List[str]) -> List[Dict[str,
             targets.extend(_discover_cf_hostname_targets(int(row["id"]), str(row["name"] or ""), secrets))
         elif provider == "aliyun":
             targets.extend(_discover_esa_record_targets(int(row["id"]), str(row["name"] or ""), secrets))
+        elif provider == "edgeone":
+            account = (str(secrets.get("secretId") or "").strip(), str(secrets.get("secretKey") or "").strip())
+            if not all(account) or account in seen_edgeone_accounts:
+                continue
+            # Use a stable EdgeOne credential; DNS/SSL aliases cannot pass
+            # _acceleration_auth even when they contain the same Tencent key.
+            seen_edgeone_accounts.add(account)
+            targets.extend(_discover_edgeone_https_targets(int(row["id"]), str(row["name"] or ""), secrets))
     try:
         cache_set(cache_key, targets, 300)
     except Exception:
@@ -6274,6 +6336,45 @@ def _target_covers(host: Any, normalized_names: List[str]) -> bool:
     if not h:
         return False
     return any(_wildcard_covers(name, h) or name == h for name in normalized_names)
+
+
+def _discover_edgeone_https_targets(cred_id: int, cred_name: str, secrets: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Scan existing HTTPS hosts using the plugin's paginated site/domain APIs."""
+    out: List[Dict[str, Any]] = []
+    try:
+        from modules.acceleration_plugins.edgeone import EdgeOneAccelerationPlugin
+        plugin = EdgeOneAccelerationPlugin(secrets)
+        sites = plugin.list_sites()
+    except Exception:
+        return out
+    seen_sites: set = set()
+    for site in sites:
+        site_id = str(site.get("siteId") or site.get("zoneId") or site.get("id") or "").strip()
+        if not site_id or site_id in seen_sites:
+            continue
+        seen_sites.add(site_id)
+        try:
+            listing = plugin.api.list_acceleration_domains(site_id)
+            for item in listing.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                mode = str(item.get("certificateMode") or "").strip().lower()
+                if mode in {"disable", "disabled", "off", "none"}:
+                    continue
+                if not (item.get("certificateBound") or item.get("certificateId")):
+                    continue
+                host = _norm_host(item.get("domainName"))
+                if host:
+                    out.append({
+                        "accelerationCredentialId": cred_id,
+                        "siteId": site_id,
+                        "domainName": host,
+                        "provider": "edgeone",
+                        "credentialName": cred_name,
+                    })
+        except Exception:
+            continue
+    return out
 
 
 def _discover_cf_hostname_targets(cred_id: int, cred_name: str, secrets: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -6678,7 +6779,7 @@ def _platform_upload_name(cert_row: Any, fingerprint: str) -> str:
 def _upsert_platform_deployment(
     uid: int, provider: str, cred_id: int, cert_row: Any, domain: str,
     platform_cert_id: str, platform_cert_name: str, fingerprint: str,
-    not_before: str, not_after: str, status: str, error: str,
+    not_before: str, not_after: str, status: str, error: str, *, uploaded: bool = False,
 ) -> None:
     ts = now_iso()
     try:
@@ -6699,7 +6800,7 @@ def _upsert_platform_deployment(
                      notAfter = excluded.notAfter,
                      status = excluded.status,
                      lastError = excluded.lastError,
-                     uploadedAt = excluded.uploadedAt,
+                     uploadedAt = COALESCE(excluded.uploadedAt, ssl_platform_deployments.uploadedAt),
                      syncedAt = excluded.syncedAt,
                      updatedAt = excluded.updatedAt""",
                 (
@@ -6708,7 +6809,7 @@ def _upsert_platform_deployment(
                     str(cert_row["remoteCertId"] or "") if cert_row is not None else "",
                     fingerprint, domain, platform_cert_id, platform_cert_name,
                     not_before, not_after, status, error or None,
-                    ts if status == "synced" else None,
+                    ts if uploaded or status == "synced" else None,
                     ts if status == "synced" else None,
                     ts, ts,
                 ),
@@ -6716,6 +6817,31 @@ def _upsert_platform_deployment(
             c.commit()
     except Exception:
         pass
+
+
+def _platform_deployment_domains(cert_row: Any, domains: List[str], provider: str) -> List[str]:
+    """Validate actual CDN targets and single-label TLS wildcard coverage."""
+    cert_names = _cert_all_names(cert_row)
+    targets: List[str] = []
+    for value in domains:
+        domain = _norm_host(value)
+        # 七牛 API 也使用 .example.com 表示已接入的泛域名，保留其目标名称。
+        qiniu_wildcard = provider == "qiniu" and domain.startswith(".")
+        coverage_name = "*" + domain if qiniu_wildcard else domain
+        if any(ch in domain for ch in (":", "/", "\\", "?", "#", "@")):
+            raise ValueError(f"无效 CDN 域名: {domain}；请填写域名，不要包含协议、端口或路径")
+        try:
+            coverage_name = acme_api.validate_domain(coverage_name)
+        except AcmeApiError as exc:
+            raise ValueError(f"无效 CDN 域名: {domain}") from exc
+        if not any(_wildcard_covers(name, coverage_name) for name in cert_names):
+            raise ValueError(f"以下域名不在证书覆盖范围内: {domain}；通配证书只覆盖一层子域名，不覆盖根域名")
+        domain = coverage_name[1:] if qiniu_wildcard else coverage_name
+        if domain not in targets:
+            targets.append(domain)
+    if not targets:
+        raise ValueError("缺少要绑定的 CDN 域名")
+    return targets
 
 
 def _deploy_pem_to_platform(
@@ -6727,6 +6853,7 @@ def _deploy_pem_to_platform(
     Returns {platformCertId, results: [{domain, ok, error?}]}.
     """
     provider = str(provider or "").strip().lower()
+    domains = _platform_deployment_domains(cert_row, domains, provider)
     public_pem = str(pem.get("publicKey") or "")
     private_pem = str(pem.get("privateKey") or "")
     if not public_pem or not private_pem:
@@ -6742,6 +6869,9 @@ def _deploy_pem_to_platform(
     platform_cert_name = ""
 
     if provider == "qiniu":
+        # 核验全部目标后再上传；证书 SAN 不能证明该账号已接入同名 CDN 域名。
+        for domain in domains:
+            api.get_domain_httpsconf(domain)
         upload = api.upload_cert(cert_name, public_pem, private_pem, common_name=str(cert_row["domain"] or ""))
         platform_cert_id = str(upload.get("certID") or "")
         platform_cert_name = cert_name
@@ -6832,6 +6962,7 @@ def _deploy_pem_to_platform(
             not_before, not_after,
             "synced" if item.get("ok") else "failed",
             "" if item.get("ok") else str(item.get("error") or ""),
+            uploaded=True,
         )
     return {
         "platformCertId": platform_cert_id,
@@ -6857,16 +6988,21 @@ def _sync_cert_to_platforms(handler, uid: int, cert_row: Any) -> Dict[str, Any]:
         names = []
     if not names:
         return {"synced": 0, "results": results, "skipped": "证书缺少域名"}
-    placeholders = ",".join("?" for _ in names)
     try:
         with conn() as c:
             rows = c.execute(
-                f"""SELECT d.*, cr.name AS credentialName
+                """SELECT d.*, cr.name AS credentialName
                       FROM ssl_platform_deployments d
                       LEFT JOIN dns_credentials cr ON cr.id = d.credentialId
-                     WHERE d.userId = ? AND d.domain IN ({placeholders})""",
-                (uid, *names),
+                     WHERE d.userId = ?""",
+                (uid,),
             ).fetchall()
+        # A wildcard is a certificate name, not a CDN hostname. Keep the
+        # existing target bindings and match their hosts using TLS semantics.
+        rows = [row for row in rows if any(
+            _wildcard_covers(name, "*" + _norm_host(row["domain"]) if _norm_host(row["domain"]).startswith(".") else row["domain"])
+            for name in names
+        )]
     except Exception:
         rows = []
     if not rows:
@@ -6887,7 +7023,7 @@ def _sync_cert_to_platforms(handler, uid: int, cert_row: Any) -> Dict[str, Any]:
             if cred_row is None:
                 raise ValueError("平台凭证已删除")
             secrets = handler._credential_secrets(cred_row)
-            domains = sorted({str(r["domain"] or "").strip().strip(".") for r in group if r["domain"]})
+            domains = sorted({_norm_host(r["domain"]) for r in group if r["domain"]})
             deploy = _deploy_pem_to_platform(handler, uid, provider, cred_row, secrets, cert_row, pem, domains)
         except Exception as exc:
             err = str(exc)[:400]
@@ -7765,12 +7901,6 @@ def _sync_cert_to_edgeone(handler: Any, uid: int, cert_row: Any, dry_run: bool =
             for t in group:
                 results.append({"domain": t["domainName"], "ok": False, "unsupported": True, "error": reason})
             continue
-        if dry_run:
-            # Preview ONLY — never resolve/upload a CertId, which would have
-            # cloud side effects (uploading a duplicate PEM per domain).
-            for t in group:
-                results.append({"domain": t["domainName"], "ok": True, "dryRun": True, "willBind": True})
-            continue
         for t in group:
             accel_domain = t["domainName"]
             # Snapshot the previous binding so a rebind that replaces the edge
@@ -7787,6 +7917,23 @@ def _sync_cert_to_edgeone(handler: Any, uid: int, cert_row: Any, dry_run: bool =
                     ).fetchone()
             except Exception:
                 old_binding = None
+            if old_binding is not None and str(old_binding["status"] or "") == "synced":
+                old_expiry = parse_certificate_datetime(old_binding["notAfter"] or "")
+                incoming_expiry = parse_certificate_datetime(cert_row["notAfter"] or "")
+                if (old_expiry is not None and incoming_expiry is not None
+                        and old_expiry > _ssl_now() and old_expiry > incoming_expiry):
+                    # Full sync can visit an older exact certificate after a
+                    # renewed wildcard. Keep the successful, fresher binding.
+                    results.append({
+                        "domain": accel_domain, "skipped": True,
+                        "reason": "已绑定有效期更长的证书",
+                        "edgeCertId": str(old_binding["edgeCertId"] or ""), "provider": provider,
+                    })
+                    continue
+            if dry_run:
+                # Never resolve/upload a CertId while previewing.
+                results.append({"domain": accel_domain, "ok": True, "dryRun": True, "willBind": True})
+                continue
             try:
                 edge_cert_id = binder(handler, uid, accel_cred_id, site_id, cert_row, accel_domain, dry_run)
                 _upsert_accel_cert_binding(
@@ -8825,7 +8972,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
 
     # Expected BaoTa plugin version. Bump together with baota-ssl-plugin's
     # info.json so deployed plugins can detect that an update is available.
-    PLUGIN_EXPECTED_VERSION = "2.1.0"
+    PLUGIN_EXPECTED_VERSION = "2.1.1"
 
     def _require_api_scope(required: str) -> bool:
         if not u.get("_api_token"):
@@ -9315,7 +9462,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 {
                     "expectedVersion": PLUGIN_EXPECTED_VERSION,
                     "minVersion": PLUGIN_EXPECTED_VERSION,
-                    "releaseNotes": "v2.1.0：同步时自动上报「域名 → 宝塔站点 / 反代 IP」清单，面板 SSL 页可查询当前域名绑定在哪个站点、被哪一个 IP 反代；修复若干问题。请升级插件后点「立即同步」生成快照",
+                    "releaseNotes": "v2.1.1：续期失败、站点部署失败、部署结果回传失败会明确显示失败原因；包含 v2.1.0 的域名→站点/反代来源上报。升级保留现有配置与续期开关。",
                 },
                 "获取插件版本要求成功",
             )
@@ -11336,6 +11483,89 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                             return True
                 return False
 
+            # ── Cloud-side certificate inventory (shared with the ACME pass) ──
+            # The ACME renewal pass below MUST NOT queue a new Let's Encrypt
+            # certificate while a cloud copy covering the same domain still has
+            # plenty of life left — that is exactly how duplicate wildcard
+            # certificates were created on every daily run. One inventory,
+            # both passes.
+            tencent_coverage: list = []
+            for _cr in cred_rows:
+                try:
+                    _sec = self._credential_secrets(_cr)
+                    _sid = str(_sec.get("secretId") or "").strip()
+                    _skey = str(_sec.get("secretKey") or "").strip()
+                    if not _sid or not _skey:
+                        continue
+                    _inv_api = TencentSslApi(_sid, _skey)
+                    _off = 0
+                    while _off <= 1000:
+                        _page = _inv_api.list_certificates(offset=_off, limit=100)
+                        _batch = _page.get("certificates") or []
+                        for _cert in _batch:
+                            if str(_cert.get("status") or "") not in ("issued", ""):
+                                continue
+                            _names = [_norm_host(_cert.get("domain"))]
+                            for _alt in (_cert.get("subjectAltName") or []):
+                                _names.append(_norm_host(_alt))
+                            _names = [n for n in _names if n]
+                            if not _names:
+                                continue
+                            _remaining = certificate_days_remaining(_cert.get("notAfter") or "", now_dt)
+                            if _remaining is None or _remaining <= 0:
+                                continue
+                            tencent_coverage.append({"names": _names, "days": int(_remaining)})
+                        if len(_batch) < 100:
+                            break
+                        _off += 100
+                except Exception:
+                    continue
+
+            def _tencent_covers(check_domain: str, min_days: int) -> bool:
+                """Whether a live Tencent certificate already covers `check_domain`.
+
+                Only certificates with MORE than `min_days` of life count, so a
+                hand-uploaded replacement inside the pre-expiry window never
+                blocks the renewal it was meant to perform.
+                """
+                raw = _norm_host(check_domain)
+                if not raw:
+                    return False
+                is_wildcard = raw.startswith("*.")
+                host = raw[2:] if is_wildcard else raw
+                if not host:
+                    return False
+                for item in tencent_coverage:
+                    if int(item.get("days") or 0) <= max(0, int(min_days)):
+                        continue
+                    for name in item["names"]:
+                        if is_wildcard:
+                            if name == raw:
+                                return True
+                            continue
+                        if name.startswith("*."):
+                            bare = name[2:]
+                            if host.endswith("." + bare) and host.count(".") == bare.count(".") + 1:
+                                return True
+                        elif host == name:
+                            return True
+                return False
+
+            def _coverage_allows(domain: str, days_left: Any) -> bool:
+                """Whether a renewal / re-issue for `domain` is still needed.
+
+                An ALREADY EXPIRED certificate must always be re-issued: Tencent
+                refuses OldCertificateId once it lapsed and acme.sh cannot re-use
+                a dead profile, so a fresh application is the only way back —
+                even when a replacement was uploaded but not deployed yet.
+                """
+                try:
+                    if days_left is not None and int(days_left) < 0:
+                        return True
+                except Exception:
+                    pass
+                return not _tencent_covers(domain, RENEWAL_TRIGGER_DAYS)
+
             for cr in cred_rows:
                 cr_secrets = self._credential_secrets(cr)
                 sid = str(cr_secrets.get("secretId") or "").strip()
@@ -11518,89 +11748,6 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 except Exception as ex:
                     failed.append({"domain": "*", "credential": cr["name"], "error": str(ex)})
 
-            # ── Cloud-side certificate inventory (shared with the ACME pass) ──
-            # The ACME renewal pass below MUST NOT queue a new Let's Encrypt
-            # certificate while a cloud copy covering the same domain still has
-            # plenty of life left — that is exactly how duplicate wildcard
-            # certificates were created on every daily run. One inventory,
-            # both passes.
-            tencent_coverage: list = []
-            for _cr in cred_rows:
-                try:
-                    _sec = self._credential_secrets(_cr)
-                    _sid = str(_sec.get("secretId") or "").strip()
-                    _skey = str(_sec.get("secretKey") or "").strip()
-                    if not _sid or not _skey:
-                        continue
-                    _inv_api = TencentSslApi(_sid, _skey)
-                    _off = 0
-                    while _off <= 1000:
-                        _page = _inv_api.list_certificates(offset=_off, limit=100)
-                        _batch = _page.get("certificates") or []
-                        for _cert in _batch:
-                            if str(_cert.get("status") or "") not in ("issued", ""):
-                                continue
-                            _names = [_norm_host(_cert.get("domain"))]
-                            for _alt in (_cert.get("subjectAltName") or []):
-                                _names.append(_norm_host(_alt))
-                            _names = [n for n in _names if n]
-                            if not _names:
-                                continue
-                            _remaining = certificate_days_remaining(_cert.get("notAfter") or "", now_dt)
-                            if _remaining is None or _remaining <= 0:
-                                continue
-                            tencent_coverage.append({"names": _names, "days": int(_remaining)})
-                        if len(_batch) < 100:
-                            break
-                        _off += 100
-                except Exception:
-                    continue
-
-            def _tencent_covers(check_domain: str, min_days: int) -> bool:
-                """Whether a live Tencent certificate already covers `check_domain`.
-
-                Only certificates with MORE than `min_days` of life count, so a
-                hand-uploaded replacement inside the pre-expiry window never
-                blocks the renewal it was meant to perform.
-                """
-                raw = _norm_host(check_domain)
-                if not raw:
-                    return False
-                is_wildcard = raw.startswith("*.")
-                host = raw[2:] if is_wildcard else raw
-                if not host:
-                    return False
-                for item in tencent_coverage:
-                    if int(item.get("days") or 0) <= max(0, int(min_days)):
-                        continue
-                    for name in item["names"]:
-                        if is_wildcard:
-                            if name == raw:
-                                return True
-                            continue
-                        if name.startswith("*."):
-                            bare = name[2:]
-                            if host.endswith("." + bare) and host.count(".") == bare.count(".") + 1:
-                                return True
-                        elif host == name:
-                            return True
-                return False
-
-            def _coverage_allows(domain: str, days_left: Any) -> bool:
-                """Whether a renewal / re-issue for `domain` is still needed.
-
-                An ALREADY EXPIRED certificate must always be re-issued: Tencent
-                refuses OldCertificateId once it lapsed and acme.sh cannot re-use
-                a dead profile, so a fresh application is the only way back —
-                even when a replacement was uploaded but not deployed yet.
-                """
-                try:
-                    if days_left is not None and int(days_left) < 0:
-                        return True
-                except Exception:
-                    pass
-                return not _tencent_covers(domain, RENEWAL_TRIGGER_DAYS)
-
             # ── acme.sh certificates: queue renewals ──
             # DNS-01 renewal can take several minutes. Never execute acme.sh in
             # the request thread: persist a renew job and let the same durable
@@ -11716,11 +11863,14 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
         # remove local rows whose remote certificate was deleted/expired.
         if self.command == "POST" and sub == "/certificates/reconcile":
             cred_id_raw = _get_cred_id()
-            if cred_id_raw and cred_id_raw != "all":
+            explicit_credential = bool(cred_id_raw and cred_id_raw != "all")
+            if explicit_credential:
                 targets = []
                 row = self._get_credential_row(uid, cred_id_raw)
-                if row is not None:
-                    targets = [row]
+                if row is None:
+                    self._err("指定凭证不存在或无权访问", 404)
+                    return
+                targets = [row]
             else:
                 # Any credential that carries Tencent SecretId/SecretKey owns
                 # certificates — a DNSPod/DNS credential is routinely also the
@@ -11739,6 +11889,12 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     sid = str(sec.get("secretId") or "").strip()
                     skey = str(sec.get("secretKey") or "").strip()
                     if not sid or not skey:
+                        # Whole-account maintenance includes unrelated DNS/CDN
+                        # credentials. Their different auth fields are not a
+                        # Tencent failure (Qiniu also uses a secretKey field).
+                        provider = str(cr["provider"] or "").strip().lower()
+                        if not explicit_credential and provider not in ("tencent_ssl", "dnspod", "edgeone"):
+                            continue
                         raise ValueError("腾讯云凭证缺少 SecretId / SecretKey")
                     api = TencentSslApi(sid, skey)
                     fetched = []
@@ -12833,11 +12989,10 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             if certificate_is_expired(cert_row["notAfter"] or "") and not body.get("force"):
                 self._err("证书已过期，请先续期再上传", 409)
                 return
-            cert_names = _cert_all_names(cert_row)
-            invalid = [d for d in domains if d not in cert_names]
-            if invalid:
-                hint = "（又拍云域名必须同时满足：已接入你的又拍云账号 + 在证书覆盖范围内）" if provider == "upyun" else ""
-                self._err(f"以下域名不在证书覆盖范围内: {', '.join(invalid)} {hint}", 400)
+            try:
+                domains = _platform_deployment_domains(cert_row, domains, provider)
+            except ValueError as exc:
+                self._err(str(exc), 400)
                 return
             cred_row, cred_provider, secrets = _platform_credential_row(self, uid, body.get("credentialId"))
             if cred_provider != provider:
@@ -12863,6 +13018,28 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 message += f"并绑定 {ok_n} 个域名"
             self._ok(result, message, 201)
             return
+
+        def _platform_edgeone_credentials():
+            # 同一腾讯密钥可能同时保存为 SSL/加速凭证；最低 ID 作为稳定代表。
+            with conn() as c:
+                credential_rows = c.execute(
+                    "SELECT id, name, secrets FROM dns_credentials WHERE userId = ? ORDER BY id ASC",
+                    (uid,),
+                ).fetchall()
+            accounts: Dict[tuple, tuple] = {}
+            aliases: Dict[int, int] = {}
+            for credential in credential_rows:
+                try:
+                    secrets = self._credential_secrets(credential)
+                    secret_id = str(secrets.get("secretId") or "").strip()
+                    secret_key = str(secrets.get("secretKey") or "").strip()
+                    if not secret_id or not secret_key:
+                        continue
+                    representative = accounts.setdefault((secret_id, secret_key), (credential, secret_id, secret_key))
+                    aliases[int(credential["id"])] = int(representative[0]["id"])
+                except Exception:
+                    continue
+            return list(accounts.values()), aliases
 
         # GET /api/ssl/platform-deployments — deployment records for visualization
         if self.command == "GET" and sub in ("/platform-deployments", "/platform-deployments/"):
@@ -12957,25 +13134,21 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             # 所有 EdgeOne 凭证的站点/域名，匹配证书 ID 生成实时条目。
             edgeone_items: List[Dict[str, Any]] = []
             eo_seen_domains: set = set()
+            eo_seen_sites: set = set()
+            eo_credential_aliases: Dict[int, int] = {}
             try:
-                with conn() as c:
-                    eo_cred_rows = c.execute(
-                        "SELECT id, name, secrets FROM dns_credentials WHERE userId = ?",
-                        (uid,),
-                    ).fetchall()
-                for eo_cred in eo_cred_rows:
+                eo_accounts, eo_credential_aliases = _platform_edgeone_credentials()
+                for eo_cred, eo_sid, eo_skey in eo_accounts:
                     try:
-                        eo_secrets = self._credential_secrets(eo_cred)
-                        eo_sid = str(eo_secrets.get("secretId") or "").strip()
-                        eo_skey = str(eo_secrets.get("secretKey") or "").strip()
-                        if not eo_sid or not eo_skey:
-                            continue
+                        eo_account_id = int(eo_cred["id"])
                         from modules.tencent_edgeone_api import TencentEdgeOneApi as _EoApi
                         eo_api = _EoApi(eo_sid, eo_skey)
                         for zone in (eo_api.list_zones(offset=0, limit=100).get("zones") or []):
                             zone_id = str(zone.get("zoneId") or zone.get("id") or "").strip()
-                            if not zone_id:
+                            zone_key = (eo_account_id, zone_id)
+                            if not zone_id or zone_key in eo_seen_sites:
                                 continue
+                            eo_seen_sites.add(zone_key)
                             try:
                                 listing = eo_api.list_acceleration_domains(zone_id)
                             except Exception:
@@ -12983,9 +13156,10 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                             for entry in (listing.get("items") or []):
                                 domain_name = str(entry.get("domainName") or "").strip().strip(".").lower()
                                 cert_id = str(entry.get("certificateId") or "").strip()
-                                if not domain_name or not cert_id or domain_name in eo_seen_domains:
+                                domain_key = (eo_account_id, zone_id, domain_name)
+                                if not domain_name or not cert_id or domain_key in eo_seen_domains:
                                     continue
-                                eo_seen_domains.add(domain_name)
+                                eo_seen_domains.add(domain_key)
                                 # 找面板证书行（同账号 remoteCertId 匹配）。
                                 cert_row_eo = None
                                 try:
@@ -13001,6 +13175,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                                     "provider": "edgeone",
                                     "providerLabel": "腾讯云 EdgeOne",
                                     "credentialId": int(eo_cred["id"]),
+                                    "siteId": zone_id,
                                     "credentialName": str(eo_cred["name"] or "EdgeOne"),
                                     "certRemoteId": cert_id,
                                     "domain": domain_name,
@@ -13023,18 +13198,27 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             try:
                 with conn() as c:
                     eo_rows = c.execute(
-                        "SELECT * FROM acceleration_cert_bindings WHERE userId = ? AND provider = 'edgeone' ORDER BY updatedAt DESC LIMIT 500",
+                        "SELECT * FROM acceleration_cert_bindings WHERE userId = ? AND provider = 'edgeone' ORDER BY updatedAt DESC, id DESC LIMIT 500",
                         (uid,),
                     ).fetchall()
                 for row in eo_rows:
+                    credential_id = int(row["accelerationCredentialId"] or 0)
+                    account_id = eo_credential_aliases.get(credential_id, credential_id)
+                    site_id = str(row["siteId"] or "").strip()
+                    domain_name = _norm_host(row["domainName"])
+                    domain_key = (account_id, site_id, domain_name)
+                    if domain_key in eo_seen_domains:
+                        continue
+                    eo_seen_domains.add(domain_key)
                     edgeone_items.append({
                         "id": -int(row["id"] or 0),
                         "provider": "edgeone",
                         "providerLabel": "腾讯云 EdgeOne",
-                        "credentialId": int(row["accelerationCredentialId"] or 0),
+                        "credentialId": account_id,
+                        "siteId": site_id,
                         "credentialName": "EdgeOne 加速",
                         "certRemoteId": str(row["certRemoteId"] or ""),
-                        "domain": str(row["domainName"] or ""),
+                        "domain": domain_name,
                         "platformCertId": str(row["edgeCertId"] or ""),
                         "notBefore": "",
                         "notAfter": str(row["notAfter"] or ""),
@@ -13088,34 +13272,34 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             # ── EdgeOne 加速绑定（腾讯云 EdgeOne）也纳入检查 ──
             # 实时扫描 EdgeOne 站点域名（绑定状态以 API 为准）。
             eo_checks: List[Dict[str, Any]] = []
+            eo_seen_domains: set = set()
+            eo_zone_listings: Dict[tuple, Any] = {}
+            eo_credential_aliases: Dict[int, int] = {}
             try:
-                with conn() as c:
-                    eo_cred_rows_c = c.execute(
-                        "SELECT id, name, secrets FROM dns_credentials WHERE userId = ?",
-                        (uid,),
-                    ).fetchall()
-                for eo_cred in eo_cred_rows_c:
+                eo_accounts, eo_credential_aliases = _platform_edgeone_credentials()
+                for eo_cred, eo_sid, eo_skey in eo_accounts:
                     try:
-                        eo_secrets = self._credential_secrets(eo_cred)
-                        eo_sid = str(eo_secrets.get("secretId") or "").strip()
-                        eo_skey = str(eo_secrets.get("secretKey") or "").strip()
-                        if not eo_sid or not eo_skey:
-                            continue
+                        eo_account_id = int(eo_cred["id"])
                         from modules.tencent_edgeone_api import TencentEdgeOneApi as _EoApi
                         eo_api = _EoApi(eo_sid, eo_skey)
                         for zone in (eo_api.list_zones(offset=0, limit=100).get("zones") or []):
                             zone_id = str(zone.get("zoneId") or zone.get("id") or "").strip()
-                            if not zone_id:
+                            zone_key = (eo_account_id, zone_id)
+                            if not zone_id or zone_key in eo_zone_listings:
                                 continue
                             try:
                                 listing = eo_api.list_acceleration_domains(zone_id)
-                            except Exception:
+                                eo_zone_listings[zone_key] = listing
+                            except Exception as exc:
+                                eo_zone_listings[zone_key] = exc
                                 continue
                             for entry in (listing.get("items") or []):
                                 domain_name = str(entry.get("domainName") or "").strip().strip(".").lower()
                                 cert_id = str(entry.get("certificateId") or "").strip()
-                                if not domain_name or not cert_id:
+                                domain_key = (eo_account_id, zone_id, domain_name)
+                                if not domain_name or not cert_id or domain_key in eo_seen_domains:
                                     continue
+                                eo_seen_domains.add(domain_key)
                                 live_eo = {
                                     "bound": True,
                                     "certificateId": cert_id,
@@ -13126,6 +13310,8 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                                 }
                                 item_eo: Dict[str, Any] = {
                                     "deploymentId": -len(eo_checks) - 1,
+                                    "credentialId": int(eo_cred["id"]),
+                                    "siteId": zone_id,
                                     "provider": "edgeone",
                                     "providerLabel": "腾讯云 EdgeOne",
                                     "domain": domain_name,
@@ -13151,7 +13337,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
             try:
                 with conn() as c:
                     eo_rows = c.execute(
-                        "SELECT * FROM acceleration_cert_bindings WHERE userId = ? ORDER BY updatedAt DESC LIMIT 500",
+                        "SELECT * FROM acceleration_cert_bindings WHERE userId = ? ORDER BY updatedAt DESC, id DESC LIMIT 500",
                         (uid,),
                     ).fetchall()
             except Exception:
@@ -13160,13 +13346,20 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                 provider = str(row["provider"] or "edgeone").strip().lower()
                 if provider != "edgeone":
                     continue
-                domain = str(row["domainName"] or "").strip().strip(".")
+                domain = _norm_host(row["domainName"])
                 edge_cert_id = str(row["edgeCertId"] or "").strip()
+                accel_cred_id = int(row["accelerationCredentialId"] or 0)
+                account_id = eo_credential_aliases.get(accel_cred_id, accel_cred_id)
+                site_id = str(row["siteId"] or "").strip()
+                domain_key = (account_id, site_id, domain.lower())
                 # 实时扫描已覆盖的域名跳过。
-                if any(c3.get("domain") == domain.lower() and c3.get("provider") == "edgeone" for c3 in checks):
+                if domain_key in eo_seen_domains:
                     continue
+                eo_seen_domains.add(domain_key)
                 item: Dict[str, Any] = {
                     "deploymentId": -int(row["id"] or 0),  # 负数 id 区分 EdgeOne 绑定
+                    "credentialId": account_id,
+                    "siteId": site_id,
                     "provider": "edgeone",
                     "providerLabel": "腾讯云 EdgeOne",
                     "domain": domain,
@@ -13178,14 +13371,21 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                     "isEdgeOne": True,
                 }
                 try:
-                    accel_cred_id = int(row["accelerationCredentialId"] or 0)
-                    accel_ctx = self._acceleration_auth(uid, accel_cred_id)
-                    accel_api = accel_ctx.get("api")
-                    site_id = str(row["siteId"] or "").strip()
+                    zone_key = (account_id, site_id)
+                    if zone_key not in eo_zone_listings:
+                        accel_ctx = self._acceleration_auth(uid, accel_cred_id)
+                        accel_api = accel_ctx.get("api")
+                        if accel_api is not None and hasattr(accel_api, "list_acceleration_domains"):
+                            try:
+                                eo_zone_listings[zone_key] = accel_api.list_acceleration_domains(site_id)
+                            except Exception as exc:
+                                eo_zone_listings[zone_key] = exc
+                    listing = eo_zone_listings.get(zone_key)
+                    if isinstance(listing, Exception):
+                        raise listing
                     live: Dict[str, Any] = {}
-                    if accel_api is not None and hasattr(accel_api, "list_acceleration_domains"):
+                    if isinstance(listing, dict):
                         try:
-                            listing = accel_api.list_acceleration_domains(site_id)
                             for entry in (listing.get("items") or []):
                                 if str(entry.get("domainName") or "").strip().strip(".").lower() == domain.lower():
                                     live = {
@@ -13240,7 +13440,7 @@ def _ssl_routes(self, path: str, q: Dict[str, List[str]], b: bytes) -> None:
                         })
                     continue
                 for row in group:
-                    domain = str(row["domain"] or "").strip().strip(".")
+                    domain = _norm_host(row["domain"])
                     item: Dict[str, Any] = {
                         "deploymentId": row["id"],
                         "provider": provider,

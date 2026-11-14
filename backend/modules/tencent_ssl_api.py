@@ -329,7 +329,7 @@ class TencentSslApi:
         if alias:
             payload["Alias"] = alias
         resp = self._tc3_request("UploadCertificate", payload)
-        return {"CertificateId": resp.get("CertId", "")}
+        return {"CertificateId": resp.get("CertificateId") or resp.get("CertId") or resp.get("RepeatCertId") or ""}
 
     def delete_certificate(self, certificate_id: str) -> Dict[str, Any]:
         resp = self._tc3_request("DeleteCertificate", {"CertificateId": certificate_id})
@@ -381,6 +381,24 @@ class TencentSslApi:
             "isUploaded": resp.get("IsUpload", False),
             "remoteCreatedAt": _format_certificate_datetime(resp.get("InsertTime", "")),
         }
+        public_pem = str(resp.get("CertificatePublicKey") or "")
+        if public_pem:
+            try:
+                from modules.acme_api import parse_cert_pem
+                meta = parse_cert_pem(public_pem)
+                # The PEM provides the SHA-256 identity used for upload reuse
+                # and UTC validity, unlike the cloud's offsetless date strings.
+                for key in ("fingerprintSha256", "notBefore", "notAfter", "san", "issuer",
+                            "subjectCN", "serialNumber", "signatureAlgorithm"):
+                    if key in meta:
+                        base[key] = meta[key]
+                base["daysRemaining"] = certificate_days_remaining(base["notAfter"])
+                base["isExpired"] = certificate_is_expired(base["notAfter"])
+                if _normalize_status(resp.get("Status")) == "issued":
+                    base["status"] = "expired" if base["isExpired"] else "issued"
+            except Exception:
+                # Incomplete issuance responses may not contain a usable PEM.
+                pass
         dv_auths = resp.get("DvAuths")
         if isinstance(dv_auths, list):
             base["dvAuths"] = [

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import base64
 import json
-import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -114,16 +112,24 @@ class CloudflareApi:
             return False
 
     def list_accounts(self) -> List[Dict[str, Any]]:
-        result = self._request("GET", "/accounts", {"per_page": 50})
-        if not isinstance(result, list):
-            return []
+        try:
+            result = self._list_tunnel_pages("/accounts", {"per_page": 50})
+        except CloudflareApiError as exc:
+            if exc.status != 403:
+                raise
+            result = []
+        if not result:
+            zones = self._list_tunnel_pages("/zones", {"per_page": 50})
+            result = [z.get("account") for z in zones if isinstance(z.get("account"), dict)]
         out = []
+        seen = set()
         for row in result:
             if not isinstance(row, dict):
                 continue
             aid = str(row.get("id") or "").strip()
-            if not aid:
+            if not aid or aid in seen:
                 continue
+            seen.add(aid)
             out.append({"id": aid, "name": row.get("name")})
         return out
 
@@ -137,6 +143,59 @@ class CloudflareApi:
             if isinstance(account, dict):
                 return str(account.get("id") or "")
         return ""
+
+    def _list_tunnel_pages(self, path: str, query: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+        """Read complete account/tunnel collections; never silently truncate."""
+        query = dict(query or {})
+        page = max(1, int(query.get("page") or 1))
+        size = max(1, int(query.get("per_page") or 50))
+        rows: List[Dict[str, Any]] = []
+        previous = None
+        first_page = page
+        read_count = 0
+        expected_count = None
+        total_pages = None
+        while True:
+            payload = self._request("GET", path, {**query, "page": page, "per_page": size}, include_meta=True)
+            batch = payload.get("result") if isinstance(payload, dict) else None
+            if isinstance(batch, dict):
+                batch = next((batch[k] for k in ("items", "routes", "result") if isinstance(batch.get(k), list)), None)
+            if not isinstance(batch, list):
+                raise CloudflareApiError("Cloudflare 分页响应格式错误", 502)
+            if batch and batch == previous:
+                raise CloudflareApiError("Cloudflare 分页未推进，无法取得完整列表", 502)
+            rows.extend(r for r in batch if isinstance(r, dict))
+            read_count += len(batch)
+            info = payload.get("result_info") or {}
+            if info.get("total_pages") is not None:
+                total_pages = int(info["total_pages"])
+            if info.get("total_count") is not None:
+                returned_size = int(info.get("per_page") or len(batch) or size)
+                expected_count = max(0, int(info["total_count"]) - (first_page - 1) * returned_size)
+            if not batch or (total_pages is not None and page >= total_pages):
+                if expected_count is not None and read_count < expected_count:
+                    raise CloudflareApiError("Cloudflare 返回的列表不完整，请刷新重试", 502)
+                break
+            if total_pages is None and expected_count is not None and read_count >= expected_count:
+                break
+            previous = batch
+            page += 1
+        return rows
+
+    def list_tunnel_zones(self, account_id: str) -> List[Dict[str, Any]]:
+        zones = self._list_tunnel_pages("/zones", {"account.id": account_id, "per_page": 50})
+        return [z for z in zones if str((z.get("account") or {}).get("id") or "") == account_id]
+
+    def tunnel_dns_records(self, account_id: str, tunnel_id: str) -> List[Dict[str, str]]:
+        target = f"{tunnel_id}.cfargotunnel.com".lower()
+        matches = []
+        for zone in self.list_tunnel_zones(account_id):
+            zid = str(zone.get("id") or "")
+            records = self._list_tunnel_pages(f"/zones/{urllib.parse.quote(zid)}/dns_records", {"type": "CNAME", "content": target, "per_page": 100})
+            for record in records:
+                if str(record.get("type") or "").upper() == "CNAME" and self.normalize_hostname(record.get("content")) == target and record.get("id"):
+                    matches.append({"zoneId": zid, "id": str(record["id"]), "hostname": str(record.get("name") or "")})
+        return matches
 
     def get_zone_by_name(self, domain: str, account_id: str | None = None) -> Dict[str, Any] | None:
         q: Dict[str, Any] = {"name": str(domain or "").strip(), "per_page": 1}
@@ -302,23 +361,17 @@ class CloudflareApi:
         return str(origin or "")
 
     def list_tunnels(self, account_id: str, page: int = 1, page_size: int = 50) -> List[Dict[str, Any]]:
-        res = self._request(
-            "GET",
+        res = self._list_tunnel_pages(
             f"/accounts/{urllib.parse.quote(str(account_id or '').strip())}/cfd_tunnel",
-            {"page": int(page), "per_page": int(page_size)},
+            {"page": int(page), "per_page": int(page_size), "is_deleted": "false"},
         )
-        if isinstance(res, list):
-            return res
-        if isinstance(res, dict) and isinstance(res.get("items"), list):
-            return res.get("items")
-        return []
+        return [r for r in res if not r.get("deleted_at")]
 
     def create_tunnel(self, account_id: str, name: str) -> Dict[str, Any]:
-        secret = base64.b64encode(os.urandom(32)).decode("ascii")
         res = self._request(
             "POST",
             f"/accounts/{urllib.parse.quote(str(account_id or '').strip())}/cfd_tunnel",
-            body={"name": str(name or "").strip(), "tunnel_secret": secret},
+            body={"name": str(name or "").strip(), "config_src": "cloudflare"},
         )
         if not isinstance(res, dict):
             raise CloudflareApiError("创建 Tunnel 失败", 502)
@@ -336,17 +389,23 @@ class CloudflareApi:
             "GET",
             f"/accounts/{urllib.parse.quote(str(account_id or '').strip())}/cfd_tunnel/{urllib.parse.quote(str(tunnel_id or '').strip())}/token",
         )
-        if isinstance(res, str):
-            return res
-        if isinstance(res, dict):
-            return str(res.get("token") or json.dumps(res, ensure_ascii=False))
-        return str(res or "")
+        token = res.get("token") if isinstance(res, dict) else res
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+        raise CloudflareApiError("Cloudflare 未返回有效的 Tunnel Token", 502)
 
     def get_tunnel_config(self, account_id: str, tunnel_id: str) -> Any:
         return self._request(
             "GET",
             f"/accounts/{urllib.parse.quote(str(account_id or '').strip())}/cfd_tunnel/{urllib.parse.quote(str(tunnel_id or '').strip())}/configurations",
         )
+
+    def require_remote_tunnel(self, account_id: str, tunnel_id: str) -> None:
+        tunnel = self._request("GET", f"/accounts/{urllib.parse.quote(account_id)}/cfd_tunnel/{urllib.parse.quote(tunnel_id)}")
+        if not isinstance(tunnel, dict):
+            raise CloudflareApiError("Tunnel 详情格式错误", 502)
+        if tunnel.get("remote_config") is False or tunnel.get("config_src") == "local":
+            raise CloudflareApiError("该 Tunnel 由本地配置管理，请在运行 cloudflared 的机器上编辑配置", 400)
 
     def update_tunnel_config(self, account_id: str, tunnel_id: str, config: Dict[str, Any]) -> Any:
         return self._request(
@@ -359,9 +418,9 @@ class CloudflareApi:
         query: Dict[str, Any] = {"page": int(page), "per_page": int(page_size), "is_deleted": "false"}
         if tunnel_id:
             query["tunnel_id"] = str(tunnel_id)
-        res = self._request("GET", f"/accounts/{urllib.parse.quote(str(account_id or '').strip())}/teamnet/routes", query)
+        res = self._list_tunnel_pages(f"/accounts/{urllib.parse.quote(str(account_id or '').strip())}/teamnet/routes", query)
         if isinstance(res, list):
-            return res
+            return [r for r in res if not r.get("deleted_at") and (not tunnel_id or str(r.get("tunnel_id") or "") == str(tunnel_id))]
         if isinstance(res, dict):
             for key in ("result", "routes", "items"):
                 val = res.get(key)
@@ -380,12 +439,12 @@ class CloudflareApi:
         return True
 
     def list_hostname_routes(self, account_id: str, tunnel_id: str | None = None, page: int = 1, page_size: int = 100) -> List[Dict[str, Any]]:
-        query: Dict[str, Any] = {"page": int(page), "per_page": int(page_size)}
+        query: Dict[str, Any] = {"page": int(page), "per_page": int(page_size), "is_deleted": "false"}
         if tunnel_id:
             query["tunnel_id"] = str(tunnel_id)
-        res = self._request("GET", f"/accounts/{urllib.parse.quote(str(account_id or '').strip())}/zerotrust/routes/hostname", query)
+        res = self._list_tunnel_pages(f"/accounts/{urllib.parse.quote(str(account_id or '').strip())}/zerotrust/routes/hostname", query)
         if isinstance(res, list):
-            return res
+            return [r for r in res if not r.get("deleted_at") and (not tunnel_id or str(r.get("tunnel_id") or "") == str(tunnel_id))]
         if isinstance(res, dict):
             for key in ("result", "routes", "items"):
                 val = res.get(key)
@@ -437,6 +496,8 @@ class CloudflareApi:
         if existing_cname:
             content = str(existing_cname.get("content") or "").rstrip(".").lower()
             proxied = existing_cname.get("proxied") is True
+            if content != target_norm:
+                raise CloudflareApiError("主机名已指向其他 CNAME，无法覆盖；请先检查现有 DNS 记录", 409)
             if content == target_norm and proxied:
                 return {"action": "unchanged"}
             self.update_record(

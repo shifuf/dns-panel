@@ -172,6 +172,7 @@ export interface Tunnel {
   created_at?: string;
   deleted_at?: string;
   connections?: Array<{
+    id?: string;
     colo_name?: string;
     is_pending_reconnect?: boolean;
     uuid?: string;
@@ -183,6 +184,7 @@ export interface Tunnel {
   conns_active_at?: string;
   conns_inactive_at?: string;
   remote_config?: boolean;
+  config_src?: 'local' | 'cloudflare';
   tun_type?: string;
 }
 

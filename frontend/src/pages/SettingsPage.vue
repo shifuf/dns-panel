@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue';
-import { NCheckbox, NInput, NInputNumber, NSelect, NButton, NSwitch, NRadioGroup, NRadio, NTag, NEmpty, useDialog, useMessage, NTabs, NTab } from 'naive-ui';
+import { NCheckbox, NInput, NInputNumber, NSelect, NButton, NSwitch, NRadioGroup, NRadio, useDialog, useMessage, NTabs, NTab } from 'naive-ui';
 import { Save, Info, Download, Upload, Database, RefreshCw, CloudUpload } from 'lucide-vue-next';
 import { useQueryClient } from '@tanstack/vue-query';
 import type { BackupPayload } from '@/types';
@@ -421,6 +421,10 @@ function formatWebdavResult(result: any): string {
 }
 
 async function refreshRestoredData() {
+  queryClient.removeQueries({
+    predicate: ({ queryKey }) => queryKey[0] === 'tunnels' || String(queryKey[0]).startsWith('tunnel-'),
+  });
+  await queryClient.invalidateQueries({ queryKey: ['domains-cred'], refetchType: 'none' });
   await Promise.allSettled([
     providerStore.loadData(),
     queryClient.invalidateQueries({ queryKey: ['domains'] }),

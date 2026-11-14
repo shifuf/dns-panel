@@ -574,6 +574,7 @@ export interface PlatformCredential {
 
 export interface PlatformDeployment {
   id: number;
+  siteId?: string;
   provider: 'qiniu' | 'upyun' | string;
   providerLabel?: string;
   credentialId: number;
@@ -610,6 +611,7 @@ export interface UpyunAccountDomain {
 export interface PlatformDeploymentsResponse {
   deployments: PlatformDeployment[];
   upyunDomains?: UpyunAccountDomain[];
+  upyunError?: string;
   overview: {
     total: number;
     byProvider: Record<string, { total: number; failed: number; expiringSoon: number; expired: number; domains: Array<{ domain: string; notAfter?: string; status?: string }> }>;
@@ -642,6 +644,8 @@ export async function deployCertToPlatform(
 
 export interface PlatformBindingCheck {
   deploymentId: number;
+  credentialId?: number;
+  siteId?: string;
   provider: string;
   providerLabel?: string;
   domain: string;

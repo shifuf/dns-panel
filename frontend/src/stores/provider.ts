@@ -3,6 +3,7 @@ import { ref, computed } from 'vue';
 import type { ProviderType, ProviderConfig, DnsCredential, ProviderCapabilities } from '@/types/dns';
 import { getProviders, getDnsCredentials } from '@/services/dnsCredentials';
 import { normalizeProviderType } from '@/utils/provider';
+import { onSessionReset } from '@/services/session';
 
 const STORAGE_KEY_PROVIDER = 'dns_selected_provider';
 const STORAGE_KEY_CREDENTIAL = 'dns_selected_credential';
@@ -36,6 +37,17 @@ export const useProviderStore = defineStore('provider', () => {
   const selectedCredentialId = ref<number | 'all' | null>(null);
   const isLoading = ref(cachedProviders.length === 0);
   const error = ref<string | null>(null);
+  let loadVersion = 0;
+
+  onSessionReset(() => {
+    loadVersion += 1;
+    providers.value = [];
+    credentials.value = [];
+    selectedProvider.value = null;
+    selectedCredentialId.value = null;
+    isLoading.value = true;
+    error.value = null;
+  });
 
   // Synchronous rehydration from localStorage when cache exists
   if (cachedCredentials.length > 0) {
@@ -112,6 +124,7 @@ export const useProviderStore = defineStore('provider', () => {
   }
 
   async function loadData() {
+    const version = ++loadVersion;
     try {
       const hasCache = providers.value.length > 0;
       if (!hasCache) isLoading.value = true;
@@ -121,6 +134,7 @@ export const useProviderStore = defineStore('provider', () => {
         getProviders(),
         getDnsCredentials(),
       ]);
+      if (version !== loadVersion) return;
 
       const providerList = (provsRes.data?.providers || [])
         .map((p) => ({
@@ -201,9 +215,9 @@ export const useProviderStore = defineStore('provider', () => {
         localStorage.removeItem(STORAGE_KEY_CREDENTIAL);
       }
     } catch (err: any) {
-      error.value = err?.message || '加载数据失败';
+      if (version === loadVersion) error.value = String(err?.message || err || '加载数据失败');
     } finally {
-      isLoading.value = false;
+      if (version === loadVersion) isLoading.value = false;
     }
   }
 

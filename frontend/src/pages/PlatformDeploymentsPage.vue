@@ -121,7 +121,7 @@
         </div>
         <div class="ml-auto flex flex-wrap items-center gap-1.5">
           <NTag size="tiny" :bordered="false" :type="dep.status === 'synced' ? 'success' : dep.status === 'failed' ? 'error' : 'warning'">
-            {{ dep.status === 'synced' ? '已同步' : dep.status === 'failed' ? '上传失败' : dep.status }}
+            {{ dep.status === 'synced' ? '已同步' : dep.status === 'failed' ? (dep.platformCertId ? '已上传，绑定失败' : '上传失败') : dep.status }}
           </NTag>
           <NTag v-if="dep.isExpired" size="tiny" type="error" :bordered="false">已过期</NTag>
           <NTag v-else-if="dep.daysRemaining !== null && dep.daysRemaining !== undefined && dep.daysRemaining <= 30" size="tiny" type="warning" :bordered="false">剩 {{ dep.daysRemaining }} 天</NTag>
@@ -178,7 +178,10 @@
         <p v-if="checkFor(dep)!.live?.error" class="mt-1 break-all text-xs text-red-500">{{ checkFor(dep)!.live!.error }}</p>
       </div>
 
-      <p v-if="dep.lastError" class="mt-2 break-all text-xs text-red-500">{{ dep.lastError }}</p>
+      <details v-if="dep.lastError" class="mt-2 break-all text-xs text-slate-500" :open="!checkFor(dep)">
+        <summary class="cursor-pointer">上次部署错误（历史记录）</summary>
+        <p class="mt-1">{{ dep.lastError }}</p>
+      </details>
 
       <div v-if="!dep.isEdgeOne" class="mt-3 flex justify-end gap-2 border-t border-panel-border pt-3">
         <NButton size="tiny" quaternary type="error" :loading="delMutation.isPending.value && delMutation.variables.value === dep.id" @click="delMutation.mutate(dep.id)">
@@ -197,7 +200,7 @@
 import { ref, computed } from 'vue';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query';
 import { NButton, NTag, NSelect, NInput, NEmpty, useMessage } from 'naive-ui';
-import { RefreshCw, Search, Upload, Zap, Globe, Cloud, Layers, ShieldCheck, AlertTriangle, XCircle, Trash2 } from 'lucide-vue-next';
+import { RefreshCw, Search, Upload, Zap, Cloud, Layers, ShieldCheck, AlertTriangle, XCircle, Trash2 } from 'lucide-vue-next';
 import {
   getPlatformDeployments, deletePlatformDeployment, checkPlatformDeployments,
 } from '@/services/ssl';
@@ -257,7 +260,8 @@ const filtered = computed(() =>
 const checks = ref<PlatformBindingCheck[]>([]);
 const checkFetching = ref(false);
 const checkFor = (dep: PlatformDeployment): PlatformBindingCheck | null => {
-  const list = checks.value.filter(c2 => c2.domain === dep.domain && c2.provider === dep.provider);
+  const list = checks.value.filter(c2 => c2.provider === dep.provider && c2.domain === dep.domain &&
+    (dep.provider === 'edgeone' ? c2.credentialId === dep.credentialId && c2.siteId === dep.siteId : c2.deploymentId === dep.id));
   return list.length ? list[list.length - 1] : null;
 };
 async function runCheck() {
@@ -270,7 +274,9 @@ async function runCheck() {
     const drift = res.data?.drift ?? 0;
     let msg = `检查完成：${checked}/${total} 个域名状态已核实`;
     if (drift) msg += `，${drift} 个漂移`;
-    message.success(msg);
+    if (checked < total) msg += `，${total - checked} 个未核实`;
+    if (checked < total || drift) message.warning(msg);
+    else message.success(msg);
   } catch (err: any) {
     message.error(String(err));
   } finally {

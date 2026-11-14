@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
-import { useRouter, useRoute } from 'vue-router';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { useRoute } from 'vue-router';
 import { useDialog } from 'naive-ui';
 import {
   Globe2, Globe, LayoutDashboard, History, Settings, LogOut, ShieldCheck, Moon, Sun, Rocket,
@@ -12,10 +12,10 @@ import type { ProviderType } from '@/types/dns';
 import { normalizeProviderType } from '@/utils/provider';
 import { useResponsive } from '@/composables/useResponsive';
 import ProviderItem from './ProviderItem.vue';
+import { navigation } from '@/router';
 
 const emit = defineEmits<{ close: [] }>();
 
-const router = useRouter();
 const route = useRoute();
 const providerStore = useProviderStore();
 const user = getStoredUser();
@@ -205,19 +205,20 @@ function confirmLogout() {
   });
 }
 
-async function navigate(path: string) {
+function navigate(path: string) {
   emit('close');
-  await nextTick();
-  try {
-    await router.push(path);
-  } catch {
-    window.location.assign(path);
-  }
+  return navigation.navigate(path);
+}
+
+function prefetchIntent(event: Event) {
+  const target = event.target as HTMLElement | null;
+  const path = target?.closest?.('[data-nav-target]')?.getAttribute('data-nav-target');
+  if (path) void navigation.prefetch(path);
 }
 </script>
 
 <template>
-  <div class="app-sidebar">
+  <div class="app-sidebar" @pointerover="prefetchIntent" @focusin="prefetchIntent" @pointerdown="prefetchIntent">
     <header class="sidebar-header">
       <div class="sidebar-logo">
         <Globe2 :size="24" />
@@ -228,22 +229,22 @@ async function navigate(path: string) {
       </div>
     </header>
 
-    <button class="nav-btn" :class="{ active: route.path === '/' }" @click="goToDashboard">
+    <button class="nav-btn" data-nav-target="/" :class="{ active: route.path === '/' }" @click="goToDashboard">
       <span class="nav-icon"><LayoutDashboard :size="17" /></span>
       总览仪表盘
     </button>
 
-    <button class="nav-btn" :class="{ active: route.path === '/ssl' || route.path === '/letsencrypt' }" @click="goToSsl">
+    <button class="nav-btn" data-nav-target="/ssl" :class="{ active: route.path === '/ssl' || route.path === '/letsencrypt' }" @click="goToSsl">
       <span class="nav-icon"><ShieldCheck :size="17" /></span>
       证书与部署
     </button>
 
-    <button class="nav-btn" :class="{ active: route.path === '/platform-deployments' }" @click="goToPlatformDeployments">
+    <button class="nav-btn" data-nav-target="/platform-deployments" :class="{ active: route.path === '/platform-deployments' }" @click="goToPlatformDeployments">
       <span class="nav-icon"><Globe :size="17" /></span>
       平台部署
     </button>
 
-    <button class="nav-btn" :class="{ active: route.path === '/edgeone' }" @click="goToEdgeOne">
+    <button class="nav-btn" data-nav-target="/edgeone" :class="{ active: route.path === '/edgeone' }" @click="goToEdgeOne">
       <span class="nav-icon"><Rocket :size="17" /></span>
       EdgeOne 加速
     </button>
@@ -259,6 +260,7 @@ async function navigate(path: string) {
      <div
        v-else
        class="providers-list"
+       data-nav-target="/"
        :style="{ touchAction: draggingType ? 'none' : 'pan-y' }"
      >
         <p v-if="!sortedProviders.length" class="empty-providers">
@@ -290,10 +292,10 @@ async function navigate(path: string) {
           <Sun v-if="isDark" :size="16" />
           <Moon v-else :size="16" />
         </button>
-        <button class="action-btn" title="日志" @click="goToLogs">
+        <button class="action-btn" data-nav-target="/logs" title="日志" @click="goToLogs">
           <History :size="16" />
         </button>
-        <button class="action-btn" title="设置" @click="goToSettings">
+        <button class="action-btn" data-nav-target="/settings" title="设置" @click="goToSettings">
           <Settings :size="16" />
         </button>
         <button class="action-btn action-btn-danger" title="退出" @click="confirmLogout">

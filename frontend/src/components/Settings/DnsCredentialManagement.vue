@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
+import { useQueryClient } from '@tanstack/vue-query';
 import { NButton, NInput, NModal, NAlert, NTag, NEmpty, NSpin, NDivider, useMessage, useDialog } from 'naive-ui';
 import { Plus, Pencil, Trash2, CheckCircle, XCircle, ExternalLink, Database, Eye, EyeOff } from 'lucide-vue-next';
 import {
@@ -41,6 +42,7 @@ const emit = defineEmits<{
 const message = useMessage();
 const dlg = useDialog();
 const providerStore = useProviderStore();
+const queryClient = useQueryClient();
 const route = useRoute();
 const router = useRouter();
 
@@ -467,8 +469,13 @@ async function handleSubmit() {
       });
     }
 
+    queryClient.removeQueries({
+      predicate: ({ queryKey }) => queryKey[0] === 'tunnels' || String(queryKey[0]).startsWith('tunnel-'),
+    });
+    await queryClient.invalidateQueries({ queryKey: ['domains-cred'], refetchType: 'none' });
     await loadData();
     await providerStore.loadData();
+    await queryClient.invalidateQueries({ queryKey: ['domains'] });
     closeDialog();
     emit('changed');
     message.success(editing.value ? '已更新' : '已创建');
@@ -489,6 +496,13 @@ async function handleVerify(id: number) {
       visibleZones: res.data?.visibleZones,
       warning: res.data?.warning,
     };
+    if (res.data?.valid) {
+      queryClient.removeQueries({
+        predicate: ({ queryKey }) => queryKey[0] === 'tunnels' || String(queryKey[0]).startsWith('tunnel-'),
+      });
+      await queryClient.invalidateQueries({ queryKey: ['domains-cred', id], refetchType: 'none' });
+      await queryClient.invalidateQueries({ queryKey: ['domains'] });
+    }
     if (res.data?.warning) message.warning(res.data.warning, { duration: 8000 });
     else if (res.data?.valid && typeof res.data?.zoneCount === 'number') {
       message.success(`凭证有效，可见 ${res.data.zoneCount} 个 Cloudflare 域名`);
@@ -510,6 +524,9 @@ function confirmDelete(cred: DnsCredential) {
     onPositiveClick: async () => {
       try {
         await deleteDnsCredential(cred.id);
+        queryClient.removeQueries({
+          predicate: ({ queryKey }) => queryKey[0] === 'tunnels' || String(queryKey[0]).startsWith('tunnel-'),
+        });
         await loadData();
         await providerStore.loadData();
         emit('changed');
